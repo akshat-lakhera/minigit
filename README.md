@@ -13,6 +13,13 @@ Runs on Windows and Linux. No dependencies, no build step.
 
 ## Install and run
 
+**Stand-alone downloads** (no Python needed) are on the [releases page](https://github.com/akshat-lakhera/minigit/releases):
+a Windows installer that adds `minigit` to PATH, a zipped `minigit.exe`, `.tar.gz` archives with an `install.sh` for
+Linux (x64) and macOS (Intel, Apple silicon), and a Python wheel. They are built by
+`.github/workflows/release.yml` whenever a `v*` tag is pushed.
+
+From a checkout:
+
 ```
 python -m minigit <command> [args]       # from the checkout (any OS)
 bin/minigit <command>                    # sh / Git Bash entry script (python3, else python)
