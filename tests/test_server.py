@@ -59,8 +59,9 @@ def _install_graph_fake() -> None:
 
 _install_graph_fake()
 
-from minigit import auth, pack, server  # noqa: E402  (after the fake is in place)
+from minigit import admin, auth, pack, server  # noqa: E402  (after the fake is in place)
 from minigit.repo import Repository  # noqa: E402
+from minigit.refs import RefStore  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +100,7 @@ class ServerTestCase(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.tmp = self._tmp.name
         self.root = os.path.join(self.tmp, "srv")
+        auth.server_init(self.root)
         self.tokens = {name: auth.add_user(self.root, name) for name in ("alice", "bob", "carol")}
         auth.create_repo(self.root, "proj", readers=["*"], writers=["alice", "bob"])
         self.srv = server.make_server(self.root, "127.0.0.1", 0, max_push_bytes=self.max_push_bytes())
@@ -174,6 +176,7 @@ class TestAuth(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.root = os.path.join(self._tmp.name, "srv")
+        auth.server_init(self.root)
 
     def tearDown(self) -> None:
         self._tmp.cleanup()
@@ -194,14 +197,55 @@ class TestAuth(unittest.TestCase):
                 auth.validate_repo_name(bad)
 
     def test_server_init_idempotent(self):
-        auth.server_init(self.root)
-        auth.server_init(self.root)
-        path = os.path.join(self.root, "server.json")
+        root = os.path.join(self._tmp.name, "fresh")
+        self.assertTrue(auth.server_init(root))
+        self.assertFalse(auth.server_init(root))  # an existing root is kept ("Reinitialized")
+        path = os.path.join(root, "server.json")
         with open(path, "rb") as fh:
             data = json.loads(fh.read())
         self.assertEqual(data, {"version": 1, "users": {}, "repos": {}})
-        self.assertTrue(os.path.isdir(os.path.join(self.root, "repos")))
+        self.assertTrue(os.path.isdir(os.path.join(root, "repos")))
         self.assertFalse(os.path.exists(path + ".lock"))
+
+    def test_admin_functions_never_create_a_root(self):
+        # QA bug 3: a mistyped ROOT must not silently become a new, empty server root.
+        missing = os.path.join(self._tmp.name, "typo")
+        calls = [lambda: auth.add_user(missing, "x"), lambda: auth.create_repo(missing, "r"),
+                 lambda: auth.list_server(missing), lambda: admin.add_token(missing, "x", "ci"),
+                 lambda: admin.list_tokens(missing, "x"), lambda: admin.set_repo(missing, "r", public=True),
+                 lambda: admin.get_perm(missing, "r", ["x"]), lambda: admin.remove_user(missing, "x")]
+        for call in calls:
+            with self.assertRaises(errors.MinigitError) as cm:
+                call()
+            self.assertEqual(cm.exception.message, f"'{missing}' is not a minigit server root")
+            self.assertIn("minigit server init", cm.exception.hint)
+            self.assertFalse(os.path.exists(missing))
+
+    def test_add_user_refuses_reset_of_missing_dot_names_and_case_variants(self):
+        with self.assertRaises(errors.MinigitError) as cm:  # QA bug 10
+            auth.add_user(self.root, "nobody", reset=True)
+        self.assertEqual(cm.exception.message, "user 'nobody' does not exist")
+        self.assertIn("without --reset", cm.exception.hint)
+        for name in (".", ".."):
+            with self.assertRaises(errors.MinigitError) as cm:
+                auth.add_user(self.root, name)
+            self.assertIn("invalid user name", cm.exception.message)
+        auth.add_user(self.root, "alice")
+        with self.assertRaises(errors.MinigitError) as cm:
+            auth.add_user(self.root, "ALICE")
+        self.assertIn("differs only in case from the existing user 'alice'", cm.exception.message)
+        self.assertEqual(sorted(auth.ServerConfig(self.root).users), ["alice"])
+
+    def test_create_repo_refuses_unknown_users(self):
+        # QA bug 9: like 'perm', a name in --readers/--writers must be an existing user (or '*').
+        auth.add_user(self.root, "alice")
+        for kwargs in ({"readers": ["ghost"]}, {"writers": "alice,ghost"}):
+            with self.assertRaises(errors.MinigitError) as cm:
+                auth.create_repo(self.root, "r2", **kwargs)
+            self.assertEqual(cm.exception.message, "user 'ghost' does not exist")
+        self.assertNotIn("r2", auth.ServerConfig(self.root).repos)
+        self.assertFalse(os.path.exists(os.path.join(self.root, "repos", "r2")))
+        auth.create_repo(self.root, "r2", readers=["*", "alice"], writers=["alice"])
 
     def test_add_user_and_authenticate(self):
         token = auth.add_user(self.root, "alice")
@@ -233,6 +277,8 @@ class TestAuth(unittest.TestCase):
         self.assertTrue(auth.ServerConfig(self.root).authenticate("alice", token))
 
     def test_create_repo(self):
+        auth.add_user(self.root, "alice")
+        auth.add_user(self.root, "bob")
         path = auth.create_repo(self.root, "proj", readers=["alice"], writers="bob,alice", public=True)
         self.assertEqual(path, os.path.join(self.root, "repos", "proj"))
         repo = Repository.open(path)
@@ -249,6 +295,8 @@ class TestAuth(unittest.TestCase):
             auth.create_repo(self.root, "other", readers=["not valid"])
 
     def test_acls(self):
+        auth.add_user(self.root, "alice")
+        auth.add_user(self.root, "carol")
         auth.create_repo(self.root, "open", readers=["*"], writers=["*"])
         auth.create_repo(self.root, "team", readers=["carol"], writers=["alice"])
         auth.create_repo(self.root, "pub", readers=[], writers=[], public=True, allow_force=True)
@@ -833,6 +881,45 @@ class TestFetchPush(ServerTestCase):
         self.assertEqual(statuses["refs/heads/main"], "rejected")
         self.assertEqual(self.server_repo().refs.list(), {"refs/heads/main": base})
 
+    @unittest.skipUnless(os.name == "nt", "refs.update refuses device names on Windows only")
+    def test_windows_reserved_branch_name_is_a_clean_rejection(self):
+        # QA bug 4: 'push origin main:CON' was an HTTP 500 with a traceback in the server log.
+        base = self.push_initial()
+        for name in ("CON", "aux.txt", "dir/nul"):
+            ref = "refs/heads/" + name
+            status, res = self.push([{"ref": "refs/heads/ok", "old": None, "new": base},
+                                     {"ref": ref, "old": None, "new": base}], b"")
+            self.assertEqual(status, 409, res)
+            self.assertEqual(res["code"], "rejected")
+            bad = next(r for r in res["results"] if r["ref"] == ref)
+            self.assertEqual(bad["status"], "rejected")
+            self.assertEqual(bad["reason"], "invalid-ref-name")
+            self.assertIn("reserved device name", bad["message"])
+            self.assertEqual(self.server_repo().refs.list(), {"refs/heads/main": base})
+        with open(os.path.join(self.root, "audit.log"), encoding="utf-8") as fh:
+            self.assertIn("refs/heads/CON - " + base + " invalid-ref-name", fh.read())
+
+    def test_unexpected_ref_error_while_applying_is_a_rejection(self):
+        # Any MinigitError from refs.update is a per-ref rejection (409), never a 500, and the batch is undone.
+        from unittest import mock
+        base = self.push_initial()
+        real_update = RefStore.update
+
+        def update(store, name, new, *args, **kwargs):
+            if name == "refs/heads/zbad" and new is not None:
+                raise errors.MinigitError(f"invalid ref name '{name}': cannot be stored here")
+            return real_update(store, name, new, *args, **kwargs)
+
+        with mock.patch.object(RefStore, "update", update):
+            status, res = self.push([{"ref": "refs/heads/aok", "old": None, "new": base},
+                                     {"ref": "refs/heads/zbad", "old": None, "new": base}], b"")
+        self.assertEqual(status, 409, res)
+        self.assertEqual(res["code"], "rejected")
+        self.assertIn("cannot be stored here", res["error"])
+        self.assertEqual({r["status"] for r in res["results"]}, {"rejected"})
+        self.assertTrue(all("cannot be stored here" in r["message"] for r in res["results"]))
+        self.assertEqual(self.server_repo().refs.list(), {"refs/heads/main": base})
+
     def test_process_push_direct(self):
         c = self.commit({"a": b"a"}, [], "c")
         cfg = auth.ServerConfig(self.root)
@@ -900,6 +987,7 @@ class TestServe(unittest.TestCase):
     def test_serve_subprocess(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = os.path.join(tmp, "srv")
+            auth.server_init(root)
             auth.create_repo(root, "pub", public=True)
             ready = os.path.join(tmp, "ready.txt")
             code = (

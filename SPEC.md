@@ -28,6 +28,7 @@ Tests are run from `E:\ideas\minigit` with `python -m unittest discover -s tests
   - `MINIGIT_GLOBAL_CONFIG`: global config path. Default `~/.minigitconfig`.
   - `MINIGIT_CREDENTIALS`: credentials file. Default `~/.minigit-credentials.json`.
   - `MINIGIT_USER`, `MINIGIT_TOKEN`: credentials for a single call.
+  - `MINIGIT_HTTP_TIMEOUT`: seconds a push or fetch waits for the server (default 900).
   - `MINIGIT_AUTHOR_NAME`, `MINIGIT_AUTHOR_EMAIL`, `MINIGIT_AUTHOR_DATE` (`"<unix> <+hhmm>"`): identity overrides.
   - `MINIGIT_DEBUG=1`: print tracebacks.
 
@@ -48,6 +49,9 @@ Tests are run from `E:\ideas\minigit` with `python -m unittest discover -s tests
     ORIG_HEAD       "<40hex>\n"  written by merge/reset/pull
     MERGE_HEAD      "<40hex>\n"  present only while a conflicted merge is open
     MERGE_MSG       default message for the merge commit
+    CHERRY_PICK_HEAD  REVERT_HEAD  SEQUENCER   cherry-pick / revert in progress (section 6)
+    REBASE_HEAD  rebase/       rebase stopped on a conflict, and its plan (section 6)
+    stash           the stash stack: one commit id per line, newest first (section 6)
     *.lock          short-lived lock files (O_EXCL)
 ```
 - A **bare repo** is the gitdir itself: `HEAD`, `config` (with `core.bare = true`), `objects/` and `refs/`. It has no index and no worktree.
@@ -58,7 +62,7 @@ Tests are run from `E:\ideas\minigit` with `python -m unittest discover -s tests
 ROOT/
   server.json     users + repo ACLs (section 7.1)
   audit.log       append-only lines: "<unix> <user> <repo> <ref> <old|-> <new|-> <ok|reason>\n"
-  repos/<name>/   bare repos
+  repos/<name>/   bare repos (a repo that has pull requests also holds pulls.json, section 7.7)
 ```
 
 ### 1.2 Config file format
@@ -401,6 +405,34 @@ Notation:
 - The marker newline is `\r\n` if ours' first line ends with `\r\n`, else `\n`.
 - If a chunk's last line lacks a newline, add one before the next marker.
 
+### cherry-pick / revert (`cherry.py`, `sequencer.py`)
+`cherry-pick [-n] [-x] [-m N] [--allow-empty] REV...` and `revert [-n] [-m N] REV...`, both with `--continue` and
+`--abort`. Each is a three-way tree merge on top of HEAD (cherry-pick: base = the commit's parent, theirs = the
+commit; revert: base = the commit, theirs = its parent). A conflict leaves stages 1/2/3, markers, `MERGE_MSG` and
+`CHERRY_PICK_HEAD`/`REVERT_HEAD`; revisions still to do are kept in `.minigit/SEQUENCER`. Design and messages:
+`features/cherry-pick-revert.md`.
+
+### stash (`stash.py`)
+`stash [push] [-m MSG] [-u]`, `stash (pop | apply | drop | show) [stash@{N} | N]`, `stash list`, `stash clear`.
+`push` shelves the index, the work tree and (with `-u`) untracked files as git-style stash commits and resets
+the work tree to HEAD. The stack is the file `.minigit/stash` (one commit id per line, newest first), not a ref, so
+`branch`, `log --all`, `push` and `clone` never see it. `apply`/`pop` is a three-way tree merge (base = the
+entry's HEAD, ours = the index, theirs = the stashed work tree); on a conflict the entry stays on the stack.
+Design and messages: `features/stash.md`.
+
+### rebase (`rebase.py`)
+`rebase [--onto NEWBASE] [UPSTREAM [BRANCH]]`, `rebase --continue | --skip | --abort`. The non-merge commits of
+BRANCH (default: the current branch) that are not in UPSTREAM (default: the branch's configured upstream) are
+replayed oldest first on top of UPSTREAM (or NEWBASE), so the result is linear. Each replay is cherry-pick's
+three-way merge and keeps the author and message; a commit whose patch id is already in the new base is dropped.
+HEAD is detached while replaying and the branch ref moves only after the last commit. A conflict stops the rebase
+(`REBASE_HEAD` and `.minigit/rebase/` hold the state). No interactive mode. Design and messages: `features/rebase.md`.
+
+### blame / grep (`blame.py`, `grep.py`)
+`blame [-L START,END] [-s] [-e] [--porcelain] [REV] PATH` and
+`grep [-i] [-n] [-l | -c] [-w] [-F] [-e PAT] [--cached] PATTERN [REV] [PATH...]` are read-only: they take no
+locks and write nothing. Design and output formats: `features/blame-grep.md`.
+
 ---
 
 ## 7. Collaboration
@@ -422,18 +454,19 @@ Notation:
 - **Transport auth:** `Authorization: Basic base64(user:token)`.
   - Missing or bad credentials: 401 with `WWW-Authenticate: Basic realm="minigit"`.
   - Authenticated user who may read the repo but not write to it: 403.
-  - Unknown repo, or a repo the caller may not read: anonymous callers get 401 for both, so private repo names cannot be discovered anonymously. A signed-in caller gets 404 `repository '<name>' not found` for an unknown repo and 403 `permission denied: user '<u>' may not read '<name>'` for one it may not read (changed by `server-admin`).
+  - Unknown repo, or a repo the caller may not read: anonymous callers get 401 for both, so private repo names cannot be discovered anonymously. A signed-in caller gets 404 `repository '<name>' not found` for an unknown repo and 403 `permission denied: user '<u>' may not read '<name>'` for one it may not read (changed by `server-admin`). The web UI under `/-/` follows the same rule.
   - An empty ACL list (`--readers ""`) means nobody; it is never promoted to `*`.
 - **Client credential order:**
   1. `MINIGIT_USER` + `MINIGIT_TOKEN`.
   2. The URL userinfo (`http://alice:TOK@host:port/proj`).
-  3. The credentials file: JSON `{"http://host:port": {"user": "...", "token": "..."}}`, keyed by `scheme://host:port`.
-- **Storing credentials:** `clone` and `remote add` strip the userinfo from the stored URL and save it to the credentials file. `minigit login URL --user U --token T` also writes it (chmod 600 on POSIX).
+  3. The credentials file: JSON `{"http://host:port": {"user": "...", "token": "..."}, "http://host:port|alice": {...}}`. A URL with a user but no token (`http://alice@host:port/proj`) uses the `scheme://host:port|alice` entry; a URL without a user uses the host default `scheme://host:port`.
+- **Storing credentials:** `clone` and `remote add` strip the userinfo from the stored URL (keeping `user@`) and save the token under `scheme://host:port|user` only. *(Integration, QA bug 1)* Only `minigit login URL --user U --token T` writes the host default (and the `|U` entry), so a `user:token@` URL used once never changes the identity of other clones of that server (chmod 600 on POSIX).
 
 ### 7.2 HTTP protocol v1
 - **Server:** `ThreadingHTTPServer`, `daemon_threads=True`, `protocol_version = "HTTP/1.0"`. Every response sets `Content-Length`.
-- **Client:** `urllib.request` with `build_opener(ProxyHandler({}))` and a 60 s timeout. *(Integration)* Redirects are not followed (urllib would forward the `Authorization` header to the new host); a 3xx is an error.
-- Every request carries the header `X-Minigit-Protocol: 1`. A missing or other value gets 400.
+- **Client:** `urllib.request` with `build_opener(ProxyHandler({}))`, a 30 s connect timeout and a 60 s read timeout; `POST /fetch` and `POST /push` wait up to `MINIGIT_HTTP_TIMEOUT` seconds (default 900) because the server writes every object synchronously. *(Integration, QA bug 2)* A refused or timed-out connect is `could not connect to server at URL: ...`; a timeout after connecting is `timed out waiting for the server at URL; the push may still be applied, run 'minigit fetch' to check` (for a push). Redirects are not followed (urllib would forward the `Authorization` header to the new host); a 3xx is an error.
+- Every protocol request carries the header `X-Minigit-Protocol: 1`. A missing or other value gets 400. Requests
+  under `/-/` (the web UI below) and the browser redirect are exempt.
 - The base URL is `http://host:port/<repo>`, and a trailing `/` is tolerated.
 - Error bodies are JSON: `{"error": "<human message>", "code": "<machine_code>"}`.
 
@@ -445,6 +478,18 @@ Notation:
 | `POST /<repo>/push` | write | `application/x-minigit-push` body (below) | JSON results |
 
 In `info/refs`, `head` is the bare repo's symbolic HEAD target, even when that target is unborn. `null` means detached.
+
+**Web UI (`/-/`).** `minigit serve` also serves a read-only, JavaScript-free HTML site under the URL prefix `/-/`
+(module `webui.py`; design in `features/web-ui.md`). Requests whose first path segment is `-` are handled before the
+protocol checks, so they are **exempt from the `X-Minigit-Protocol` rule** and answer with HTML, not JSON. Pages:
+`/-/` (repository list), `/-/<repo>/` (summary), `branches`, `log`, `commit/<rev>`, `tree`, `blob` and `raw`. Only
+GET and HEAD are accepted (other methods: 405). Access follows the protocol's ACLs and HTTP Basic auth (user name +
+token), and public repos are readable anonymously. As in the protocol, an anonymous request for any non-public
+repository name gets 401 with `WWW-Authenticate` whether or not the repository exists; a signed-in user gets 404 for a
+missing repository and 403 for one they may not read. Browsers cache Basic credentials, so there is no log-out.
+**Browser redirect:** a `GET`/`HEAD` of `/` or `/<repo>` that has no `X-Minigit-Protocol` header and an `Accept` header
+containing `text/html` gets `303` to `/-/` or `/-/<repo>/`; every other request without the header still gets 400.
+`serve --no-web` turns all of this off: `/-/` is then just an unknown repository name and nothing is redirected.
 
 Status codes:
 - 400 malformed request, bad ref name, or a want not reachable from any current server ref
@@ -484,7 +529,7 @@ Push responses:
 Messages:
 - non-ff: `the remote branch has commits you do not have; run 'minigit pull' first, then push again`
 - stale: `remote ref changed since you last fetched (expected X, found Y); run 'minigit pull' first`
-- ref-clash: `cannot create 'refs/heads/a/b': it clashes with the existing branch 'refs/heads/a'` (also case-only differences); the client prints no "pull first" hint.
+- ref-clash: `cannot create 'refs/heads/a/b': it clashes with the existing branch 'refs/heads/a'` (also case-only differences); the client prints no "pull" hint.
 
 Any HTTP method the server does not implement gets a JSON 405 `method_not_allowed`. A request body that is not valid JSON, including JSON nested too deeply, gets 400. Trees with duplicate or unsorted entry names are malformed: the server answers a push containing one with 422 `bad_pack`, and `fsck` reports it.
 
@@ -553,10 +598,10 @@ Readers take no lock: ref files are replaced atomically, and objects never chang
   7. **On rejection** (local or 409), the CLI prints this to stderr and exits 1:
      ```
      To <url>
-      ! [rejected]        main -> main (non-fast-forward)      (or (fetch first) / (stale info))
+      ! [rejected]        main -> main (non-fast-forward)      (or (fetch first) for a lost race, (forced update disabled), (ref name clash), (invalid ref name))
      error: failed to push some refs to '<url>'
      hint: Updates were rejected because the remote contains work that you do not have locally.
-     hint: Run 'minigit pull' first, then push again (pull first).
+     hint: Integrate the remote changes first ('minigit pull'), then push again.
      ```
 - **HTTP errors:**
   - 401 → `AuthError("authentication failed for '<url>': check user/token (minigit login)")`.
@@ -565,7 +610,9 @@ Readers take no lock: ref files are replaced atomically, and objects never chang
   - Any other status → `RemoteError(body.error)`.
 
 ### 7.6 Server CLI
-- `minigit serve --root R [--host 127.0.0.1] [--port 8765] [--ready-file F] [--quiet]`:
+- `minigit serve --root R [--host 127.0.0.1] [--port 8765] [--init] [--ready-file F] [--quiet] [--no-web] [--max-push-bytes N]`
+  (`--no-web` turns the web UI off, `--max-push-bytes` is the push body limit, default 256 MiB; `serve --help` ends with
+  `Browse the repositories at http://HOST:PORT/-/ (unless --no-web).`):
   - `--root` must be an existing directory containing `server.json` (made by `minigit server init`), unless `--init` is given, which creates it. A mistyped path is an error, not a new empty root. `--port` must be 0 to 65535 (usage error otherwise).
   - Binds, with `--port 0` meaning a free port.
   - Prints `Serving minigit on http://HOST:PORT` (flushed) to stdout.
@@ -577,6 +624,34 @@ Readers take no lock: ref files are replaced atomically, and objects never chang
   - `minigit server add-user R NAME [--reset]` prints the token alone on one line.
   - `minigit server create-repo R NAME [--readers a,b|*] [--writers a,b|*] [--public] [--allow-force]` prints the URL path.
   - `minigit server list R`
+- More admin commands (`remove-user`, `add-token`, `list-tokens`, `revoke-token`, `perm`, `set-repo`; named tokens
+  and per-user permissions) are specified in `features/server-admin.md`.
+
+### 7.7 Pull requests
+A pull request asks the server to merge one branch into another (`pulls.py` on the server, `pr.py` for the client
+`minigit pr open | list | show | diff | merge | close`; full design and error table: `features/pull-requests-lite.md`).
+Records live in `repos/<name>/pulls.json` (written under a lock with `atomic_write`, reloaded on every request;
+numbers start at 1 per repo and are never reused). The requests below need the protocol header; reading needs read
+access and opening, merging and closing need write access (section 7.1).
+
+| Method + path | Perm | Request | 2xx response |
+|---|---|---|---|
+| `GET /<repo>/pulls[?state=open\|merged\|closed\|all]` | read | – | 200 `{"pulls": [record, ...]}`, ascending number; default `open` |
+| `POST /<repo>/pulls` | write | JSON `{"head","base","title","body"?}` | 201 `{"pull": view}` |
+| `GET /<repo>/pulls/<n>` | read | – | 200 `{"pull": view}` |
+| `GET /<repo>/pulls/<n>/diff` | read | – | 200, unified diff since the merge base (three-dot), `text/x-diff` |
+| `POST /<repo>/pulls/<n>/merge` | write | JSON `{"message"?}` | 200 `{"pull","kind","merge_commit","old","new"}` |
+| `POST /<repo>/pulls/<n>/close` | write | `{}` | 200 `{"pull": view}` |
+
+- The view adds `head_sha`, `base_sha`, `merge_base`, `ahead`, `behind`, `commits`, `mergeable`
+  (`clean | conflict | up-to-date | unrelated | unknown`), `conflicts` and `messages`, computed from the branch tips as they
+  are on the server.
+- **Merge** runs under the same per-repo lock as pushes: a merge commit with parents (base tip, head tip), message
+  `Merge pull request #N from <head>` (or the given message), author = committer = `<user>@minigit`, the base ref moved
+  by compare-and-swap, one `audit.log` line for the ref change. A conflict is 409 `merge_conflict` and nothing changes.
+- Errors are the usual JSON `{"error","code"}`: 400 `bad_request`/`same_branch`/`unknown_branch`, 404 `not_found`, 409
+  `nothing_to_compare`/`duplicate`/`not_open`/`branch_missing`/`merge_conflict`/`unrelated_histories`/`base_moved`,
+  413 `too_large` (JSON bodies over 1 MiB), 503 `busy`.
 
 ---
 
@@ -593,6 +668,13 @@ Every file is owned by exactly one module. Dependency order: **M1 → M2 → {M3
 | **M5 server** | `pack.py auth.py server.py` | `tests/test_server.py` | M1 |
 | **M6 client** | `transport.py remote.py` | `tests/test_remote.py` | M1, M2, M4, M5 (pack; `server.make_server` in tests) |
 | **M7 cli + e2e** | `cli.py __main__.py`, `bin/minigit`, `bin/minigit.cmd`, `tests/__init__.py tests/helpers.py tests/test_e2e_local.py tests/test_e2e_multiuser.py`, `README.md` | the e2e files | all |
+| **M8 web UI** | `webui.py` (`/-/`, section 7.2; `server.py` imports it lazily) | `tests/test_webui.py`, `tests/test_web_ui.py` | M1, M3, M5 |
+| **M9 pull requests** | `pulls.py` (server), `pr.py` (client + CLI glue), section 7.7 | `tests/test_pulls.py`, `tests/test_pull_requests_lite.py` | M1, M4, M5, M6 |
+| **M10 stash, rebase, cherry-pick/revert** | `stash.py`, `rebase.py`, `cherry.py`, `sequencer.py` (section 6) | `tests/test_stash.py`, `tests/test_rebase.py`, `tests/test_cherry.py`, `tests/test_cherry_pick_revert.py` | M1, M2, M4 |
+| **M11 blame, grep** | `blame.py`, `grep.py` (section 6) | `tests/test_blame_grep.py` | M1, M2, M3 |
+| **M12 server admin** | `admin.py` (operations on `server.json`), `serveradmin.py` (`minigit server` parsers and dispatch), `features/server-admin.md` | `tests/test_server_admin.py` | M1, M5 |
+
+M8 to M12 are add-ons to the base design above. Each registers or wires its own CLI parser and handler, and `cli.py` only calls them.
 
 Unit tests use `tempfile.TemporaryDirectory(ignore_cleanup_errors=True)` and do not import `tests/helpers.py`. Python 3.11's `rmtree` takes `onerror`, not `onexc`.
 
@@ -939,11 +1021,11 @@ def serve(root: str, host: str, port: int, *, ready_file: str | None = None, max
 def split_url(url: str) -> tuple[str, tuple[str, str] | None]    # (url without userinfo, (user, token)|None)
 def credentials_path() -> str
 def load_credentials(url: str) -> tuple[str, str] | None         # section 7.1 order (env, userinfo, file)
-def save_credentials(url: str, user: str, token: str) -> None
+def save_credentials(url: str, user: str, token: str, *, host_default: bool = False) -> None  # True: login
 @dataclass
 class RemoteRefs: head: str | None; refs: dict[str, str]
 class HttpRemote:
-    def __init__(self, url: str, timeout: float = 60.0) -> None   # strips userinfo, resolves credentials
+    def __init__(self, url: str, timeout: float = 60.0, data_timeout: float | None = None) -> None   # strips userinfo, resolves credentials
     url: str
     def list_repos(self) -> list[str]
     def info_refs(self) -> RemoteRefs
@@ -963,7 +1045,7 @@ def format_fetch(url: str, changes: list[RefChange]) -> str
 def pull(repo: Repository, remote: str | None = None, branch: str | None = None) -> tuple[list[RefChange], MergeOutcome]
 def push(repo: Repository, remote: str | None = None, refspec: str | None = None, *, set_upstream: bool = False,
          force: bool = False, delete: bool = False) -> list[str]    # output lines; raises PushRejectedError
-def format_push_rejection(err: PushRejectedError, src: str, dst: str) -> str   # section 7.5 text (contains "[rejected]", "pull first")
+def format_push_rejection(err: PushRejectedError, src: str, dst: str) -> str   # section 7.5 text (contains "[rejected]" and "'minigit pull'")
 def login(url: str, user: str, token: str) -> None
 ```
 **test_remote** (in-process `make_server`): clone empty and non-empty, push/fetch/pull round-trips, non-ff rejection text, a second fetch requesting nothing (no request sent), only missing objects sent (assert `pack_count`), credentials order, CRLF and binary bytes identical after clone.
@@ -976,7 +1058,7 @@ def main(argv: Sequence[str] | None = None) -> int
 # __main__.py: `import sys; from minigit.cli import main; sys.exit(main())`
 ```
 - **Global flags:** `-C <dir>` (sets cwd), `--version`, `--help`, `<cmd> --help`.
-- **Commands** (the flags in section 6/7 are authoritative): init, config, add, rm, status (`--porcelain`, `-s` = porcelain), diff, commit, log, show, branch, switch, checkout, merge, reset, restore, remote (`add|remove|-v`), clone, fetch, pull, push, login, serve, server (`init|add-user|create-repo|list`), fsck, cat-file, ls-files, hash-object, rev-parse, help.
+- **Commands** (the flags in section 6/7 are authoritative): init, config, add, rm, status (`--porcelain`, `-s` = porcelain), diff, commit, log, show, branch, switch, checkout, merge, cherry-pick, revert, stash, rebase, reset, restore, remote (`add|remove|-v`), clone, fetch, pull, push, pr (`open|list|show|diff|merge|close`), login, serve, server (`init|add-user|remove-user|add-token|list-tokens|revoke-token|create-repo|perm|set-repo|list`), fsck, blame, grep, cat-file, ls-files, hash-object, rev-parse, help.
 - **Output:**
   - Data goes to `sys.stdout.buffer` as UTF-8 bytes with `\n` newlines.
   - Errors go to stderr as `error: <message>`, plus `hint: <hint>` when set. `PushRejectedError` prints `format_push_rejection`.
@@ -990,7 +1072,7 @@ def main(argv: Sequence[str] | None = None) -> int
 - **e2e_local:** init → add → status → commit → log → diff → rm → ignore → branching → merge conflict → resolve → abort → reset → restore → detached.
 - **e2e_multiuser** (live `ServerProcess`):
   1. Alice and bob are added. Alice clones the empty repo, commits and runs `push -u`. Bob clones.
-  2. Both commit. Bob pushes. Alice's push exits 1 with `pull first`.
+  2. Both commit. Bob pushes. Alice's push exits 1 with the `'minigit pull'` hint.
   3. Alice pulls (merge commit) and pushes. Bob pulls (fast-forward). `rev-parse HEAD` is equal everywhere.
   4. A same-line conflict through pull is resolved, then pushed.
   5. A wrong token exits 1 with `authentication failed`. A read-only user exits 1 with `permission denied`.

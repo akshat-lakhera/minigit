@@ -250,12 +250,17 @@ def pull_view(repo: Repository, record: dict) -> dict:
     both = base_sha is not None and head_sha is not None
     view["merge_base"] = graph.best_merge_base(store, base_sha, head_sha) if both else None
     view["ahead"], view["behind"] = graph.ahead_behind(store, head_sha, base_sha) if both else (0, 0)
-    view["commits"] = _commits_between(store, head_sha, base_sha)
+    # Without both tips there is nothing to compare: never list head's whole history as the PR's commits.
+    view["commits"] = _commits_between(store, head_sha, base_sha) if both else []
+    missing = None if both else record["head"] if head_sha is None else record["base"]
+    view["missing_branch"] = missing
     if record.get("state") == "open":
         mergeable, conflicts, messages, _ = _trial_merge(repo, base_sha, head_sha, record["base"],
                                                          record["head"])
     else:
         mergeable, conflicts, messages = None, [], []
+    if missing is not None:
+        messages = messages + [_branch_missing(record, missing).message]
     view["mergeable"], view["conflicts"], view["messages"] = mergeable, conflicts, messages
     return view
 
@@ -460,6 +465,20 @@ def _route(tail: list[str]) -> tuple[str, int | None, tuple[str, ...]] | None:
     return None
 
 
+def _discard(handler, length: int, cap: int = 16 << 20) -> None:
+    """Read and drop (up to ``cap`` bytes of) a refused body. Closing a socket with unread data makes
+    Windows reset the connection, and the client then loses the 413 response."""
+    left = min(length, cap)
+    try:
+        while left > 0:
+            chunk = handler.rfile.read(min(left, 1 << 16))
+            if not chunk:
+                break
+            left -= len(chunk)
+    except OSError:
+        pass
+
+
 def _read_json(handler) -> dict:
     from .server import HttpError
 
@@ -469,6 +488,7 @@ def _read_json(handler) -> dict:
     except ValueError:
         too_big = False  # _read_body reports the bad header
     if too_big:
+        _discard(handler, int(raw))
         raise HttpError(413, "too_large", f"request body of {raw} bytes exceeds the limit of {PULL_JSON_MAX} bytes")
     body = handler._read_body()
     if not body.strip():

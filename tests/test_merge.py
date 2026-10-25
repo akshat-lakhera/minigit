@@ -696,6 +696,34 @@ class MergeCommandTests(RepoCase):
         with self.assertRaises(MinigitError) as cm:
             M.merge(self.repo, "main")
         self.assertEqual(cm.exception.message, "refusing to merge unrelated histories")
+        self.assertEqual(cm.exception.hint, "use --allow-unrelated-histories if you really want to join them")
+
+    def test_allow_unrelated_histories(self):
+        # QA bug 12: two people each made a root commit in a fresh clone of an empty repo
+        main_root = self.commit_files("alice root", {"a": b"a\n", "same": b"s\n", "both": b"alice\n"})
+        self.repo.refs.set_symbolic_head("refs/heads/other")
+        with locked_index(self.repo) as idx:
+            for p in list(idx.paths()):
+                idx.remove(p)
+        for p in ("a", "same", "both"):
+            self.delete(p)
+        other_root = self.commit_files("bob root", {"b": b"b\n", "same": b"s\n", "both": b"bob\n"})
+        out = M.merge(self.repo, "main", allow_unrelated=True)
+        self.assertEqual(out.kind, "conflict")  # add/add with different content, as in git
+        self.assertEqual(out.conflicts, ["both"])
+        self.assertEqual(self.read("a"), b"a\n")
+        self.assertEqual(self.read("b"), b"b\n")
+        self.assertEqual(self.read("same"), b"s\n")
+        self.assertIn(b"<<<<<<< HEAD\nbob\n=======\nalice\n>>>>>>> main\n", self.read("both"))
+        self.assertEqual(self.repo.merge_head(), main_root)
+        self.assertEqual(self.repo.head_commit(), other_root)
+        M.merge_abort(self.repo)
+        # without a conflicting path the merge commit is made directly
+        self.commit_files("drop both", {"both": None})
+        out = M.merge(self.repo, "main", allow_unrelated=True)
+        self.assertEqual(out.kind, "merged")
+        parents = self.repo.objects.read_typed(out.commit, "commit")
+        self.assertIn(main_root.encode(), parents)
 
     def test_unknown_revision(self):
         self.commit_files("base", {"a": b"a\n"})

@@ -14,6 +14,7 @@ import zlib
 
 from minigit import auth, errors, objects, pack, server
 from minigit.objects import Commit, TreeEntry
+from minigit.repo import Repository
 from tests import helpers
 from tests.test_server import SIG, ServerTestCase
 
@@ -163,6 +164,7 @@ class TestCliCollab(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.env = helpers.make_env(self.tmp)
         self.root = os.path.join(self.tmp, "srv")
+        auth.server_init(self.root)
         self.token = auth.add_user(self.root, "alice")
         auth.create_repo(self.root, "proj")
         auth.create_repo(self.root, "empty")
@@ -184,6 +186,24 @@ class TestCliCollab(unittest.TestCase):
         self.cli("add", ".", cwd=d)
         self.cli("commit", "-m", "c1", cwd=d)
         return d
+
+    @unittest.skipUnless(os.name == "nt", "refs.update refuses device names on Windows only")
+    def test_push_to_a_windows_device_name_is_rejected_cleanly(self):
+        # QA bug 4: 'push origin main:CON' was "internal server error" (HTTP 500 + traceback in the log).
+        d = self.clone_with_commit()
+        self.cli("push", "-u", "origin", "main", cwd=d)
+        for dst in ("CON", "aux.txt"):
+            # The CLI now refuses the name before contacting the server (QA bug 5): exit 2, no request.
+            res = self.cli("push", "origin", f"main:{dst}", cwd=d, check=False)
+            self.assertEqual(res.returncode, 2, res)
+            self.assertIn("reserved device name", res.err, res)
+            self.assertNotIn("internal server error", res.err, res)
+        # A client without that check still gets a clean 409 from the server: covered at the HTTP level by
+        # tests.test_server (test_windows_reserved_branch_name_is_a_clean_rejection).
+        self.assertNotIn("Traceback", self.srv.log())
+        self.assertNotIn(" 500 ", self.srv.log())
+        bare = Repository.open(os.path.join(self.root, "repos", "proj"))
+        self.assertEqual(sorted(bare.refs.list()), ["refs/heads/main"])
 
     def test_push_delete_accepts_git_option_order(self):
         d = self.clone_with_commit()
@@ -311,6 +331,7 @@ class TestTruncatedTransfer(unittest.TestCase):
         from minigit.transport import HttpRemote
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = os.path.join(tmp, "srv")
+            auth.server_init(root)
             auth.create_repo(root, "proj", public=True)
             httpd = server.make_server(root, "127.0.0.1", 0)
             t = threading.Thread(target=httpd.serve_forever, daemon=True)

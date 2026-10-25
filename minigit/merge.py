@@ -290,14 +290,18 @@ def _normalize_message(msg: str) -> str:
 
 
 def _three_way(repo: Repository, index: Index, head: str, theirs: str, ours: FlatTree,
-               rev: str, label: str, message: str | None) -> tuple[MergeOutcome, str | None]:
+               rev: str, label: str, message: str | None,
+               allow_unrelated: bool = False) -> tuple[MergeOutcome, str | None]:
     store = repo.objects
     bases = merge_bases(store, head, theirs)
-    if not bases:
-        raise MinigitError("refusing to merge unrelated histories")
+    if not bases and not allow_unrelated:
+        raise MinigitError("refusing to merge unrelated histories",
+                           hint="use --allow-unrelated-histories if you really want to join them")
     # Several merge bases (criss-cross history): merge them into a virtual base
     # first, so a conflict the two sides resolved differently conflicts again.
-    res = merge_trees(store, merged_base_flat(store, bases), ours, commit_flat(store, theirs), "HEAD", label)
+    # Unrelated histories (allowed explicitly) merge against an empty base, as in git.
+    base_flat: FlatTree = merged_base_flat(store, bases) if bases else {}
+    res = merge_trees(store, base_flat, ours, commit_flat(store, theirs), "HEAD", label)
 
     target: dict[str, Entry | None] = {}
     for p in set(ours) | set(res.merged) | set(res.stages):
@@ -349,7 +353,7 @@ def _three_way(repo: Repository, index: Index, head: str, theirs: str, ours: Fla
 
 
 def merge(repo: Repository, rev: str, *, message: str | None = None, label: str | None = None,
-          no_ff: bool = False) -> MergeOutcome:
+          no_ff: bool = False, allow_unrelated: bool = False) -> MergeOutcome:
     repo.require_worktree()
     store = repo.objects
     op = repo.operation_in_progress()
@@ -381,7 +385,8 @@ def merge(repo: Repository, rev: str, *, message: str | None = None, label: str 
             outcome = MergeOutcome("fast-forward", theirs, head, [],
                                    [f"Updating {head[:7]}..{theirs[:7]}", "Fast-forward"])
         else:
-            outcome, merge_msg = _three_way(repo, index, head, theirs, head_flat, rev, label, message)
+            outcome, merge_msg = _three_way(repo, index, head, theirs, head_flat, rev, label, message,
+                                            allow_unrelated)
     # The index is written; now move refs / record merge state.
     if head is not None:
         repo.refs.write_special("ORIG_HEAD", head)

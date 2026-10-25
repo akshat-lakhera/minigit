@@ -166,7 +166,7 @@ class CliTestCase(unittest.TestCase):
             format_fetch=Mock(return_value="From http://h:1/p\n * [new branch]      main -> origin/main"),
             pull=Mock(return_value=(["change"], Outcome("merged", ["Merge made by the 'three-way' strategy."]))),
             push=Mock(return_value=["To http://h:1/p", "   1..2  main -> main"]),
-            format_push_rejection=Mock(return_value="To http://h:1/p\n ! [rejected]        main -> main (non-fast-forward)\nhint: Run 'minigit pull' first, then push again (pull first)."),
+            format_push_rejection=Mock(return_value="To http://h:1/p\n ! [rejected]        main -> main (non-fast-forward)\nhint: Integrate the remote changes first ('minigit pull'), then push again."),
             login=Mock(),
         )
         self.transport = mod("transport", split_url=Mock(return_value=("http://h:1", ("u", "t"))))
@@ -179,7 +179,7 @@ class CliTestCase(unittest.TestCase):
         )
         self.auth = mod(
             "auth",
-            server_init=Mock(), add_user=Mock(return_value="TOKEN123"),
+            server_init=Mock(return_value=True), require_root=Mock(), add_user=Mock(return_value="TOKEN123"),
             create_repo=Mock(return_value="/root/repos/proj"),
             list_server=Mock(return_value="users:\n  alice\nrepos:\n  proj"),
         )
@@ -595,13 +595,15 @@ class BranchCommandTests(CliTestCase):
 
     def test_merge_fast_forward(self):
         out = self.ok("merge", "feature")
-        self.merge.merge.assert_called_with(self.repo, "feature", message=None, no_ff=False)
+        self.merge.merge.assert_called_with(self.repo, "feature", message=None, no_ff=False, allow_unrelated=False)
         self.assertEqual(out, "Updating 1..2\nFast-forward\n")
 
     def test_merge_options(self):
         self.merge.merge.return_value = Outcome("merged", ["Merge made by the 'three-way' strategy."])
         self.ok("merge", "--no-ff", "-m", "msg", "feature")
-        self.merge.merge.assert_called_with(self.repo, "feature", message="msg", no_ff=True)
+        self.merge.merge.assert_called_with(self.repo, "feature", message="msg", no_ff=True, allow_unrelated=False)
+        self.ok("merge", "--allow-unrelated-histories", "other")  # QA bug 12
+        self.merge.merge.assert_called_with(self.repo, "other", message=None, no_ff=False, allow_unrelated=True)
 
     def test_merge_up_to_date_exit_0(self):
         self.merge.merge.return_value = Outcome("up-to-date", ["Already up to date."])
@@ -719,13 +721,15 @@ class RemoteCommandTests(CliTestCase):
 
     def test_pull_merged(self):
         out = self.ok("pull")
-        self.remote.pull.assert_called_with(self.repo, None, None)
+        self.remote.pull.assert_called_with(self.repo, None, None, allow_unrelated=False)
         self.remote.remote_url.assert_called_with(self.repo, "upstream")  # from get_upstream
         self.assertIn("main -> origin/main", out)
         self.assertIn("Merge made by the 'three-way' strategy.", out)
         self.ok("pull", "origin", "main")
-        self.remote.pull.assert_called_with(self.repo, "origin", "main")
+        self.remote.pull.assert_called_with(self.repo, "origin", "main", allow_unrelated=False)
         self.remote.remote_url.assert_called_with(self.repo, "origin")
+        self.ok("pull", "--allow-unrelated-histories")
+        self.remote.pull.assert_called_with(self.repo, None, None, allow_unrelated=True)
 
     def test_pull_default_remote_without_upstream(self):
         self.ops.get_upstream.return_value = None
@@ -765,7 +769,7 @@ class RemoteCommandTests(CliTestCase):
         self.assertEqual(out, "")
         self.remote.format_push_rejection.assert_called_with(err_obj, "main", "main")
         self.assertIn("[rejected]", err)
-        self.assertIn("pull first", err)
+        self.assertIn("'minigit pull'", err)
 
     def test_push_rejected_refspec_names(self):
         err_obj = self.E.PushRejectedError("push rejected", results=[], url="u")
@@ -838,14 +842,18 @@ class ServerCommandTests(CliTestCase):
         root = os.path.join(self.cwd, "srv")
         out = self.ok("server", "init", "srv")
         self.auth.server_init.assert_called_with(root)
-        self.assertIn(root, out)
+        self.auth.require_root.assert_not_called()
+        self.assertEqual(out, f"Initialized minigit server root in {root}\n")
+        self.auth.server_init.return_value = False
+        self.assertEqual(self.ok("server", "init", "srv"), f"Reinitialized existing minigit server root in {root}\n")
 
     def test_server_add_user(self):
         self.assertEqual(self.ok("server", "add-user", "srv", "alice"), "TOKEN123\n")
         self.auth.add_user.assert_called_with(os.path.join(self.cwd, "srv"), "alice", reset=False)
         self.ok("server", "add-user", "srv", "alice", "--reset")
         self.auth.add_user.assert_called_with(os.path.join(self.cwd, "srv"), "alice", reset=True)
-        self.auth.server_init.assert_called_with(os.path.join(self.cwd, "srv"))
+        self.auth.require_root.assert_called_with(os.path.join(self.cwd, "srv"), "srv")
+        self.auth.server_init.assert_not_called()  # only 'server init' creates a root
 
     def test_server_add_user_exists(self):
         self.auth.add_user.side_effect = self.E.MinigitError("user 'alice' already exists (use --reset)")

@@ -98,7 +98,7 @@ class MultiUserTests(unittest.TestCase):
     def assert_rejected(self, res):
         self.assertEqual(res.returncode, 1, str(res))
         self.assertIn("[rejected]", res.err)
-        self.assertIn("pull first", res.err)
+        self.assertIn("'minigit pull'", res.err)
         self.assertIn("error: failed to push some refs", res.err)
 
     # -- tests ------------------------------------------------------------
@@ -280,7 +280,7 @@ class MultiUserTests(unittest.TestCase):
             if i not in winners:
                 self.assertEqual(r.returncode, 1, str(r))
                 self.assertIn("[rejected]", r.err)
-                self.assertIn("pull first", r.err)
+                self.assertIn("'minigit pull'", r.err)
         winner_head = self.head(clones[winners[0]][0], clones[winners[0]][1])
         self.assertEqual(self.head(self.server_repo_dir(repo)), winner_head)
         res = self.mg(self.server_repo_dir(repo), self.admin_env, "fsck")

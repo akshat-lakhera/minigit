@@ -1,8 +1,8 @@
 # minigit
 
 A git clone written from scratch in Python 3.11 with the standard library only, plus a multi-user HTTP
-server. It reads and writes git's own object format (blobs, trees, commits, SHA-1 ids, zlib loose objects,
-the binary index), has branches, three-way merges with conflict markers, blame, grep, cherry-pick, revert,
+server. It reads and writes git's own object format (blobs, trees, commits, SHA-1 ids, zlib loose objects;
+the index is minigit's own binary format), has branches, three-way merges with conflict markers, blame, grep, cherry-pick, revert,
 rebase and stash, and lets several people clone, push and pull the same repositories safely, with
 lightweight pull requests and a read-only web view.
 
@@ -22,7 +22,9 @@ pip install .                            # optional: puts a `minigit` command on
 
 `minigit --help` lists every command, `minigit <command> --help` explains one, `-C <dir>` runs a command as if
 started in `dir`. Set your identity once: `minigit config --global user.name "You"` and
-`minigit config --global user.email you@example.com`.
+`minigit config --global user.email you@example.com`. For a single run (scripts, CI) the environment variables
+`MINIGIT_AUTHOR_NAME` and `MINIGIT_AUTHOR_EMAIL` override the configured identity, and `MINIGIT_GLOBAL_CONFIG`
+names another global config file (default `~/.minigitconfig`).
 
 Try the whole multi-user story in one go: `python demo.py` (see below).
 
@@ -72,7 +74,9 @@ minigit server remove-user srv bob            # also removes bob from every acce
 ```
 
 `add-user --reset` replaces only the user's `default` token. A signed-in user without access to a repository gets
-`permission denied`. Details: `features/server-admin.md`.
+`permission denied` (HTTP 403; a repository that does not exist is 404). An anonymous caller gets 401 for any
+non-public repository name, whether or not it exists, so names cannot be discovered. Details:
+`features/server-admin.md`.
 
 Alice and Bob each:
 
@@ -82,7 +86,14 @@ cd project
 ```
 
 (Or `minigit login http://host:8080 --user alice --token TOKEN` once and clone without credentials in the URL;
-`MINIGIT_USER`/`MINIGIT_TOKEN` work for single calls.)
+`MINIGIT_USER`/`MINIGIT_TOKEN` work for single calls. `login` stores the credentials in
+`~/.minigit-credentials.json`; `MINIGIT_CREDENTIALS` names a different credentials file.)
+Which identity a command uses: `MINIGIT_USER`+`MINIGIT_TOKEN` override everything; otherwise a remote URL with
+a user (`http://bob@host/...`, which is what cloning with `bob:TOKEN@` leaves behind) uses bob's saved token,
+and a URL without a user uses the host default that only `minigit login` sets, so a `user:token@` URL never
+changes who your other clones push as.
+Pushes and fetches wait up to 900 s for the server (`MINIGIT_HTTP_TIMEOUT=<seconds>` changes that); if the
+wait runs out, the push may still be applied, so run `minigit fetch` to check.
 
 ```
 # alice
@@ -90,14 +101,20 @@ echo "from Alice" > greeting.txt && minigit add greeting.txt && minigit commit -
 
 # bob, who edited the same file without pulling
 minigit push
+To http://bob@host:8080/project
  ! [rejected]        main -> main (fetch first)
- hint: Updates were rejected because the remote contains work that you do not have locally.
+error: failed to push some refs to 'http://bob@host:8080/project'
+hint: Updates were rejected because the remote contains work that you do not have locally.
+hint: Integrate the remote changes first ('minigit pull'), then push again.
 
 minigit pull                 # CONFLICT (content): Merge conflict in greeting.txt
 # edit greeting.txt, remove the <<<<<<< / ======= / >>>>>>> lines
 minigit add greeting.txt && minigit commit -m "Merge Alice's greeting"
 minigit push                 # accepted: a fast-forward of the server branch
 ```
+
+Bob should clone after Alice's first push; if both clone the empty repository and each make a first commit, `pull`
+refuses to merge the unrelated histories until Bob runs `minigit pull --allow-unrelated-histories`.
 
 Real output of this flow is in `python demo.py`. Pushes are compare-and-swap on refs under a per-repo lock, so
 two simultaneous pushes can never lose a commit; forced pushes need `--allow-force` on the repo. A branch is
@@ -106,7 +123,7 @@ removed on the server with `minigit push --delete origin NAME`.
 ### Pull requests
 
 A pull request asks the server to merge one of its branches into another. It lives on the server
-(`pulls.json` next to the bare repo), always uses the branch tips as they are on the server, and is merged
+(`pulls.json` inside the bare repo), always uses the branch tips as they are on the server, and is merged
 there, under the same lock as pushes, as a real merge commit `Merge pull request #N from <head>`:
 
 ```
@@ -133,7 +150,8 @@ operations are available as JSON over HTTP under `/<repo>/pulls` (`features/pull
 `minigit serve` also serves a read-only, JavaScript-free site at `http://host:8080/-/`: repository list,
 summary, branches, paged commit log, a commit with its diff, a file browser and raw file download. Access
 follows the same ACLs as the protocol (the browser asks for user name + token; `--public` repos are readable
-anonymously). Pass `serve --no-web` to turn it off.
+anonymously; any other repository name, existing or not, answers 401 to an anonymous browser). Browsers cache HTTP
+Basic credentials, so there is no log-out other than closing the browser. Pass `serve --no-web` to turn it off.
 
 ## Command reference
 
@@ -151,7 +169,7 @@ anonymously). Pass `serve --no-web` to turn it off.
 | `branch [-v] [-r] [-a] [-d NAME] [-D NAME] [NAME [START]]` | List, create, delete branches |
 | `switch [-c BRANCH] [--detach] TARGET` | Switch branches |
 | `checkout [-b BRANCH] TARGET \| REV -- PATH` | Switch branches, detach HEAD, or restore files |
-| `merge [--no-ff] [-m MSG] REV` / `merge --abort` | Three-way merge with conflict markers |
+| `merge [--no-ff] [-m MSG] [--allow-unrelated-histories] REV` / `merge --abort` | Three-way merge with conflict markers |
 | `cherry-pick [-n] [-x] [-m N] [--allow-empty] REV...` (`--continue`, `--abort`) | Apply the change of existing commits onto HEAD |
 | `revert [-n] [-m N] REV...` (`--continue`, `--abort`) | Record a commit that undoes a commit |
 | `stash [push] [-m MSG] [-u]` / `stash (pop \| apply \| drop \| show) [stash@{N}]` / `stash (list \| clear)` | Shelve local changes (with `-u` also untracked files) and reapply them later |
@@ -163,9 +181,9 @@ anonymously). Pass `serve --no-web` to turn it off.
 | `remote [-v] \| add NAME URL \| remove NAME` | Manage remotes |
 | `clone URL [dir]` | Clone from a minigit server |
 | `fetch [REMOTE]` | Download objects, update remote-tracking branches |
-| `pull [REMOTE [BRANCH]]` | Fetch and merge the upstream branch |
+| `pull [--allow-unrelated-histories] [REMOTE [BRANCH]]` | Fetch and merge the upstream branch |
 | `push [-u] [-f] [--delete] [REMOTE [SRC[:DST]]]` | Upload a branch (or delete a remote branch) |
-| `pr open --title T [-m BODY]... [--head B] [--base B]` | Open a pull request on the server |
+| `pr open -t\|--title T [-m BODY]... [--head B] [--base B]` | Open a pull request on the server |
 | `pr list [--state open\|merged\|closed\|all]` / `pr show N` / `pr diff N` | List pull requests, show one, show its diff |
 | `pr merge N [-m MSG]` / `pr close N` | Merge a pull request on the server (always a merge commit) or close it; every `pr` command takes `--remote NAME` |
 | `login URL --user U --token T` | Store credentials for a server |
@@ -180,6 +198,7 @@ anonymously). Pass `serve --no-web` to turn it off.
 | `server perm ROOT REPO USERS [read \| write \| none]` | Show or set the access of users (or `*`) to a repository |
 | `server set-repo ROOT REPO [--public \| --private] [--allow-force \| --no-allow-force]` | Change a repository's flags |
 | `server list ROOT` | List users (with token names) and repositories |
+| `fsck` | Verify the object store and ref connectivity |
 | `cat-file (-p \| -t \| -s) OBJ` | Print an object's content, type or size |
 | `ls-files [-s]` | List files in the index |
 | `hash-object [-w] FILE` | Compute (and store) a blob id |
@@ -196,7 +215,7 @@ work tree/
   .minigit/
     HEAD                 "ref: refs/heads/main" or a detached 40-hex id
     config               INI (user.*, remote.*, branch.*)
-    index                git's binary index format
+    index                minigit's own binary index ("MIDX", SPEC section 3; not git's)
     objects/ab/cdef...   zlib loose objects: "<type> <size>\0<payload>", SHA-1 ids
     refs/heads/*  refs/remotes/<remote>/*
     ORIG_HEAD  MERGE_HEAD  MERGE_MSG   present during merges / resets
@@ -204,8 +223,9 @@ work tree/
 
 Objects are byte-identical to git's, so a minigit object hashes to the same id git would give it
 (`hash-object` matches `git hash-object`). The directory is `.minigit` rather than `.git`, so the two tools do not
-interfere. A server root holds `server.json` (users, token hashes, per-repo ACLs) and one bare repository per
-repo. Details and every edge case: `SPEC.md`.
+interfere. A server root holds `server.json` (users, token hashes, per-repo ACLs), `audit.log` (one line per
+push) and `repos/<name>/`, one bare repository per repo (so `repos/` sits next to `server.json` and `audit.log`;
+a pull request database `pulls.json` lives inside the bare repository). Details and every edge case: `SPEC.md`.
 
 ## Limitations compared with real git
 
@@ -224,10 +244,10 @@ repo. Details and every edge case: `SPEC.md`.
 python -m unittest discover -s tests -t .
 ```
 
-About 600 tests: unit tests per module, CLI tests, and end-to-end tests that start a live `minigit serve` and
-drive clones, pushes, conflicts and concurrent pushes through real subprocesses. `tests_blackbox/` holds
-independent QA suites written against `SPEC.md` only (they drive the CLI as a user would). `tests_future/`
-holds acceptance tests for designed-but-unbuilt features (skipped unless `MINIGIT_RUN_FUTURE=1`).
+798 tests in `tests/` (counted as `def test_`): unit tests per module, CLI tests, and end-to-end tests that start a
+live `minigit serve` and drive clones, pushes, conflicts and concurrent pushes through real subprocesses.
+`tests_blackbox/` holds another 422 tests, independent QA suites written against `SPEC.md` only (they drive the CLI
+as a user would); run them with `python -m unittest discover -s tests_blackbox -t .`.
 
 ## Demo
 

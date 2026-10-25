@@ -173,6 +173,7 @@ class RepoFixture(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.root = os.path.join(self._tmp.name, "srv")
+        auth.server_init(self.root)
         self.tokens = {name: auth.add_user(self.root, name) for name in ("alice", "bob")}
         auth.create_repo(self.root, "proj", readers=["alice"], writers=["alice"])
         auth.create_repo(self.root, "pub", readers=["alice"], writers=["alice"], public=True)
@@ -430,6 +431,19 @@ class ServerHookTests(RepoFixture):
             return r.status, {k.lower(): v for k, v in r.getheaders()}, r.read()
         finally:
             conn.close()
+
+    def test_anonymous_web_requests_cannot_tell_private_names_from_missing_ones(self):
+        srv, _ = self.start()
+        port = srv.server_address[1]
+        for path in ("/-/proj/", "/-/nosuch/", "/-/proj/log", "/-/nosuch/branches"):
+            status, headers, _ = self.http(port, "GET", path, {"Accept": "text/html"})
+            self.assertEqual(status, 401, path)
+            self.assertIn("www-authenticate", headers, path)
+        creds = "Basic " + base64.b64encode(f"bob:{self.tokens['bob']}".encode()).decode()
+        status, _, _ = self.http(port, "GET", "/-/proj/", {"Authorization": creds})
+        self.assertEqual(status, 403, "a signed-in user without access is denied, not told the repo is missing")
+        status, _, _ = self.http(port, "GET", "/-/nosuch/", {"Authorization": creds})
+        self.assertEqual(status, 404)
 
     def test_web_prefix_skips_the_protocol_header_and_redirects_browsers(self):
         srv, _ = self.start()

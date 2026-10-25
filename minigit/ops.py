@@ -330,7 +330,9 @@ def _branch_ref(name: str) -> str:
     ref = f"refs/heads/{name}"
     try:
         check_ref_name(ref)
-    except MinigitError:
+    except MinigitError as e:
+        if ": too long" in e.message:  # say why: the name is fine apart from its length
+            raise MinigitError(f"{invalid.message}: {e.message.rsplit(': ', 1)[1]}") from None
         raise invalid from None
     return ref
 
@@ -478,9 +480,15 @@ def switch(repo: Repository, target: str | None, *, create: str | None = None, s
         repo.refs.set_symbolic_head(ref)
         return f"Switched to branch '{target}'"
 
-    # DWIM: exactly one remote-tracking branch with this name
+    # DWIM: exactly one remote-tracking branch with this name.  Names with '/' (feature/x)
+    # qualify too, unless the name already is a remote-tracking ref ('origin/main').
     matches = _remote_branch_matches(repo, target)
-    if len(matches) == 1 and "/" not in target and target not in ("HEAD", "@"):
+    if target in ("HEAD", "@") or repo.refs.read_raw("refs/remotes/" + target) is not None:
+        matches = []
+    if len(matches) > 1:
+        raise MinigitError(f"'{target}' matched multiple ({len(matches)}) remote tracking branches",
+                           hint=f"say which one: minigit switch -c {target} <remote>/{target}")
+    if len(matches) == 1:
         remote, _, sha = matches[0]
         ref = _branch_ref(target)
         _checkout_commit(repo, sha)

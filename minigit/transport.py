@@ -27,6 +27,9 @@ PACK_CONTENT_TYPE = "application/x-minigit-pack"
 PUSH_CONTENT_TYPE = "application/x-minigit-push"
 PUSH_MAGIC = b"MGPUSH1\n"
 DEFAULT_PORTS = {"http": 80, "https": 443}
+CONNECT_TIMEOUT = 30.0   # seconds to establish the TCP (and TLS) connection
+DATA_TIMEOUT = 900.0     # seconds to wait on a push/fetch: the server writes every object synchronously
+DATA_TIMEOUT_ENV = "MINIGIT_HTTP_TIMEOUT"
 
 _HEX = set("0123456789abcdef")
 
@@ -157,8 +160,13 @@ def load_credentials(url: str) -> tuple[str, str] | None:
     return None
 
 
-def save_credentials(url: str, user: str, token: str) -> None:
-    """Store credentials for ``scheme://host:port`` of ``url`` (chmod 600 on POSIX)."""
+def save_credentials(url: str, user: str, token: str, *, host_default: bool = False) -> None:
+    """Store ``user``'s token for ``scheme://host:port`` of ``url`` (chmod 600 on POSIX).
+
+    The entry is always keyed ``scheme://host:port|user``.  Only ``host_default=True``
+    (``minigit login``) also makes it the host-wide default used by URLs without a user;
+    a ``user:token@`` URL given to clone/remote add must not change who other clones act as.
+    """
     from .util import LockFile  # local import: keeps transport importable on its own
 
     if not user:
@@ -169,7 +177,8 @@ def save_credentials(url: str, user: str, token: str) -> None:
     os.makedirs(parent, exist_ok=True)
     with LockFile(path, timeout=5.0) as lock:
         data = _read_credentials_file(path)
-        data[key] = {"user": user, "token": token}
+        if host_default:
+            data[key] = {"user": user, "token": token}
         data[f"{key}|{user}"] = {"user": user, "token": token}
         lock.write((json.dumps(data, indent=2, sort_keys=True) + "\n").encode("utf-8"))
         if os.name != "nt":
@@ -195,6 +204,58 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None  # urllib then raises HTTPError for the 3xx response
 
 
+def default_data_timeout() -> float:
+    """Read timeout of push/fetch requests: ``MINIGIT_HTTP_TIMEOUT`` seconds, default 900."""
+    raw = os.environ.get(DATA_TIMEOUT_ENV, "").strip()
+    if not raw:
+        return DATA_TIMEOUT
+    try:
+        value = float(raw)
+    except ValueError:
+        value = 0.0
+    if not value > 0 or value == float("inf"):
+        raise MinigitError(f"invalid {DATA_TIMEOUT_ENV} '{raw}': expected a number of seconds > 0")
+    return value
+
+
+def _connection_factory(base: type, req: urllib.request.Request) -> Callable[..., http.client.HTTPConnection]:
+    """``base`` connections that connect within ``req.timeout`` (short) and then wait up to
+    ``req.minigit_read_timeout`` for the server, recording on ``req`` that the connect worked."""
+
+    def make(host: str, **kw) -> http.client.HTTPConnection:
+        conn = base(host, **kw)
+        connect = conn.connect
+
+        def connect_then_wait() -> None:
+            connect()
+            req.minigit_connected = True
+            read_timeout = getattr(req, "minigit_read_timeout", None)
+            if read_timeout is not None and conn.sock is not None:
+                conn.sock.settimeout(read_timeout)
+
+        conn.connect = connect_then_wait
+        return conn
+
+    return make
+
+
+class _HTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):  # noqa: D102
+        return self.do_open(_connection_factory(http.client.HTTPConnection, req), req)
+
+
+_HANDLER_CLASSES: list[type] = [_HTTPHandler]
+if hasattr(urllib.request, "HTTPSHandler"):  # Python built without ssl: http only
+    class _HTTPSHandler(urllib.request.HTTPSHandler):
+        def https_open(self, req):  # noqa: D102
+            kw = {"context": self._context}
+            if getattr(self, "_check_hostname", None) is not None:
+                kw["check_hostname"] = self._check_hostname
+            return self.do_open(_connection_factory(http.client.HTTPSConnection, req), req, **kw)
+
+    _HANDLER_CLASSES.append(_HTTPSHandler)
+
+
 def _describe(exc: BaseException) -> str:
     if isinstance(exc, http.client.IncompleteRead):
         expected = f" of {len(exc.partial) + exc.expected}" if exc.expected is not None else ""
@@ -211,14 +272,18 @@ class RemoteRefs:
 class HttpRemote:
     """A remote repository reached over minigit HTTP protocol v1."""
 
-    def __init__(self, url: str, timeout: float = 60.0) -> None:
+    def __init__(self, url: str, timeout: float = 60.0, data_timeout: float | None = None) -> None:
         clean, _ = split_url(url)
         parts = check_url(clean)
         self.url = clean.rstrip("/")
         self.server_url = urllib.parse.urlunsplit((parts.scheme, parts.netloc, "", "", ""))
-        self.timeout = timeout
+        self.timeout = timeout  # read timeout of the small requests (info/refs, pulls, ...)
+        self.connect_timeout = min(timeout, CONNECT_TIMEOUT)
+        # push/fetch: the server may legitimately take minutes (one fsync per object)
+        self.data_timeout = data_timeout if data_timeout is not None else default_data_timeout()
         self.credentials = load_credentials(url)
-        self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+        self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect(),
+                                                   *(cls() for cls in _HANDLER_CLASSES))
         self.requests_sent = 0  # handy for tests / diagnostics
 
     # -- low level -------------------------------------------------------
@@ -230,18 +295,30 @@ class HttpRemote:
             headers["Authorization"] = "Basic " + base64.b64encode(raw).decode("ascii")
         return headers
 
+    def _timeout_error(self, read_timeout: float, after: str, data: bool) -> RemoteError:
+        hint = f"the server did not answer within {read_timeout:g} s"
+        if data:
+            hint += f"; set {DATA_TIMEOUT_ENV}=<seconds> to wait longer"
+        return RemoteError(f"timed out waiting for the server at {self.url}; {after}", hint=hint)
+
     def _request(self, method: str, full_url: str, body: bytes | None = None,
                  content_type: str | None = None,
-                 on_error: Callable[[int, bytes], None] | None = None) -> bytes:
+                 on_error: Callable[[int, bytes], None] | None = None,
+                 data: bool = False,
+                 on_timeout: str = "nothing was changed locally, try again") -> bytes:
+        """``data=True`` (push/fetch) waits ``self.data_timeout`` for the answer, else ``self.timeout``."""
         headers = self._headers()
         if body is not None:
             headers["Content-Type"] = content_type or "application/octet-stream"
             headers["Content-Length"] = str(len(body))
         req = urllib.request.Request(full_url, data=body, method=method, headers=headers)
+        read_timeout = self.data_timeout if data else self.timeout
+        req.minigit_read_timeout = read_timeout  # applied once connected (see _connection_factory)
+        req.minigit_connected = False
         self.requests_sent += 1
         phase = ["connecting"]
         try:
-            with self._opener.open(req, timeout=self.timeout) as resp:
+            with self._opener.open(req, timeout=self.connect_timeout) as resp:
                 phase[0] = "receiving"
                 return resp.read()
         except urllib.error.HTTPError as exc:
@@ -255,8 +332,13 @@ class HttpRemote:
                 on_error(exc.code, err_body)
             raise self._http_error(exc.code, err_body) from None
         except urllib.error.URLError as exc:
+            # urllib wraps errors raised while connecting *and* while sending the body
+            if req.minigit_connected and isinstance(exc.reason, TimeoutError):
+                raise self._timeout_error(read_timeout, on_timeout, data) from None
             raise RemoteError(f"could not connect to server at {self.url}: {exc.reason}") from None
         except (OSError, http.client.HTTPException) as exc:
+            if isinstance(exc, TimeoutError) and req.minigit_connected:  # connected, then no answer
+                raise self._timeout_error(read_timeout, on_timeout, data) from None
             if isinstance(exc, http.client.IncompleteRead) or (phase[0] == "receiving" and not isinstance(
                     exc, TimeoutError)):
                 raise RemoteError(f"transfer interrupted: the connection to {self.url} was lost while "
@@ -348,7 +430,7 @@ class HttpRemote:
 
     def fetch_pack(self, wants: Sequence[str], haves: Sequence[str]) -> bytes:
         body = json.dumps({"want": list(wants), "have": list(haves)}).encode("utf-8")
-        return self._request("POST", self.url + "/fetch", body, "application/json")
+        return self._request("POST", self.url + "/fetch", body, "application/json", data=True)
 
     def push(self, updates: Sequence[dict], pack: bytes, *, force: bool = False) -> dict:
         meta = json.dumps({"protocol": 1, "force": bool(force), "updates": list(updates)}).encode("utf-8")
@@ -367,7 +449,8 @@ class HttpRemote:
                                     code=payload.get("code") if isinstance(payload.get("code"), str) else "rejected",
                                     payload=payload) from None
 
-        resp = self._request("POST", self.url + "/push", body, PUSH_CONTENT_TYPE, on_error=on_error)
+        resp = self._request("POST", self.url + "/push", body, PUSH_CONTENT_TYPE, on_error=on_error, data=True,
+                             on_timeout="the push may still be applied, run 'minigit fetch' to check")
         return self._json(resp, "push")
 
     # -- pull requests (features/pull-requests-lite.md) ------------------

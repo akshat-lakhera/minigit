@@ -327,7 +327,9 @@ def _run(repo: Repository, action: str, shas: list[str], *, mainline: int | None
         outcomes.append(out)
         if out.kind == "conflict":
             rest = shas[i + 1:]
-            if rest and not no_commit:
+            if not no_commit:
+                # Always record where the sequence started (even with nothing left to do) so that
+                # --abort can rewind the commits that already landed, like git does.
                 _write_sequence(repo, {"action": action, "orig_head": orig_head, "todo": rest, "opts": opts})
             else:
                 repo.remove_state(SEQUENCER_FILE)
@@ -348,6 +350,10 @@ def start(repo: Repository, action: str, revs: list[str], *, mainline: int | Non
     _require_no_operation(repo)
     if not revs:
         raise UsageError(f"{action}: a revision is required")
+    for r in revs:
+        if ".." in r:
+            raise UsageError(f"{action}: ranges like '{r}' are not supported; list the commits instead "
+                             f"(oldest first), e.g. '{action} A B C'")
     shas = [resolve_rev(repo, r) for r in revs]
     head = repo.head_commit()
     if head is None:

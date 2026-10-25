@@ -8,6 +8,7 @@ safe on the server.
 
 from __future__ import annotations
 
+import errno
 import os
 import re
 import time
@@ -20,6 +21,10 @@ ANY = object()
 
 _HEX40 = re.compile(r"^[0-9a-f]{40}$")
 _BAD_CHARS = set("~^:?*[\\")
+# Refs are files: a component must fit a file name (255 bytes on NTFS/ext4/APFS) together with
+# the ".lock" suffix of its lock file; the whole name is capped so the path stays usable.
+MAX_REF_COMPONENT_BYTES = 255 - len(".lock")
+MAX_REF_NAME_BYTES = 1024
 
 
 def is_hex_sha(s: str) -> bool:
@@ -55,6 +60,10 @@ def check_ref_name(name: str) -> None:
             raise bad("component starts with '.'")
         if comp.endswith(".lock"):
             raise bad("component ends with '.lock'")
+        if len(comp.encode("utf-8", "surrogateescape")) > MAX_REF_COMPONENT_BYTES:
+            raise bad("too long (a component is over %d bytes)" % MAX_REF_COMPONENT_BYTES)
+    if len(name.encode("utf-8", "surrogateescape")) > MAX_REF_NAME_BYTES:
+        raise bad("too long (over %d bytes)" % MAX_REF_NAME_BYTES)
 
 
 def _check_windows_ref_name(name: str) -> None:
@@ -101,6 +110,10 @@ class RefStore:
                 if attempt == 49:
                     return None
                 time.sleep(0.002)
+            except OSError as e:  # a name no file can have (too long, ...) is a missing ref
+                if e.errno in (errno.EINVAL, errno.ENAMETOOLONG):
+                    return None
+                raise
         text = line.decode("utf-8", "surrogateescape").strip()
         return text or None
 

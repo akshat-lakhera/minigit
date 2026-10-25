@@ -241,6 +241,19 @@ def _same_ref(repo: Repository, ref: str, other: str) -> bool:
         return False
 
 
+def _unstorable(ref: str) -> str | None:
+    """Why ``refs.update`` would refuse to create ``ref`` on this platform (a Windows device name such
+    as ``CON`` or ``aux.txt``, a component ending in '.'), or None. Checked up front so the push is a
+    clean per-ref rejection and nothing is written."""
+    if os.name != "nt":  # refs.update applies the check on Windows only
+        return None
+    try:
+        refs_mod._check_windows_ref_name(ref)
+    except errors.MinigitError as e:
+        return _msg(e)
+    return None
+
+
 def _evaluate(repo: Repository, updates: list[dict], force: bool, allow_force: bool) -> tuple[list[dict], bool]:
     """Check every update against the current refs. Returns (results, rejected_any)."""
     store = repo.objects
@@ -254,7 +267,10 @@ def _evaluate(repo: Repository, updates: list[dict], force: bool, allow_force: b
         upd["cur"] = cur
         reason = message = None
         clash = _find_clash(ref, existing) if new is not None else None
-        if clash is not None:
+        unstorable = _unstorable(ref) if new is not None else None
+        if unstorable is not None:
+            reason, message = "invalid-ref-name", unstorable
+        elif clash is not None:
             reason, message = "ref-clash", MSG_CLASH.format(ref=ref, other=clash)
         elif cur != old:
             reason = "stale"
@@ -345,6 +361,14 @@ def process_push(root: str, repo_name: str, user: str, body: bytes, cfg: ServerC
                                 extra={"ok": False, "results": [
                                     {"ref": u["ref"], "status": "rejected",
                                      "reason": "stale" if repo.refs.resolve(u["ref"]) != u["cur"] else "ref-clash",
+                                     "current": repo.refs.resolve(u["ref"]), "message": _msg(e)}
+                                    for u in updates]})
+            except errors.MinigitError as e:  # anything else refs.update refuses: a rejection, never a 500
+                for upd in updates:
+                    _audit(root, user, repo_name, upd["ref"], upd["old"], upd["new"], "rejected")
+                raise HttpError(409, "rejected", f"push rejected: {_msg(e)}",
+                                extra={"ok": False, "results": [
+                                    {"ref": u["ref"], "status": "rejected", "reason": "rejected",
                                      "current": repo.refs.resolve(u["ref"]), "message": _msg(e)}
                                     for u in updates]})
             for upd in updates:

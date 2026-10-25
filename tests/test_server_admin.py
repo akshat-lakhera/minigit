@@ -288,6 +288,48 @@ class ServerAdminCliTests(_AdminCase):
         self.assertEqual(rec["token_sha256"], sha256(second))
         self.assertEqual(rec["tokens"]["ci"]["sha256"], sha256(ci), "--reset must keep named tokens")
 
+    def test_add_user_reset_of_a_missing_user_is_refused(self):
+        before = self.server_json()
+        res = self.fails(1, "add-user", "nobodyuser", "--reset")
+        self.assertIn("error: user 'nobodyuser' does not exist", res.err)
+        self.assertIn("without --reset", res.err)
+        self.assertEqual(res.out, "")
+        self.assertEqual(self.server_json(), before)
+
+    def test_add_user_refuses_dot_names_and_case_variants(self):
+        self.add_user("alice")
+        before = self.server_json()
+        for name in (".", ".."):
+            self.assertIn(f"invalid user name '{name}'", self.fails(1, "add-user", name).err)
+        res = self.fails(1, "add-user", "ALICE")
+        self.assertIn("'ALICE' differs only in case from the existing user 'alice'", res.err)
+        self.assertEqual(self.server_json(), before)
+
+    def test_server_init_on_an_existing_root_says_reinitialized(self):
+        self.add_user("alice")
+        res = run(["server", "init", self.srv], cwd=self.dir, env=self.env)
+        self.assertEqual(res.out, f"Reinitialized existing minigit server root in {self.srv}\n")
+        self.assertIn("alice", self.server_json()["users"])
+        fresh = os.path.join(self.dir, "fresh")
+        res = run(["server", "init", fresh], cwd=self.dir, env=self.env)
+        self.assertEqual(res.out, f"Initialized minigit server root in {fresh}\n")
+
+    def test_commands_on_a_missing_root_create_nothing(self):
+        """Only 'server init' creates a root: a mistyped ROOT is an error, not a new empty root."""
+        commands = [("add-user", "x"), ("add-user", "x", "--reset"), ("create-repo", "r"), ("list",),
+                    ("remove-user", "x"), ("add-token", "x", "ci"), ("list-tokens", "x"),
+                    ("revoke-token", "x", "--all"), ("perm", "r", "x"), ("perm", "r", "x", "read"),
+                    ("set-repo", "r", "--public")]
+        for args in commands:
+            with self.subTest(args=args):
+                res = run(["server", args[0], "typo_root", *args[1:]], cwd=self.dir, env=self.env, check=False)
+                self.assertEqual(res.returncode, 1, str(res))
+                self.assertIn(f"error: '{os.path.join(self.dir, 'typo_root')}' is not a minigit server root",
+                              res.err)
+                self.assertIn("hint: create it with 'minigit server init typo_root'", res.err)
+                self.assertEqual(res.out, "")
+                self.assertFalse(os.path.exists(os.path.join(self.dir, "typo_root")), str(res))
+
     def test_legacy_user_record_keeps_working(self):
         """A server.json written before this feature (token_sha256 only) needs no migration."""
         legacy = "legacy-token-abcdefghijklmnop"
@@ -438,9 +480,23 @@ class ServerAdminCliTests(_AdminCase):
         self.fails(2, "perm", "proj", " , ", "read")
         self.assertEqual(self.server_json(), before, "a refused perm must not touch server.json")
 
+    def test_create_repo_refuses_unknown_users(self):
+        self.add_user("alice")
+        before = self.server_json()
+        for flags in (("--readers", "ghost"), ("--writers", "alice,ghost")):
+            res = self.fails(1, "create-repo", "r2", *flags)
+            self.assertIn("error: user 'ghost' does not exist", res.err)
+        self.assertEqual(self.server_json(), before)
+        self.assertFalse(os.path.exists(os.path.join(self.srv, "repos", "r2")))
+        self.create_repo("r2", "--readers", "*", "--writers", "alice")
+
     def test_perm_none_cleans_up_a_name_that_is_not_a_user(self):
         self.add_user("alice")
+        self.add_user("ghost")
         self.create_repo("stale", "--readers", "ghost,alice", "--writers", "ghost")
+        data = self.server_json()  # a user deleted by hand leaves stale entries behind
+        del data["users"]["ghost"]
+        write_bytes(os.path.join(self.srv, "server.json"), json.dumps(data).encode("utf-8"))
         res = self.adm("perm", "stale", "ghost", "none")
         self.assertEqual(res.out, "stale: ghost = none\n")
         self.assertEqual((self.repo("stale")["readers"], self.repo("stale")["writers"]), (["alice"], []))

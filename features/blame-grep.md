@@ -1,7 +1,7 @@
 # Feature design: `blame` and `grep`
 
-Status: designed, not implemented. Acceptance tests: `tests_future/test_blame_grep.py`
-(class is `@unittest.skip`-ped until the feature lands).
+Status: implemented in `minigit/blame.py` and `minigit/grep.py` (the parsers are wired in `cli.py`).
+Acceptance tests: `tests/test_blame_grep.py`.
 
 Both commands are **read-only**. They take no locks, write nothing under `.minigit/`, and
 change nothing in the protocol or the on-disk formats, so they are safe to run while any
@@ -387,7 +387,7 @@ exactly like `status`) and worktree files.
 
 ---
 
-## 5. Edge cases (all covered by `tests_future/test_blame_grep.py` unless marked *unit*)
+## 5. Edge cases (all covered by `tests/test_blame_grep.py` unless marked *unit*)
 
 blame
 - Lines introduced on a side branch and brought in by a merge blame the side-branch commit,
@@ -490,9 +490,8 @@ README: a `blame`/`grep` line each in "Local workflow".
 5. **`cli.py`** (45 min): section 3 verbatim; `minigit blame --help` and `minigit grep --help`
    must work with the library absent (lazy imports). Add the two commands to
    `tests/test_cli.py`'s fake-based argument tests if that file has a table of commands.
-6. **Acceptance tests** (30 min): move `tests_future/test_blame_grep.py` to
-   `tests/test_e2e_blame_grep.py`, delete the `@unittest.skip` line, run it on Windows and
-   (if available) Linux. Delete the empty `tests_future/` folder.
+6. **Acceptance tests** (30 min): `tests/test_blame_grep.py` runs in the normal suite; run it on
+   Windows and (if available) Linux.
 7. **Docs** (45 min): SPEC.md section 6/8 text from section 6 above, README lines, and
    `--help` strings. Run the full suite again; the baseline from step 1 must not regress.
 

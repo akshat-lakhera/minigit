@@ -15,6 +15,7 @@ import socket
 import struct
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -101,7 +102,7 @@ class CredentialTests(_EnvCase):
         self.assertIsNone(T.load_credentials(self.URL))
 
     def test_save_and_load_file(self):
-        T.save_credentials(self.URL, "alice", "TOK")
+        T.save_credentials(self.URL, "alice", "TOK", host_default=True)
         with open(T.credentials_path(), "rb") as fh:
             data = json.loads(fh.read())
         entry = {"user": "alice", "token": "TOK"}
@@ -111,14 +112,28 @@ class CredentialTests(_EnvCase):
         self.assertFalse(os.path.exists(T.credentials_path() + ".lock"))
 
     def test_save_keeps_other_hosts_and_overwrites_same_host(self):
-        T.save_credentials(self.URL, "alice", "1")
-        T.save_credentials("http://other:1/p", "bob", "2")
-        T.save_credentials(self.URL, "carol", "3")
+        T.save_credentials(self.URL, "alice", "1", host_default=True)
+        T.save_credentials("http://other:1/p", "bob", "2", host_default=True)
+        T.save_credentials(self.URL, "carol", "3", host_default=True)  # a second `login` may switch
         self.assertEqual(T.load_credentials(self.URL), ("carol", "3"))
         self.assertEqual(T.load_credentials("http://other:1/x"), ("bob", "2"))
 
+    def test_userinfo_credentials_do_not_change_the_host_default(self):
+        # QA bug 1: a `user:token@` URL used once (clone / remote add) must not change who
+        # every other clone of that server acts as; only `login` sets the host default.
+        T.save_credentials(self.URL, "alice", "A", host_default=True)   # minigit login
+        T.save_credentials(self.URL, "bob", "B")                         # clone http://bob:B@...
+        with open(T.credentials_path(), "rb") as fh:
+            data = json.loads(fh.read())
+        self.assertEqual(data["http://127.0.0.1:8765"], {"user": "alice", "token": "A"})
+        self.assertEqual(T.load_credentials(self.URL), ("alice", "A"))
+        self.assertEqual(T.load_credentials("http://bob@127.0.0.1:8765/proj"), ("bob", "B"))
+        T.save_credentials("http://fresh:1/p", "carol", "C")  # no login for that host at all
+        self.assertIsNone(T.load_credentials("http://fresh:1/p"))
+        self.assertEqual(T.load_credentials("http://carol@fresh:1/p"), ("carol", "C"))
+
     def test_order_env_then_userinfo_then_file(self):
-        T.save_credentials(self.URL, "filer", "F")
+        T.save_credentials(self.URL, "filer", "F", host_default=True)
         with_info = "http://urler:U@127.0.0.1:8765/proj"
         self.assertEqual(T.load_credentials(self.URL), ("filer", "F"))
         self.assertEqual(T.load_credentials(with_info), ("urler", "U"))
@@ -294,6 +309,51 @@ class TransportFakeServerTests(_EnvCase):
             T.HttpRemote(url, timeout=5).info_refs()
         self.assertTrue(str(cm.exception).startswith(f"could not connect to server at {url}: "))
 
+    def test_slow_push_uses_the_long_data_timeout(self):
+        # QA bug 2: a big push legitimately takes minutes on the server (one fsync per object);
+        # only the small requests are bound by `timeout`, push/fetch wait `data_timeout`.
+        def responder(method, path, body):
+            if path.endswith(("/push", "/fetch")):
+                time.sleep(1.0)
+            return 200, "application/json", {"ok": True, "results": []}
+
+        self.httpd.responder = responder
+        rem = T.HttpRemote(self.url, timeout=0.3, data_timeout=10)
+        self.assertEqual(rem.push([], b""), {"ok": True, "results": []})
+        self.assertEqual(rem.fetch_pack(["a" * 40], []), b'{"ok": true, "results": []}')
+
+    def test_push_timeout_is_reported_as_a_timeout_not_a_connect_failure(self):
+        def responder(method, path, body):
+            time.sleep(2.0)
+            return 200, "application/json", {"ok": True, "results": []}
+
+        self.httpd.responder = responder
+        self.httpd.handle_error = lambda request, address: None  # the late reply hits a closed socket
+        rem = T.HttpRemote(self.url, timeout=5, data_timeout=0.3)
+        with self.assertRaises(errors.RemoteError) as cm:
+            rem.push([{"ref": "refs/heads/main", "old": None, "new": "a" * 40}], b"")
+        self.assertEqual(str(cm.exception), f"timed out waiting for the server at {self.url}; the push may "
+                                            "still be applied, run 'minigit fetch' to check")
+        self.assertIn("MINIGIT_HTTP_TIMEOUT", cm.exception.hint)
+        with self.assertRaises(errors.RemoteError) as cm:
+            rem.fetch_pack(["a" * 40], [])
+        self.assertTrue(str(cm.exception).startswith(f"timed out waiting for the server at {self.url}; "))
+        with self.assertRaises(errors.RemoteError) as cm:
+            T.HttpRemote(self.url, timeout=0.3).info_refs()
+        self.assertTrue(str(cm.exception).startswith("timed out waiting"), str(cm.exception))
+
+    def test_data_timeout_from_environment(self):
+        self.assertEqual(T.HttpRemote(self.url).data_timeout, T.DATA_TIMEOUT)
+        self.assertEqual(T.HttpRemote(self.url).connect_timeout, T.CONNECT_TIMEOUT)
+        os.environ["MINIGIT_HTTP_TIMEOUT"] = "1800"
+        self.assertEqual(T.HttpRemote(self.url).data_timeout, 1800.0)
+        self.assertEqual(T.HttpRemote(self.url, data_timeout=7).data_timeout, 7)
+        for bad in ("soon", "0", "-5", "inf", "nan"):
+            os.environ["MINIGIT_HTTP_TIMEOUT"] = bad
+            with self.subTest(bad=bad), self.assertRaises(errors.MinigitError) as cm:
+                T.HttpRemote(self.url)
+            self.assertIn("MINIGIT_HTTP_TIMEOUT", str(cm.exception))
+
     def test_fetch_pack_request(self):
         self.respond(200, b"PACKBYTES", "application/x-minigit-pack")
         data = T.HttpRemote(self.url).fetch_pack(["a" * 40], ["b" * 40])
@@ -358,17 +418,34 @@ class FormatTests(unittest.TestCase):
         self.assertEqual(R.format_fetch("u", []), "")
 
     def test_format_push_rejection(self):
-        for reason, text in (("non-fast-forward", "non-fast-forward"), ("fetch-first", "fetch first"),
-                             ("stale", "stale info")):
+        # QA bug 11: a lost race ("stale") reads "fetch first" (git keeps "stale info" for
+        # --force-with-lease); a non-fast-forward says the branch is behind.
+        behind = "hint: Updates were rejected because the tip of your branch is behind its remote counterpart."
+        missing = "hint: Updates were rejected because the remote contains work that you do not have locally."
+        for reason, text, first_hint in (("non-fast-forward", "non-fast-forward", behind),
+                                         ("fetch-first", "fetch first", missing),
+                                         ("stale", "fetch first", missing)):
             err = errors.PushRejectedError("push rejected", url="http://h:1/p", results=[
                 {"ref": "refs/heads/main", "status": "rejected", "reason": reason}])
             self.assertEqual(R.format_push_rejection(err, "main", "main"), "\n".join([
                 "To http://h:1/p",
                 f" ! [rejected]        main -> main ({text})",
                 "error: failed to push some refs to 'http://h:1/p'",
-                "hint: Updates were rejected because the remote contains work that you do not have locally.",
-                "hint: Run 'minigit pull' first, then push again (pull first).",
+                first_hint,
+                "hint: Integrate the remote changes first ('minigit pull'), then push again.",
             ]))
+
+    def test_format_force_disabled_rejection_does_not_say_pull(self):
+        # QA bug 11: pulling cannot help when the repository refuses every forced update
+        err = errors.PushRejectedError("push rejected", url="http://h:1/p", results=[
+            {"ref": "refs/heads/main", "status": "rejected", "reason": "force-disabled"}])
+        self.assertEqual(R.format_push_rejection(err, "main", "main"), "\n".join([
+            "To http://h:1/p",
+            " ! [rejected]        main -> main (forced update disabled)",
+            "error: failed to push some refs to 'http://h:1/p'",
+            "hint: this repository does not allow forced pushes (ask the admin for --allow-force or push a "
+            "new branch)",
+        ]))
 
     def test_guess_dir(self):
         self.assertEqual(R._guess_dir("http://h:1/proj"), "proj")
@@ -480,10 +557,26 @@ class CloneTests(LiveServerCase):
         repo, _ = R.clone(url, None, self.tmp)  # dir name guessed: "proj"
         self.assertEqual(repo.worktree, os.path.join(self.tmp, "proj"))
         self.assertEqual(repo.config.get("remote.origin.url"), self.url.replace("://", "://alice@"))
-        self.assertEqual(T.load_credentials(self.url), ("alice", self.tokens["alice"]))
+        self.assertEqual(T.load_credentials(self.url.replace("://", "://alice@")), ("alice", self.tokens["alice"]))
+        self.assertIsNone(T.load_credentials(self.url), "a userinfo URL does not set the host default")
         # the saved credentials are then used without env or userinfo
         self.commit(repo, {"x": b"1\n"}, "x")
         self.assertEqual(R.push(repo)[0], f"To {self.url.replace('://', '://alice@')}")
+
+    def test_userinfo_clone_does_not_hijack_other_clones(self):
+        # QA bug 1: alice is logged in; cloning once with bob's token in the URL must not make
+        # alice's own clone (remote URL without a user) push as bob.
+        R.login(self.url, "alice", self.tokens["alice"])
+        mine, _ = R.clone(self.url, "mine", self.tmp)
+        port = self.httpd.server_address[1]
+        R.clone(f"http://bob:{self.tokens['bob']}@127.0.0.1:{port}/proj", "bobs", self.tmp)
+        sha = self.commit(mine, {"eve.txt": b"x\n"}, "x")
+        R.push(mine)
+        self.assertEqual(self.server_ref(), sha)
+        with open(os.path.join(self.root, server.AUDIT_LOG), "rb") as fh:
+            last = fh.read().decode("utf-8").strip().splitlines()[-1]
+        self.assertEqual(last.split()[1], "alice", last)
+        self.assertEqual(T.load_credentials(self.url), ("alice", self.tokens["alice"]))
 
     def test_clone_nonempty_bytes_identical(self):
         files = {"crlf.txt": b"one\r\ntwo\r\n", "bin.dat": bytes(range(256)) * 4 + b"\x00\r\n",
@@ -658,7 +751,7 @@ class PushFetchTests(LiveServerCase):
             self.push("alice", alice)
         text = R.format_push_rejection(cm.exception, "main", "main")
         self.assertIn(" ! [rejected]        main -> main (fetch first)", text)
-        self.assertIn("pull first", text)
+        self.assertIn("'minigit pull'", text)
         self.assertEqual(R.format_push_rejection(cm.exception), text)  # src/dst attached by push
         self.assertEqual(self.server_ref(), bob_sha)
         # after a fetch (but no merge) the local pre-check says non-fast-forward
@@ -667,7 +760,7 @@ class PushFetchTests(LiveServerCase):
             self.push("alice", alice)
         text = R.format_push_rejection(cm.exception, "main", "main")
         self.assertIn("(non-fast-forward)", text)
-        self.assertIn("hint: Run 'minigit pull' first, then push again (pull first).", text)
+        self.assertIn("hint: Integrate the remote changes first ('minigit pull'), then push again.", text)
         self.assertEqual(self.server_ref(), bob_sha)
         self.assertEqual(alice.refs.resolve("refs/remotes/origin/main"), bob_sha)
         self.assertNotEqual(base, bob_sha)
@@ -692,8 +785,8 @@ class PushFetchTests(LiveServerCase):
                 self.push("alice", alice)
         self.assertEqual(cm.exception.results[0]["reason"], "stale")
         text = R.format_push_rejection(cm.exception)
-        self.assertIn("main -> main (stale info)", text)
-        self.assertIn("pull first", text)
+        self.assertIn("main -> main (fetch first)", text)
+        self.assertIn("'minigit pull'", text)
         self.assertEqual(self.server_ref(), bob_sha)
 
     def test_force_disabled(self):
@@ -705,7 +798,39 @@ class PushFetchTests(LiveServerCase):
         with self.assertRaises(errors.PushRejectedError) as cm:
             self.push("alice", alice, force=True)
         self.assertEqual(cm.exception.results[0]["reason"], "force-disabled")
-        self.assertIn("pull first", R.format_push_rejection(cm.exception))
+        text = R.format_push_rejection(cm.exception)
+        self.assertIn("hint: this repository does not allow forced pushes", text)
+        self.assertNotIn("minigit pull", text)
+        self.assertNotIn("remote contains work", text)
+
+    def test_too_long_branch_name_rejected_locally_and_by_the_server(self):
+        # QA bug 7: the length check lives in refs.check_ref_name, shared by client and server
+        alice, sha = self.alice_with_commit()
+        long_name = "b" * 256
+        with mock.patch.object(T.HttpRemote, "info_refs", side_effect=AssertionError("server contacted")):
+            with self.assertRaises(errors.UsageError) as cm:
+                self.push("alice", alice, "origin", f"main:{long_name}")
+        self.assertEqual(cm.exception.message, f"invalid destination branch name '{long_name}': too long "
+                                               "(a component is over 250 bytes)")
+        with self.as_user("alice"):  # a client without the check: the server answers 400, not 500
+            with self.assertRaises(errors.RemoteError) as cm:
+                T.HttpRemote(self.url).push([{"ref": "refs/heads/" + long_name, "old": None, "new": sha}], b"")
+        self.assertEqual(cm.exception.status, 400)
+        self.assertIn("too long", str(cm.exception))
+        self.assertIsNone(self.server_ref("refs/heads/" + long_name))
+
+    @unittest.skipUnless(os.name == "nt", "Windows reserved names are checked on Windows")
+    def test_reserved_windows_name_rejected_before_contacting_the_server(self):
+        # QA bug 5: `push origin main:CON` fails locally with the reserved-name message
+        alice, _ = self.alice_with_commit()
+        for dst in ("CON", "aux.txt", "x/nul"):
+            with self.subTest(dst=dst):
+                with mock.patch.object(T.HttpRemote, "info_refs", side_effect=AssertionError("server contacted")):
+                    with self.assertRaises(errors.UsageError) as cm:
+                        self.push("alice", alice, "origin", f"main:{dst}")
+                self.assertEqual(cm.exception.message, f"invalid destination branch name '{dst}': "
+                                 f"'{dst.rsplit('/', 1)[-1]}' is a reserved device name on Windows")
+        self.assertEqual(sorted(self.server_repo.refs.list("refs/heads/")), ["refs/heads/main"])
 
     def test_detached_head_needs_refspec(self):
         alice, sha = self.alice_with_commit()
@@ -757,6 +882,26 @@ class ForcePushTests(LiveServerCase):
 
 
 class PullTests(LiveServerCase):
+    def test_two_clones_of_an_empty_repo_need_allow_unrelated(self):
+        # QA bug 12: both clone the fresh empty repo and each make a root commit
+        alice, _ = self.clone("alice")
+        bob, _ = self.clone("bob")
+        alice_root = self.commit(alice, {"a.txt": b"alice\n"}, "alice root")
+        self.push("alice", alice)
+        bob_root = self.commit(bob, {"b.txt": b"bob\n"}, "bob root")
+        with self.assertRaises(errors.MinigitError) as cm:
+            self.pull("bob", bob)
+        self.assertEqual(cm.exception.message, "refusing to merge unrelated histories")
+        self.assertIn("--allow-unrelated-histories", cm.exception.hint)
+        self.assertEqual(bob.head_commit(), bob_root)
+        with self.as_user("bob"):
+            _, outcome = R.pull(bob, allow_unrelated=True)
+        self.assertEqual(outcome.kind, "merged")
+        self.assertEqual((self.read(bob, "a.txt"), self.read(bob, "b.txt")), (b"alice\n", b"bob\n"))
+        self.push("bob", bob)
+        self.assertEqual(self.server_ref(), bob.head_commit())
+        self.assertNotEqual(bob.head_commit(), alice_root)
+
     def test_pull_fast_forward(self):
         alice, _ = self.alice_with_commit()
         bob, _ = self.clone("bob")
@@ -828,7 +973,8 @@ class RemoteConfigTests(_EnvCase):
         # the stored URL keeps the user name (never the token) so a clone remembers who it acts as
         self.assertEqual(R.remote_list(repo), {"origin": "http://alice@127.0.0.1:1/proj"})
         self.assertEqual(R.remote_url(repo, "origin"), "http://alice@127.0.0.1:1/proj")
-        self.assertEqual(T.load_credentials("http://127.0.0.1:1/proj"), ("alice", "TOK"))
+        self.assertEqual(T.load_credentials(R.remote_url(repo, "origin")), ("alice", "TOK"))
+        self.assertIsNone(T.load_credentials("http://127.0.0.1:1/proj"), "only login sets the host default")
         with self.assertRaises(errors.MinigitError):
             R.remote_add(repo, "origin", "http://127.0.0.1:1/other")
         with self.assertRaises(errors.MinigitError):

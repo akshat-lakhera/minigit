@@ -105,6 +105,7 @@ def add_token(root: str, user: str, name: str) -> str:
 def list_tokens(root: str, user: str) -> list[tuple[str, int | None]]:
     """``(name, created)`` of the usable tokens of ``user``: ``default`` first, then by name."""
     auth.validate_user_name(user)
+    auth.require_root(root)
     cfg = auth.ServerConfig(root)
     if user not in cfg.users:
         raise _no_user(user)
@@ -182,6 +183,7 @@ def parse_names(value: str) -> list[str]:
 def get_perm(root: str, repo: str, names: list[str]) -> list[str]:
     """The effective access of each of ``names``; changes nothing."""
     auth.validate_repo_name(repo)
+    auth.require_root(root)
     cfg = auth.ServerConfig(root)
     record = cfg.repos.get(repo)
     if not isinstance(record, dict):

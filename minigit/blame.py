@@ -50,7 +50,7 @@ def format_date_iso(ts: int, offset: int) -> str:
 # -L handling
 # ---------------------------------------------------------------------------
 
-_RANGE_RE = re.compile(r"^(\d+)(?:,(\+?)(\d+))?$")
+_RANGE_RE = re.compile(r"^(\d+)(?:,(\+?)(\d*))?$")
 
 
 def parse_line_range(spec: str) -> tuple[int, int | None, bool]:
@@ -61,8 +61,10 @@ def parse_line_range(spec: str) -> tuple[int, int | None, bool]:
     start = int(m.group(1))
     if start == 0:
         raise bad
-    if m.group(3) is None:
-        return start, None, False
+    if m.group(3) is None or m.group(3) == "":
+        if m.group(2):   # "5,+" is not a count
+            raise bad
+        return start, None, False   # "5" and "5," both mean: from line 5 to the end
     num = int(m.group(3))
     if m.group(2):
         if num == 0:
@@ -83,7 +85,7 @@ def select_lines(spec: str | None, total: int, path: str) -> range:
     if num is None:
         end = total
     elif plus:
-        end = start + num   # acceptance test: "2,+1" selects lines 2 and 3
+        end = start + num - 1   # like git: "2,+2" selects lines 2 and 3
     else:
         end = num
     return range(start - 1, min(end, total))

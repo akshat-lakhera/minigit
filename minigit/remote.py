@@ -22,7 +22,7 @@ from . import revparse
 from . import trees
 from . import worktree
 from .errors import MinigitError, PushRejectedError, RemoteError, UsageError
-from .refs import ANY, check_ref_name
+from .refs import ANY, _check_windows_ref_name, check_ref_name
 from .repo import Repository
 from .transport import HttpRemote, RemoteRefs, check_url, save_credentials, split_url, url_with_user
 
@@ -304,8 +304,8 @@ def clone(url: str, directory: str | None, cwd: str) -> tuple[Repository, list[s
 
 # --------------------------------------------------------------- pull ----
 
-def pull(repo: Repository, remote: str | None = None,
-         branch: str | None = None) -> tuple[list[RefChange], "MergeOutcome"]:
+def pull(repo: Repository, remote: str | None = None, branch: str | None = None, *,
+         allow_unrelated: bool = False) -> tuple[list[RefChange], "MergeOutcome"]:
     repo.require_worktree()
     branch_arg = branch
     configured = False
@@ -332,7 +332,7 @@ def pull(repo: Repository, remote: str | None = None,
                                hint="check the branch name with: minigit fetch")
         raise MinigitError(f"no upstream '{remote}/{branch}' (push with -u first)")
     outcome = merge_mod.merge(repo, tracking, label=f"{remote}/{branch}",
-                              message=f"Merge branch '{branch}' of {url}")
+                              message=f"Merge branch '{branch}' of {url}", allow_unrelated=allow_unrelated)
     return changes, outcome
 
 
@@ -341,10 +341,11 @@ def pull(repo: Repository, remote: str | None = None,
 _REASON_TEXT = {
     "non-fast-forward": "non-fast-forward",
     "fetch-first": "fetch first",
-    "stale": "stale info",
+    "stale": "fetch first",  # the ref moved between our info/refs and the push (a lost race)
     "force-disabled": "forced update disabled",
     "delete-default-branch": "deletion of the default branch prohibited",
     "ref-clash": "ref name clash",
+    "invalid-ref-name": "invalid ref name",
 }
 
 _REJECT_MESSAGES = {
@@ -374,13 +375,17 @@ def _resolve_src(repo: Repository, src: str) -> tuple[str, str | None]:
         raise MinigitError(f"src refspec '{src}' does not match any commit") from None
 
 
-def _dst_ref(dst: str) -> str:
+def _dst_ref(dst: str, delete: bool = False) -> str:
     name = dst[len(HEADS):] if dst.startswith(HEADS) else dst
     ref = HEADS + name
     try:
         check_ref_name(ref)
-    except MinigitError:
-        raise UsageError(f"invalid destination branch name '{dst}'") from None
+        if os.name == "nt" and not delete:  # the checks refs.update makes, before contacting the server
+            _check_windows_ref_name(ref)
+    except MinigitError as e:
+        prefix = f"invalid ref name '{ref}': "
+        reason = e.message[len(prefix):] if e.message.startswith(prefix) else ""
+        raise UsageError(f"invalid destination branch name '{dst}'" + (f": {reason}" if reason else "")) from None
     if not name:
         raise UsageError("empty destination branch name")
     return ref
@@ -418,7 +423,7 @@ def push(repo: Repository, remote: str | None = None, refspec: str | None = None
             raise UsageError(f"invalid refspec '{refspec}': missing destination")
     else:
         src, dst = refspec, refspec
-    dst_ref = _dst_ref(dst)
+    dst_ref = _dst_ref(dst, delete)
     dst_name = dst_ref[len(HEADS):]
     tracking = f"refs/remotes/{remote}/{dst_name}"
 
@@ -520,16 +525,22 @@ def format_push_rejection(err: PushRejectedError, src: str | None = None, dst: s
              f"error: failed to push some refs to '{url}'"]
     if reason == "delete-default-branch":
         lines.append("hint: The remote's default branch cannot be deleted.")
-    elif reason == "ref-clash":
+    elif reason in ("ref-clash", "invalid-ref-name"):
         detail = next((r.get("message") for r in results if isinstance(r, dict) and r.get("message")), None)
         if detail:
             lines.insert(2, f"error: {detail}")
         lines.append("hint: Choose a different branch name; pulling will not resolve this.")
+    elif reason == "force-disabled":  # pulling would not help: the policy refuses any rewrite
+        lines.append("hint: this repository does not allow forced pushes "
+                     "(ask the admin for --allow-force or push a new branch)")
     else:
-        if reason == "force-disabled":
-            lines.append("hint: This repository does not allow forced pushes.")
-        lines.append("hint: Updates were rejected because the remote contains work that you do not have locally.")
-        lines.append("hint: Run 'minigit pull' first, then push again (pull first).")
+        if reason == "non-fast-forward":
+            lines.append("hint: Updates were rejected because the tip of your branch is behind its remote "
+                         "counterpart.")
+        else:
+            lines.append("hint: Updates were rejected because the remote contains work that you do not have "
+                         "locally.")
+        lines.append("hint: Integrate the remote changes first ('minigit pull'), then push again.")
     return "\n".join(lines)
 
 
@@ -542,4 +553,4 @@ def login(url: str, user: str, token: str) -> None:
         raise UsageError("login needs --user")
     if not token:
         raise UsageError("login needs --token")
-    save_credentials(clean, user, token)
+    save_credentials(clean, user, token, host_default=True)

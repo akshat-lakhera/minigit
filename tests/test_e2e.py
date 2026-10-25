@@ -443,12 +443,15 @@ class MultiUserWorkflowTests(CliCase):
         self.mg(wt, "commit", "-m", msg, env=env)
         return self.head(wt, env)
 
-    def assert_rejected(self, res, url, branch="main"):
+    def assert_rejected(self, res, url, branch="main", pull_hint=True):
         self.assertEqual(res.returncode, 1, str(res))
         self.assertIn(f"To {url}\n", res.err)
         self.assertIn(f" ! [rejected]        {branch} -> {branch} (", res.err)
         self.assertIn(f"error: failed to push some refs to '{url}'", res.err)
-        self.assertIn("pull first", res.err)
+        if pull_hint:
+            self.assertIn("'minigit pull'", res.err)
+        else:  # e.g. a forced push the repository refuses: pulling would not help
+            self.assertNotIn("minigit pull", res.err)
 
     # -- tests ------------------------------------------------------------
     def test_two_users_push_rejected_then_pull_merge_push(self):
@@ -494,8 +497,9 @@ class MultiUserWorkflowTests(CliCase):
         self.assertIn("main -> main (non-fast-forward)", res.err)
         # The server enforces it as well: forced updates are disabled for this repository.
         res = self.mg_fail(bob, "push", "--force", env=b_env)
-        self.assert_rejected(res, url)
+        self.assert_rejected(res, url, pull_hint=False)
         self.assertIn("(forced update disabled)", res.err)
+        self.assertIn("hint: this repository does not allow forced pushes", res.err)
         self.assertEqual(self.server_head("collab"), alice_tip)
 
         # Bob pulls (a real merge commit) and pushes.

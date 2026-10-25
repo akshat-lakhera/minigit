@@ -118,6 +118,30 @@ class TestPullsLibrary(PullsTestCase):
                          ("up-to-date", head, head, head))
         self.assertEqual(result["pull"]["state"], "merged")
 
+    def test_deleted_branch_lists_no_commits(self):
+        # QA bug 8: with the base gone, 'pr show' listed head's whole history as "0 ahead" PR commits.
+        root, head = self.setup_pr()
+        self.assertEqual([c["sha"] for c in pulls.pull_view(self.repo, pulls.get_pull(self.repo, 1))["commits"]],
+                         [head])
+        for gone, other in (("main", "feature"), ("feature", "main")):
+            with self.subTest(gone=gone):
+                sha = self.tip(gone)
+                self.repo.refs.update("refs/heads/" + gone, None)
+                view = pulls.pull_view(self.repo, pulls.get_pull(self.repo, 1))
+                self.assertEqual((view["commits"], view["ahead"], view["behind"]), ([], 0, 0))
+                self.assertEqual((view["mergeable"], view["missing_branch"]), ("unknown", gone))
+                self.assertIn(f"branch '{gone}' of pull request #1 no longer exists", view["messages"])
+                self.branch(gone, sha)
+        self.repo.refs.update("refs/heads/main", None)
+        view = pulls.close_pull(self.repo, "alice", 1)["pull"]  # the snapshot keeps base_sha = null
+        self.assertEqual((view["state"], view["base_sha"], view["commits"]), ("closed", None, []))
+        self.assertEqual(view["missing_branch"], "main")
+        stored = pulls.get_pull(self.repo, 1)
+        self.assertNotIn("commits", stored)
+        self.assertIsNone(pulls.pull_view(self.repo, stored)["mergeable"])
+        self.branch("main", root)
+        self.assertEqual(pulls.pull_view(self.repo, pulls.get_pull(self.repo, 1))["commits"], [])  # snapshot
+
     def test_merge_message_and_identity(self):
         root, head = self.setup_pr()
         self.assert_pr_error(400, "bad_request", pulls.merge_pull, self.repo, "bob", 1, " \n ")

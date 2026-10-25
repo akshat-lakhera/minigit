@@ -716,6 +716,20 @@ class BranchTests(RepoCase):
                     ops.switch(self.repo, None, create=name)
         self.assertEqual(list(self.repo.refs.list("refs/heads/")), ["refs/heads/main"])
 
+    def test_too_long_branch_name_is_a_clean_error(self):
+        # QA bug 7: `branch <256 chars>` was "fatal: internal error: [Errno 22]"
+        self.commit_file("a.txt", "1\n", "one")
+        ops.branch_create(self.repo, "b" * 250)
+        for name in ("b" * 256, "c" * 300, "dir/" + "e" * 251):
+            with self.subTest(length=len(name)):
+                with self.assertRaises(MinigitError) as cm:
+                    ops.branch_create(self.repo, name)
+                self.assertEqual(cm.exception.message, f"'{name}' is not a valid branch name: too long "
+                                                       "(a component is over 250 bytes)")
+                with self.assertRaises(MinigitError):
+                    ops.switch(self.repo, name)
+        self.assertEqual(list(self.repo.refs.list("refs/heads/")), ["refs/heads/" + "b" * 250, "refs/heads/main"])
+
     def test_list_marks_a_detached_head(self):
         c1 = self.commit_file("a.txt", "1\n", "one")
         self.commit_file("a.txt", "2\n", "two")
@@ -819,6 +833,32 @@ class SwitchTests(RepoCase):
         self.repo.refs.update("refs/remotes/origin/dup", c1)
         with self.assertRaises(MinigitError):
             ops.switch(self.repo, "dup")
+
+    def test_dwim_remote_branch_with_slash(self):
+        # QA bug 6: `switch feature/x` creates a tracking branch like git does
+        c1 = self.commit_file("a.txt", "1\n")
+        self.repo.refs.update("refs/remotes/origin/feature/x", c1)
+        msg = ops.switch(self.repo, "feature/x")
+        self.assertEqual(msg, "branch 'feature/x' set up to track 'origin/feature/x'.\n"
+                              "Switched to a new branch 'feature/x'")
+        self.assertEqual(self.repo.refs.current_branch(), "feature/x")
+        self.assertEqual(self.repo.refs.resolve("refs/heads/feature/x"), c1)
+        self.assertEqual(ops.get_upstream(self.repo, "feature/x"), ("origin", "refs/heads/feature/x"))
+        self.assertEqual(ops.switch(self.repo, "feature/x"), "Already on 'feature/x'")
+        # two remotes have it: ambiguous, nothing created
+        self.repo.refs.update("refs/remotes/origin/team/y", c1)
+        self.repo.refs.update("refs/remotes/up/team/y", c1)
+        with self.assertRaises(MinigitError) as cm:
+            ops.switch(self.repo, "team/y")
+        self.assertEqual(cm.exception.message, "'team/y' matched multiple (2) remote tracking branches")
+        self.assertIsNone(self.repo.refs.read_raw("refs/heads/team/y"))
+        # a remote-tracking name itself is still "a branch is expected", even if another remote
+        # happens to have a branch called "origin/feature/x"
+        self.repo.refs.update("refs/remotes/up/origin/feature/x", c1)
+        with self.assertRaises(MinigitError) as cm:
+            ops.switch(self.repo, "origin/feature/x")
+        self.assertIn("a branch is expected", cm.exception.message)
+        self.assertIsNone(self.repo.refs.read_raw("refs/heads/origin/feature/x"))
 
     def test_create_with_start_and_merge_guard(self):
         c1 = self.commit_file("a.txt", "1\n")

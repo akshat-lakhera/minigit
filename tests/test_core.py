@@ -568,6 +568,18 @@ class RefNameTest(unittest.TestCase):
             with self.assertRaises(MinigitError, msg=repr(name)):
                 check_ref_name(name)
 
+    def test_too_long_names(self):
+        # QA bug 7: refs are files; a 256-char name crashed with "[Errno 22]" instead of a clean error
+        check_ref_name("refs/heads/" + "b" * 250)  # 250 + ".lock" still fits a file name
+        check_ref_name("refs/heads/" + "/".join(["x"] * 60) + "/deep")
+        for name in ("refs/heads/" + "b" * 251, "refs/heads/" + "b" * 300, "refs/heads/a/" + "é" * 126,
+                     "refs/heads/" + "/".join(["d" * 100] * 11)):
+            with self.subTest(length=len(name)):
+                with self.assertRaises(MinigitError) as cm:
+                    check_ref_name(name)
+                self.assertTrue(cm.exception.message.startswith(f"invalid ref name '{name}': too long"),
+                                cm.exception.message)
+
     def test_helpers(self):
         self.assertTrue(is_hex_sha("a" * 40))
         self.assertFalse(is_hex_sha("A" * 40))
@@ -588,6 +600,15 @@ class RefStoreTest(TempDirCase):
         self.refs = RefStore(self.gitdir)
         atomic_write(os.path.join(self.gitdir, "HEAD"), b"ref: refs/heads/main\n")
         self.A, self.B, self.C = "a" * 40, "b" * 40, "c" * 40
+
+    def test_too_long_ref_is_refused_before_touching_the_disk(self):
+        name = "refs/heads/" + "b" * 256
+        with self.assertRaises(MinigitError) as cm:
+            self.refs.update(name, self.A, expected=None)
+        self.assertIn("too long", cm.exception.message)
+        self.assertIsNone(self.refs.read_raw(name))  # reading such a name is "missing", not a crash
+        self.assertIsNone(self.refs.resolve(name))
+        self.assertEqual(os.listdir(os.path.join(self.gitdir, "refs", "heads")), [])
 
     def test_cas_create_mismatch_delete(self):
         r = self.refs

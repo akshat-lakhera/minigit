@@ -244,6 +244,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = cmd("show", "Show a commit, blob or tree")
     s.add_argument("spec", nargs="?", default="HEAD", help="revision, or rev:path (default: HEAD)")
+    _add_blame_parser(sub)
+    _add_grep_parser(sub)
 
     # --- branching -------------------------------------------------------
     s = cmd("branch", "List, create or delete branches")
@@ -268,6 +270,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--abort", action="store_true", help="abort the current conflicted merge")
     s.add_argument("-m", "--message", default=None, metavar="MSG", help="merge commit message")
     s.add_argument("--no-ff", dest="no_ff", action="store_true", help="always create a merge commit")
+    s.add_argument("--allow-unrelated-histories", dest="allow_unrelated", action="store_true",
+                   help="merge histories that share no commit (e.g. two root commits)")
     s.add_argument("rev", nargs="?", help="branch or revision to merge")
     _m("cherry").add_parser(sub)  # cherry-pick, revert (minigit/cherry.py)
     _m("stash").add_parser(sub)  # stash (minigit/stash.py)
@@ -300,6 +304,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("remote", nargs="?", help="remote name (default: origin)")
 
     s = cmd("pull", "Fetch and merge the upstream branch")
+    s.add_argument("--allow-unrelated-histories", dest="allow_unrelated", action="store_true",
+                   help="merge even if the histories share no commit")
     s.add_argument("remote", nargs="?", help="remote name")
     s.add_argument("branch", nargs="?", help="remote branch")
 
@@ -317,9 +323,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--user", required=True, help="user name")
     s.add_argument("--token", required=True, help="access token")
 
-    s = cmd("serve", "Run the minigit HTTP server")
+    s = cmd("serve", "Run the minigit HTTP server",
+            epilog="Browse the repositories at http://HOST:PORT/-/ (unless --no-web).")
     s.add_argument("--root", required=True, help="server root directory")
-    s.add_argument("--host", default="127.0.0.1")
+    s.add_argument("--host", default="127.0.0.1", help="address to listen on (default: 127.0.0.1)")
     s.add_argument("--init", action="store_true",
                    help="create the server root if it does not exist yet")
     s.add_argument("--port", type=_port, default=8765, help="port (0 picks a free port)")
@@ -328,8 +335,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--quiet", action="store_true", help="do not log requests")
     s.add_argument("--no-web", dest="no_web", action="store_true",
                    help="do not serve the read-only web UI at /-/")
-    s.add_argument("--max-push-bytes", dest="max_push_bytes", type=int, default=256 << 20,
-                   help=argparse.SUPPRESS)
+    s.add_argument("--max-push-bytes", dest="max_push_bytes", type=int, default=256 << 20, metavar="N",
+                   help="reject pushes larger than N bytes (default: 256 MiB)")
 
     s = cmd("server", "Administer a server root: users, tokens, repositories, permissions")
     ss = s.add_subparsers(dest="server_cmd", metavar="<subcommand>", parser_class=_Parser)
@@ -358,8 +365,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = cmd("help", "Show help for a command")
     s.add_argument("topic", nargs="?")
-    _add_blame_parser(sub)
-    _add_grep_parser(sub)
     return p
 
 
@@ -623,7 +628,7 @@ def cmd_merge(ns, cwd):
         return 0
     if not ns.rev:
         raise _usage("merge: a revision is required")
-    outcome = merge.merge(repo, ns.rev, message=ns.message, no_ff=ns.no_ff)
+    outcome = merge.merge(repo, ns.rev, message=ns.message, no_ff=ns.no_ff, allow_unrelated=ns.allow_unrelated)
     _say("\n".join(outcome.messages))
     return 1 if outcome.kind == "conflict" else 0
 
@@ -705,7 +710,7 @@ def cmd_pull(ns, cwd):
     remote = _m("remote")
     repo = _repo(cwd)
     name = ns.remote or _default_remote(repo)
-    changes, outcome = remote.pull(repo, ns.remote, ns.branch)
+    changes, outcome = remote.pull(repo, ns.remote, ns.branch, allow_unrelated=ns.allow_unrelated)
     _say(remote.format_fetch(remote.remote_url(repo, name), changes))
     _say("\n".join(outcome.messages))
     return 1 if outcome.kind == "conflict" else 0

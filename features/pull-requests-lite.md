@@ -13,12 +13,7 @@ like the web UI) instead of a `_handle_pulls` method, `process_pull_merge` is in
 1 MiB JSON cap is checked from `Content-Length` before `_read_body()` (which is unchanged); `close` also
 takes the per-repo lock so a merge and a close of the same PR cannot interleave.
 
-Verified against the code on 2026-10-20 (server.py, transport.py, cli.py, merge.py, graph.py, diff.py,
-remote.py as integrated): with `MINIGIT_RUN_FUTURE=1` all 7 tests fail at their **first** `pr` command
-(`invalid choice: 'pr'`) or `/pulls` request (404), and every other step they rely on (serve, clone,
-push -u, push --delete, local conflict + resolve + push, hand fast-forward merge + push, `-C <bare>
-rev-parse main^2`, `cat-file -p main:path`, `fsck` on the bare repo, audit line format, empty-body POST)
-was exercised separately and passes. Newlines in argv (`--title "two\nlines"`) survive on Windows.
+Newlines in argv (`--title "two\nlines"`) survive on Windows.
 
 Design goals, in order: fit SPEC.md exactly (library never prints, binary I/O, CAS on refs, the same
 lock and JSON conventions as `server.json`), one agent can build it in a day, and nothing existing
@@ -193,10 +188,11 @@ The stored record plus live fields computed on every read:
 | `head_sha`, `base_sha` | while open: the current `refs/heads/<x>` tips or `null` if the branch is gone; otherwise the stored snapshot |
 | `merge_base` | `graph.best_merge_base(base_sha, head_sha)` or `null` |
 | `ahead`, `behind` | `graph.ahead_behind(store, head_sha, base_sha)`; `0, 0` when a sha is `null` |
-| `commits` | `[{"sha": ..., "subject": ...}]`: commits reachable from `head_sha` but not from `base_sha`, in `topo_walk` order |
+| `commits` | `[{"sha": ..., "subject": ...}]`: commits reachable from `head_sha` but not from `base_sha`, in `topo_walk` order; `[]` when either sha is `null` (never head's whole history) |
+| `missing_branch` | `head` when `head_sha` is `null`, else `base` when `base_sha` is `null`, else `null` |
 | `mergeable` | open PRs only, else `null`: `"clean"`, `"conflict"`, `"up-to-date"`, `"unrelated"`, `"unknown"` (a branch is missing) |
 | `conflicts` | sorted conflicted paths when `mergeable == "conflict"`, else `[]` |
-| `messages` | the `CONFLICT ...`/warning lines from the trial merge, else `[]` |
+| `messages` | the `CONFLICT ...`/warning lines from the trial merge, else `[]`; plus `branch 'x' of pull request #n no longer exists` (the `branch_missing` wording) when `missing_branch` is set |
 
 `mergeable` runs `merge.merge_trees` without touching any ref. That writes cleanly merged blobs into
 the object store even on a GET; this is deliberate: objects are immutable, idempotent and unreachable,
@@ -211,13 +207,17 @@ Every request still needs `X-Minigit-Protocol: 1`; errors are still `{"error", "
 (`_handle` already drops empty path segments).
 
 **Check order** (fixed, so the status for a bad request is deterministic; the tests rely on it):
-1. protocol header (400, existing) → credentials (401 on bad ones, existing) → repo exists (404, existing);
+1. protocol header (400, existing) → credentials (401 on bad ones, existing) → repository access, as for
+   every repository URL: an anonymous caller gets 401 + `WWW-Authenticate` for a repository it may not
+   read (private or missing, so names do not leak); a signed-in caller gets 404 for a missing repository
+   and 403 when it may not read it;
 2. route shape: `tail` must be `[]`, `[n]`, `[n, "diff"]`, `[n, "merge"]` or `[n, "close"]` with a
-   well-formed `n`, else 404 `not_found` (`no such endpoint: <path>`) — before any auth, like every
-   unknown endpoint today;
-3. method for that route, else 405 `method_not_allowed` (also before auth: an anonymous `DELETE /pulls/1`
-   is 405). Only GET/HEAD/POST/PUT/DELETE reach the handler; other verbs get the stdlib 501;
-4. permission via `_require` (read for GET/HEAD, write for POST): 401 + `WWW-Authenticate` / 403;
+   well-formed `n`, else 404 `not_found` (`no such endpoint: <path>`). This comes after step 1, so on a
+   private repository an anonymous `/pulls/abc` is 401, not 404;
+3. method for that route, else 405 `method_not_allowed` (also after step 1: an anonymous `DELETE /pulls/1`
+   is 401 on a private repository and 405 on a public one). Only GET/HEAD/POST/PUT/DELETE reach the
+   handler; other verbs get the stdlib 501;
+4. write permission via `_require` for POST (read was checked in step 1): 401 + `WWW-Authenticate` / 403;
 5. query (`?state=`) and body (411/413/400);
 6. the operation, which raises the feature's own errors (including 404 `pull request #7 not found`, so a
    private repo never reveals which numbers exist to an anonymous caller: that is a 401 first).
@@ -497,7 +497,8 @@ def format_close_result(pull: dict) -> str              # "Closed pull request #
    `/pulls/1/bogus` → 404.
 7. Merging or closing a merged/closed PR → 409 `not_open`, exit 1 with `not open` in the message.
 8. Head or base branch deleted while the PR is open → `show` says `Mergeable: unknown (branch 'x' missing)`;
-   `merge`/`diff` → 409 `branch_missing` (`no longer exists`). `close` still works.
+   `merge`/`diff` → 409 `branch_missing` (`no longer exists`). `close` still works. The view lists no
+   commits (`0 commits ahead, 0 behind`, `missing_branch` set), also after `close` stored the `null` sha.
 9. Conflicts → 409 `merge_conflict`; nothing changes on the server (base tip, PR state, `pulls.json`);
    the view keeps saying `conflict (a.txt)` until the head branch is updated. The usual fix (merge the
    base into the head locally, resolve, push) makes the next merge succeed.
@@ -522,7 +523,8 @@ def format_close_result(pull: dict) -> str              # "Closed pull request #
 21. Several clients open the same head/base at the same instant → exactly one 201, the rest 409
     `duplicate` carrying that PR's number; `next` advances by one.
 22. Anonymous request on a **private** repo: `GET /pulls/99` is 401 (not 404), so PR numbers do not
-    leak; malformed paths (`/pulls/abc`) are 404 for everyone, like any unknown endpoint.
+    leak; malformed paths (`/pulls/abc`) and wrong methods (`DELETE /pulls/1`) are 401 too, because the
+    repository check comes first. The 404 / 405 appear with credentials or on a public repository.
 23. JSON body over 1 MiB → 413 `too_large`; no `Content-Length` → 411 (existing `_read_body`).
 24. `pr show -1` / `pr merge 0` → usage error, exit 2 (never reaches the server).
 25. The base ref is rewritten out of band between the trial merge and the CAS → 409 `base_moved`, PR
@@ -540,7 +542,7 @@ def format_close_result(pull: dict) -> str              # "Closed pull request #
 | 3 | `server.py`: `_handle_pulls`, `_read_json_body`, `process_pull_merge`, audit on success | 1 h |
 | 4 | `tests/test_pulls.py` (in-process, `make_server` + raw `urllib`, like `tests/test_server.py`): open/list/view shapes, every error code of section 3.3, merge creates the right commit and audit line, conflict leaves everything untouched, unrelated histories, file/dir clash, 8 threads merging one PR behind a `Barrier` → exactly one 200, `fsck == []` | 1 h |
 | 5 | `transport.py` methods + `minigit/pr.py` porcelain and formatters; `tests/test_remote.py` additions for `HttpRemote.*pull*` (201 accepted, conflict payload surfaces as `RemoteError.code`) | 1 h |
-| 6 | `cli.py` `pr` command (+ `tests/test_cli.py` parser cases); run `tests_future/test_pull_requests_lite.py` with `MINIGIT_RUN_FUTURE=1` until green (about 2 min, it starts one live server), then move it to `tests_blackbox/` and drop the `@SKIP`; green on Windows and Linux | 1 h |
+| 6 | `cli.py` `pr` command (+ `tests/test_cli.py` parser cases); run `tests/test_pull_requests_lite.py` until green (about 2 min, it starts one live server); green on Windows and Linux | 1 h |
 | 7 | SPEC.md section 7.7 + section 8 signatures, README "Pull requests" | 0.5 h |
 
 Order matters: steps 1-4 are server-only and testable without the client; 5-6 need 1-3.

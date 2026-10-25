@@ -325,6 +325,21 @@ class SequenceTests(CherryCase):
         self.assertIsNone(self.repo.operation_in_progress())
         self.assertIsNone(self.repo.read_state(cherry.SEQUENCER_FILE))
 
+    def test_abort_on_the_last_commit_also_rewinds_earlier_picks(self):
+        """A conflict on the LAST commit of a sequence must still let --abort drop the picks before it."""
+        c1, c2, c3 = self.feat_commits()
+        start = self.commit("main edits f", {"f.txt": b"a\nb\nMAIN\n"})
+        # c1 and c3 apply cleanly; c2 (which edits f.txt) conflicts as the LAST pick, nothing left to do
+        outcomes = cherry.start(self.repo, "cherry-pick", [c1, c3, c2], mainline=None, no_commit=False)
+        self.assertEqual(outcomes[-1].kind, "conflict")
+        self.assertNotEqual(self.head(), start, "c1/c3 landed before the conflict")
+        cherry.abort(self.repo, "cherry-pick")
+        self.assertEqual(self.head(), start)
+        self.assertFalse(self.exists("one.txt"))
+        self.assertFalse(self.exists("three.txt"))
+        self.assertEqual(self.read("f.txt"), b"a\nb\nMAIN\n")
+        self.assertIsNone(self.repo.operation_in_progress())
+
     def test_bad_revision_anywhere_applies_nothing(self):
         c1, _c2, _c3 = self.feat_commits()
         start = self.head()

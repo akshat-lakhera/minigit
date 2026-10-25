@@ -1,7 +1,7 @@
-# Feature: `cherry-pick` and `revert` of single commits
+# Feature: `cherry-pick` and `revert`
 
-Status: designed, not implemented. Acceptance tests: `tests_future/test_cherry_pick_revert.py`
-(skipped until the feature lands; run them early with `MINIGIT_RUN_FUTURE=1`).
+Status: implemented in `minigit/cherry.py` and `minigit/sequencer.py` (the parsers and handlers are wired
+in `cli.py`). Acceptance tests: `tests/test_cherry_pick_revert.py`; in-process tests in `tests/test_cherry.py`.
 
 Both commands are a three-way merge with a cleverly chosen base, applied on top of HEAD with
 exactly the machinery `merge` already has (`merge_trees`, the worktree safety check, conflict
@@ -31,7 +31,10 @@ minigit revert --abort
 ```
 
 - `<rev>` is any SPEC section 5 revision (`feat`, `abc1234`, `HEAD~2`, `origin/x`, `MERGE_HEAD`, ...).
-  Exactly one commit per invocation (ranges and several revs are out of scope).
+  Several revisions may be given and are applied in order (`cherry-pick A B C`); `A..B` ranges are
+  refused with a usage error. A conflict stops the sequence: `--continue` commits the resolution and
+  goes on with the rest, `--abort` rewinds to the commit HEAD was on before the first pick (also when
+  the conflict is on the last commit). `-n` picks may be stacked on each other.
 - `-n/--no-commit`: apply the change to the index and working tree and stop; no commit, no state file
   (see 1.4). The prepared message is left in `MERGE_MSG`, so a following `minigit commit` without `-m`
   uses it.
@@ -392,9 +395,8 @@ Non-goals (say so in `--help`/README): ranges and several commits, `--skip`, `--
    commit during a fake `CHERRY_PICK_HEAD` uses that commit's author and removes the file; status
    long lines; `reset --hard` clears the state; `switch` refused.
 5. **M7 (1 h)** `cli.py` parsers + handler; `README.md`; `SPEC.md` (sections 1, 5, 6, 8).
-6. **Acceptance (30 min)** `MINIGIT_RUN_FUTURE=1 python -m unittest tests_future.test_cherry_pick_revert`
-   must pass on Windows and Linux. Then move the file to `tests_blackbox/` (drop the skip decorator
-   and the env switch) and delete `tests_future/`. Run the full suite:
+6. **Acceptance (30 min)** `python -m unittest tests.test_cherry_pick_revert` must pass on Windows
+   and Linux. Run the full suite:
    `python -m unittest discover -s tests -t .` and `python -m unittest discover -s tests_blackbox -t .`.
 
 Risk notes for the implementer:

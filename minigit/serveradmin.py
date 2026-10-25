@@ -85,10 +85,12 @@ def cmd_server(ns, cwd):
     if not ns.server_cmd:
         raise cli._usage(f"server: a subcommand is required ({', '.join(SUBCOMMANDS)})")
     root = cli._abs(cwd, ns.root)
-    auth.server_init(root)
     sub = ns.server_cmd
+    if sub != "init":
+        auth.require_root(root, ns.root)  # only 'init' creates a root: a mistyped ROOT must not become one
     if sub == "init":
-        cli._say(f"Initialized minigit server root in {root}")
+        created = auth.server_init(root)
+        cli._say(f"{'Initialized' if created else 'Reinitialized existing'} minigit server root in {root}")
     elif sub == "add-user":
         token = auth.add_user(root, ns.name, reset=ns.reset)
         cli._say(token)

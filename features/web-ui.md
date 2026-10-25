@@ -1,14 +1,13 @@
 # Feature design: `web-ui` (a read-only web view in `minigit serve`)
 
-Status: designed, not implemented. Acceptance tests: `tests_future/test_web_ui.py`. They are skipped with
-`unittest.skip("feature not implemented yet")` until the feature lands.
+Status: implemented in `minigit/webui.py` (with a few hook lines in `server.py` and the `--no-web` flag in
+`cli.py`). Acceptance tests: `tests/test_web_ui.py` (black box, live server) and `tests/test_webui.py`
+(in-process). This document is kept as the design record.
 
 Second design pass (2026-10-20): checked against the current `server.py`, `cli.py`, `revparse.py`, `refs.py` and
 `auth.py`. It adds the rev syntax gate (4.3, 8.6; it closes a path traversal confirmed against today's
 `revparse`), strict integer parameters, repo-list rows for missing repo directories, the notes on unsupported
-methods, the interactions with the other designed features (section 11), and three more acceptance tests. With
-the skip removed, the suite builds its fixture with today's CLI. Every test then fails only on the missing web
-behaviour, except the protocol-coexistence test, which already passes, as it should.
+methods, the interactions with the other features (section 11), and three more acceptance tests.
 
 ## 1. Summary
 
@@ -56,15 +55,18 @@ server is plain HTTP today).
 
 - Anonymous viewers see public repos. A page of a non-public repo answers `401` with
   `WWW-Authenticate: Basic realm="minigit"`, so the browser asks for a user name and password. The user types
-  their minigit user name and **token**.
+  their minigit user name and **token**. An anonymous request for any repository name that is not public gets
+  this `401` **whether or not the repository exists**, so names cannot be discovered without signing in (the
+  same as the protocol).
 - Every page header shows either `signed in as <user>` or a `log in` link to `/-/?login=1`. That URL answers
   `401` + challenge when the request has no credentials, and `303 Location: /-/` when the credentials are good.
   `/-/` is the directory of `/-/?login=1`, so browsers then send the credentials for every `/-/...` page.
 - Bad credentials always give `401` + challenge, even on pages that anonymous users may see. This matches the
   protocol.
-- An authenticated user without read access gets `403` with
+- A signed-in user without read access gets `403` with
   `permission denied: user '<u>' may not read '<repo>'` and no challenge.
-- An unknown repo gives `404 repository '<name>' not found`.
+- A signed-in user who asks for a repo that does not exist gets `404 repository '<name>' not found`. (Anonymous
+  callers get the `401` above instead.)
 
 ### 2.3 Pages (what each one shows)
 
@@ -183,20 +185,23 @@ link back to `/-/`.
 | 200 | page or raw bytes |
 | 303 | browser redirect (2.1), login success, tree<->blob type mismatch |
 | 400 | bad query: `n` not an int in 1..500, `skip` not an int >= 0 (both must be 1 to 6 ASCII digits, `^[0-9]{1,6}$`, so `+5`, ` 5`, `1_0` and non-ASCII digits are refused, although `int()` would take them), `rev` longer than 256 characters, `path` longer than 4096 characters, `path` missing or empty on blob/raw, more than 20 query fields |
-| 401 | bad credentials anywhere, anonymous access to a non-public repo, or `/-/?login=1` without credentials. Always carries `WWW-Authenticate: Basic realm="minigit"` |
-| 403 | authenticated without read access |
-| 404 | unknown repo, unknown page, unknown or non-commit revision (the message is the `RevisionError` text, e.g. `unknown revision 'x'`), a rev refused by the syntax gate (4.3; same message `unknown revision '<rev>'`, so the gate is no oracle), a missing path (`path 'P' does not exist in 'L'`), blob/raw on an empty repo without `rev` |
+| 401 | bad credentials anywhere, anonymous access to a non-public repo (existing or not: no name discovery), or `/-/?login=1` without credentials. Always carries `WWW-Authenticate: Basic realm="minigit"` |
+| 403 | signed in, but without read access to an existing repo |
+| 404 | unknown repo (signed-in users only), unknown page, unknown or non-commit revision (the message is the `RevisionError` text, e.g. `unknown revision 'x'`), a rev refused by the syntax gate (4.3; same message `unknown revision '<rev>'`, so the gate is no oracle), a missing path (`path 'P' does not exist in 'L'`), blob/raw on an empty repo without `rev` |
 | 405 | `POST`, `PUT` or `DELETE` on `/-/...`, with `Allow: GET, HEAD`. Methods the handler has no `do_X` for (`PATCH`, `OPTIONS`, ...) never reach it: the stdlib answers `501` as it does today for protocol URLs. That is unchanged on purpose, and the tests do not use those methods. |
 | 500 | an unexpected exception (for example a corrupt object). The traceback goes only to the server log, the same as for protocol 500s |
 
-Check order: (1) method, (2) query parse, (3) credentials, (4) for `/-/` the list or login, (5) repo exists,
-(6) read permission, (7) sub-page exists, (8) parameter validation, (9) rev and path resolution. So a forbidden
-user gets 403 for every URL inside a repo they cannot read, even a URL that names a missing page.
+Check order: (1) method, (2) query parse, (3) credentials, (4) for `/-/` the list or login, (5) an anonymous
+caller needs a repo that exists and is readable by anonymous users, else 401 (a missing repo and a private one
+look the same), (6) a signed-in caller: repo exists (else 404), (7) read permission (else 403), (8) sub-page
+exists, (9) parameter validation, (10) rev and path resolution. So a forbidden user gets 403 for every URL
+inside a repo they cannot read, even a URL that names a missing page, and an anonymous caller gets 401 for
+every URL whose repo is not public, whatever the rest of the URL says.
 
 ## 3. CLI syntax
 
 ```
-minigit serve --root R [--host 127.0.0.1] [--port 8765] [--ready-file F] [--quiet] [--no-web]
+minigit serve --root R [--host 127.0.0.1] [--port 8765] [--ready-file F] [--quiet] [--no-web] [--max-push-bytes N]
 ```
 
 - `--no-web`: do not serve the web UI. Help text: `do not serve the read-only web UI at /-/`. With the flag, the
@@ -406,7 +411,9 @@ itself.
 ### 5.3 `minigit/cli.py` (changed)
 
 - `serve` parser: `s.add_argument("--no-web", dest="no_web", action="store_true", help="do not serve the read-only web UI at /-/")`.
-  Add the epilog/description sentence `Browse the repositories at http://HOST:PORT/-/ (unless --no-web).`
+  `serve --help` ends with the epilog `Browse the repositories at http://HOST:PORT/-/ (unless --no-web).`
+  `--max-push-bytes N` (`reject pushes larger than N bytes (default: 256 MiB)`) is no longer hidden: it is listed
+  in `serve --help` like the other options.
 - `cmd_serve` passes `web=not ns.no_web` to `server.serve`. `on_ready` still prints only the `Serving` line.
 
 ### 5.4 Existing tests that must be updated (and only these)
@@ -441,7 +448,7 @@ itself.
 | `rev` with `:path`, a tree sha or a blob sha | `resolve_rev` raises `'x' is not a commit`, which gives 404. |
 | `rev` (or `commit/<rev>`) such as `../../../../../proj/.minigit/refs/heads/main`, `..\..\x`, `/etc/x`, `.minigit/HEAD` | Refused by `check_rev` (4.3) **before** `revparse`, giving 404 `unknown revision '<rev>'`. Without the gate, today's `RefStore.path` would read that file and serve its sha if the object exists in this repo. |
 | Windows device names as branch names (`CON`, `NUL`, `COM1`) | `RefStore.read_raw` returns `None` for them (checked on Windows 11), so they give 404 like any unknown revision. There is no hang. |
-| Repo in `server.json` whose directory was deleted | Repo list: the row shows `unavailable` with no link (2.3 item 1). `/-/<repo>/...`: `repo_exists` is false, giving 404. |
+| Repo in `server.json` whose directory was deleted | Repo list: the row shows `unavailable` with no link (2.3 item 1). `/-/<repo>/...`: `repo_exists` is false, giving 404 (401 for anonymous callers, as for any non-public name). |
 | `rev` such as `main~100000` | `resolve_rev` stops at the root and raises, which gives 404. The cost is bounded by history length. |
 | Non-UTF-8 file names (surrogateescape) | Displayed with U+FFFD. Links percent-encode the original bytes, and `parse_qsl(errors="surrogateescape")` turns them back exactly. |
 | Non-UTF-8 or Latin-1 file content | The blob page decodes with `replace`. Raw returns the exact bytes. |
@@ -454,7 +461,7 @@ itself.
 | Mode-only change | The status is `mode changed`, and the block shows only the `old mode`/`new mode` header lines. |
 | Path naming a file in tree, or a directory in blob | 303 to the other view. Raw on a directory: 404. |
 | `dir/../x`, `./x`, `a//b`, `a\b`, `.minigit/...`, `file/x` | 404. There is no normalisation, and names are matched exactly. |
-| `/-/..%2F..`, `/-/server.json/`, `/-/repos/x/` | `repo_exists` fails (bad name, or not registered), which gives 404. The server root is never read beyond `server.json` through `ServerConfig`. |
+| `/-/..%2F..`, `/-/server.json/`, `/-/repos/x/` | `repo_exists` fails (bad name, or not registered), which gives 404 (401 for anonymous callers). The server root is never read beyond `server.json` through `ServerConfig`. |
 | Push lands while a page renders | No locks are taken. Ref files are replaced atomically and objects are immutable, so a page is consistent per read. Two reads may see different tips, which is harmless for a read-only view. |
 | Large histories | `topo_walk` scans the reachable set for every log page (O(history)). That is acceptable at minigit scale and documented. Possible later work: cache by tip sha. |
 | Corrupt object | `ObjectError` propagates, giving a 500 page `internal server error`. The traceback goes to the server log only (with `MINIGIT_DEBUG=1` or a verbose server). |
@@ -526,8 +533,8 @@ itself.
    `tests/test_cli.py` (5.4). Add in-process `tests/test_server.py` cases for: the `/-/` exemption from the
    protocol header, the browser redirect only with `Accept: text/html` and no protocol header, and
    `make_server(web=False)` behaving as before.
-4. **Acceptance (1 h).** Move `tests_future/test_web_ui.py` to `tests/test_web_ui.py`, delete the
-   `@unittest.skip` line, and run `python -m unittest discover -s tests -t .`. Then run
+4. **Acceptance (1 h).** `tests/test_web_ui.py` is part of the normal suite: run
+   `python -m unittest discover -s tests -t .`. Then run
    `python -m unittest discover -s tests_blackbox -t .` to prove that the protocol did not change.
 5. **Docs (0.5 h).** SPEC 7.2 / 7.6 / 7.7 / 8 and the README (5.5).
 6. **Manual check (0.25 h).** `minigit serve --root R --port 0` and open the printed URL + `/-/` in a browser.
@@ -539,7 +546,7 @@ itself.
   through `RefStore`/`ObjectStore`. If not, treat it as a 503 page rather than a 500.
 - Accidental changes to protocol responses. Step 4 runs the black-box suite, which guards against that.
 
-## 10. Acceptance tests (`tests_future/test_web_ui.py`)
+## 10. Acceptance tests (`tests/test_web_ui.py`)
 
 One live `minigit serve` (started with `--port 0 --ready-file --quiet`, always stopped in `tearDownClass`) on a
 root built entirely through the CLI:
@@ -573,9 +580,7 @@ The tests cover:
 Every 200 HTML page is also checked for the 4.4 headers, an exact `Content-Length`, no `<script`, and no
 `token_sha256`.
 
-To enable the suite: delete the `@unittest.skip(...)` line, or move the file into `tests/` (plan step 4).
-
-## 11. Interactions with other designed features
+## 11. Interactions with other features
 
 - **pull-requests-lite** (`features/pull-requests-lite.md`) adds the protocol routes `/<repo>/pulls...` inside
   `_handle`, after `_check_protocol`. The web branch runs before `_check_protocol` and only claims parts whose
@@ -583,7 +588,7 @@ To enable the suite: delete the `@unittest.skip(...)` line, or move the file int
   `/<repo>/pulls`. Both features edit `MinigitHandler._handle`, so whichever lands second rebases a few lines.
   A later web page `/-/<repo>/pulls` (read-only list + `pulls.pull_diff` through `classify_diff_lines`) fits
   the routing table without changes and is out of scope here.
-- **server-admin** (`tests_future/test_server_admin.py`: several tokens per user, `remove-user`, `set-repo`)
+- **server-admin** (`tests/test_server_admin.py`: several tokens per user, `remove-user`, `set-repo`)
   changes `server.json` and `ServerConfig`. The web UI authenticates only through
   `MinigitHandler._authenticate` → `ServerConfig.authenticate`, and authorises only through
   `can_read`/`readable_repos`/`repo_exists`, with a fresh `ServerConfig` per request. So any token, ACL or

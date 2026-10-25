@@ -152,9 +152,21 @@ def _dump(data: dict) -> bytes:
     return (json.dumps(data, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
 
-def _modify(root: str, fn: Callable[[dict], object]) -> object:
-    """Load server.json under its lock, let ``fn`` mutate it, write it back atomically."""
-    os.makedirs(root, exist_ok=True)
+def require_root(root: str, shown: str | None = None) -> None:
+    """Refuse a ROOT without server.json, so a mistyped ROOT never becomes a new, empty server root.
+    ``shown`` is the spelling of ROOT for the hint (default: ``root``)."""
+    if not os.path.isfile(config_path(root)):
+        raise errors.MinigitError(f"'{root}' is not a minigit server root",
+                                  hint=f"create it with 'minigit server init {shown or root}'")
+
+
+def _modify(root: str, fn: Callable[[dict], object], *, create: bool = False) -> object:
+    """Load server.json under its lock, let ``fn`` mutate it, write it back atomically.
+    Only ``create`` (server_init) may start a missing server.json."""
+    if create:
+        os.makedirs(root, exist_ok=True)
+    else:
+        require_root(root)
     path = config_path(root)
     with util.LockFile(path, timeout=LOCK_TIMEOUT):
         data = _load(root)
@@ -232,11 +244,14 @@ class ServerConfig:
 # admin operations
 # ---------------------------------------------------------------------------
 
-def server_init(root: str) -> None:
-    """Create ROOT, ROOT/repos and ROOT/server.json if missing. Idempotent."""
+def server_init(root: str) -> bool:
+    """Create ROOT, ROOT/repos and ROOT/server.json if missing. Idempotent; True when server.json was new.
+    This is the only function that creates a server root; every other one requires it (``require_root``)."""
     os.makedirs(repos_dir(root), exist_ok=True)
-    if not os.path.exists(config_path(root)):
-        _modify(root, lambda data: None)
+    if os.path.exists(config_path(root)):
+        return False
+    _modify(root, lambda data: None, create=True)
+    return True
 
 
 def _new_token() -> str:
@@ -252,12 +267,22 @@ def add_user(root: str, name: str, *, reset: bool = False) -> str:
     """Create a user (or replace its default token with ``reset``) and return the new token.
     Named tokens and any other fields of an existing record are kept."""
     validate_user_name(name)
-    server_init(root)
+    if name in (".", ".."):
+        raise errors.MinigitError(f"invalid user name '{name}'",
+                                  hint="'.' and '..' cannot be user names")
     token = _new_token()
 
     def mutate(data: dict) -> None:
         if name in data["users"] and not reset:
             raise errors.MinigitError(f"user '{name}' already exists (use --reset to issue a new token)")
+        if name not in data["users"]:
+            if reset:
+                raise errors.MinigitError(f"user '{name}' does not exist",
+                                          hint="to create the user, run 'minigit server add-user' without --reset")
+            other = next((n for n in data["users"] if n.casefold() == name.casefold()), None)
+            if other is not None:
+                raise errors.MinigitError(f"user '{name}' differs only in case from the existing user '{other}'",
+                                          hint="user names that differ only in case are refused; choose another name")
         record = data["users"].get(name)
         if not isinstance(record, dict):
             record = data["users"][name] = {}
@@ -287,7 +312,6 @@ def create_repo(root: str, name: str, *, readers: Sequence[str] = ("*",), writer
                 public: bool = False, allow_force: bool = False) -> str:
     """Create a bare repo under ROOT/repos and register it. Returns the repo directory."""
     validate_repo_name(name)
-    server_init(root)
     acl = {
         "readers": _acl_list(readers),
         "writers": _acl_list(writers),
@@ -299,6 +323,10 @@ def create_repo(root: str, name: str, *, readers: Sequence[str] = ("*",), writer
     def mutate(data: dict) -> None:
         if name in data["repos"]:
             raise errors.MinigitError(f"repository '{name}' already exists")
+        for user in acl["readers"] + acl["writers"]:
+            if user != "*" and user not in data["users"]:  # like 'perm': a later user of that name gets nothing
+                raise errors.MinigitError(f"user '{user}' does not exist",
+                                          hint="create it first with 'minigit server add-user'")
         if os.path.exists(path):
             raise errors.MinigitError(
                 f"cannot create repository '{name}': '{path}' already exists"
@@ -313,6 +341,7 @@ def create_repo(root: str, name: str, *, readers: Sequence[str] = ("*",), writer
 
 def list_server(root: str) -> str:
     """Human-readable listing of users and repos."""
+    require_root(root)
     cfg = ServerConfig(root)
     lines = ["users:"]
     if cfg.users:

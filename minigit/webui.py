@@ -672,11 +672,13 @@ def handle_request(root: str, cfg: ServerConfig, user: str | None, parts: list[s
         if not parts:
             return view_repo_list(root, cfg, user, params)
         name, rest = parts[0], parts[1:]
-        if not cfg.repo_exists(name):
+        exists = cfg.repo_exists(name)
+        if user is None and not (exists and cfg.can_read(user, name)):
+            # Like the protocol: anonymous callers cannot tell a private name from a missing one.
+            raise WebError(401, f"authentication required to read '{name}'", headers=[CHALLENGE])
+        if not exists:
             raise WebError(404, f"repository '{name}' not found")
         if not cfg.can_read(user, name):
-            if user is None:
-                raise WebError(401, f"authentication required to read '{name}'", headers=[CHALLENGE])
             raise WebError(403, f"permission denied: user '{user}' may not read '{name}'")
         try:
             repo = Repository.open(repo_dir(root, name))

@@ -254,7 +254,8 @@ class BlameGrepAcceptance(unittest.TestCase):
         two = f"{self.boundary('c1')} (Alice {DATE_C1} 2) two"
         three = f"{self.id8('c2')} (Bob   {DATE_C2} 3) three"
         self.assertEqual(self.mg("blame", "-L", "2,3", "a.txt").lines, [two, three])
-        self.assertEqual(self.mg("blame", "-L", "2,+1", "a.txt").lines, [two, three])
+        self.assertEqual(self.mg("blame", "-L", "2,+2", "a.txt").lines, [two, three])
+        self.assertEqual(self.mg("blame", "-L", "2,", "a.txt").lines, [two, three])
         # a single printed line is padded to its own author only
         three1 = f"{self.id8('c2')} (Bob {DATE_C2} 3) three"
         self.assertEqual(self.mg("blame", "-L", "3", "a.txt").lines, [three1])
@@ -267,7 +268,7 @@ class BlameGrepAcceptance(unittest.TestCase):
         self.assertIn("error:", res.err)
         self.assertIn("has only 12 lines", res.err)
         self.assertEqual(res.stdout, b"")
-        for bad in ("0,2", "3,2", "x", "1,", "2,+0"):
+        for bad in ("0,2", "3,2", "x", ",1", "2,+0", "2,+"):
             res = self.fail_mg("blame", "-L", bad, "a.txt", code=2)
             self.assertIn("-L", res.err, str(res))
 
@@ -582,7 +583,8 @@ class BlameGrepEdgeCases(unittest.TestCase):
         self.assertEqual(blame.parse_line_range("3"), (3, None, False))
         self.assertEqual(blame.parse_line_range("3,5"), (3, 5, False))
         self.assertEqual(blame.parse_line_range("3,+2"), (3, 2, True))
-        for bad in ("", "0", "0,2", "3,2", "x", "1,", ",3", "2,+0", "-1", "1,2,3"):
+        self.assertEqual(blame.parse_line_range("3,"), (3, None, False))
+        for bad in ("", "0", "0,2", "3,2", "x", "0,", ",3", "2,+0", "2,+", "-1", "1,2,3"):
             with self.assertRaises(UsageError, msg=bad):
                 blame.parse_line_range(bad)
 
