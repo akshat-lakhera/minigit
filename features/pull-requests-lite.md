@@ -133,7 +133,9 @@ minigit pr close N [--remote NAME]
   <blank>
   <sha7> <subject>                          (commits in head but not in base, log order; omitted when none)
   ```
-  The `Mergeable:` line is printed only while the PR is open. For `merged`/`closed` PRs the
+  The `Mergeable:` line is printed only while the PR is open. A `merged`/`closed` PR whose snapshot has a
+  missing branch (`missing_branch` set) prints `note: branch 'x' no longer exists` in its place. For
+  `merged`/`closed` PRs the
   `Branches:` counts and the commit list come from the snapshot taken at merge/close time.
 - **diff** writes the unified diff bytes (section 3.3) verbatim to stdout. Empty when there is nothing
   to show.

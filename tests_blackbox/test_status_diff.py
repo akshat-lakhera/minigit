@@ -482,14 +482,21 @@ class StatusConflictTest(MinigitCase):
             "\tboth modified:   both.txt\n"
             "\tdeleted by us:   ours_del.txt\n"
             "\tdeleted by them: theirs_del.txt\n"))
-        self.assertEqual(self.diff(), (b"* Unmerged path added.txt\n* Unmerged path both.txt\n"
-                                       b"* Unmerged path ours_del.txt\n* Unmerged path theirs_del.txt\n"))
+        # SUPERSEDED: git also prints a diff for conflicted files; minigit prints that of `git diff --ours`.
+        def vs_ours(p: str, ours: bytes, theirs: bytes) -> bytes:
+            marked = b"<<<<<<< HEAD\n" + ours + b"=======\n" + theirs + b">>>>>>> feature\n"
+            return (f"* Unmerged path {p}\ndiff --git a/{p} b/{p}\n"
+                    f"index {short(ours)}..{short(marked)} 100644\n--- a/{p}\n+++ b/{p}\n").encode() + (
+                    b"@@ -1 +1,5 @@\n+<<<<<<< HEAD\n " + ours + b"+=======\n+" + theirs + b"+>>>>>>> feature\n")
+        both = vs_ours("both.txt", b"main\n", b"feature\n")
+        self.assertEqual(self.diff(), (vs_ours("added.txt", b"main add\n", b"feature add\n") + both
+                                       + b"* Unmerged path ours_del.txt\n* Unmerged path theirs_del.txt\n"))
         staged = self.diff("--cached")
         self.assertIn(b"* Unmerged path both.txt\n", staged)
         self.assertIn(b"diff --git a/clean.txt b/clean.txt\n", staged)
         self.assertIn(b" clean\n+feat\n", staged)
         self.assertEqual(self.diff("--", "clean.txt"), b"")       # pathspec filters unmerged lines too
-        self.assertEqual(self.diff("--", "both.txt"), b"* Unmerged path both.txt\n")
+        self.assertEqual(self.diff("--", "both.txt"), both)
 
     def test_all_conflicts_fixed_but_still_merging(self):
         self.write("both.txt", "resolved\n")
@@ -533,6 +540,7 @@ class StatusCraftedStagesTest(MinigitCase):
         text = self.long_status()
         self.assertIn("Unmerged paths:\n\tadded by us:     au.txt\n\tadded by them:   ua.txt\n"
                       "\tboth modified:   uu.txt\n", text)
+        # REAL BUG (fixed): ua.txt has no stage 2, so like `git diff --ours` it gets no diff against stage 3.
         self.assertEqual(self.diff(), b"* Unmerged path au.txt\n* Unmerged path ua.txt\n* Unmerged path uu.txt\n")
 
 
@@ -914,6 +922,7 @@ class DiffFormsTest(MinigitCase):
         self.mg("reset", "--hard", c1)
         self.mg("rm", "--cached", "run.sh")
         out = self.diff("HEAD")
+        # REAL BUG (fixed): diff <rev> keeps the revision's mode for a path missing from the index.
         # SPEC "mode from stat": on Windows use the previous index or HEAD mode. Content is unchanged,
         # so no mode change may be invented (git itself would print a deletion of a 100755 file).
         self.assertNotIn(b"new mode 100644", out, out)

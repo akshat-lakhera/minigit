@@ -180,7 +180,7 @@ Basic credentials, so there is no log-out other than closing the browser. Pass `
 | `grep [-i -n -l -c -w -F] [-e PAT] [--cached] PATTERN [REV] [PATH...]` | Search tracked files or a tree |
 | `remote [-v] \| add NAME URL \| remove NAME` | Manage remotes |
 | `clone URL [dir]` | Clone from a minigit server |
-| `fetch [REMOTE]` | Download objects, update remote-tracking branches |
+| `fetch [--prune] [REMOTE]` | Download objects, update remote-tracking branches; `origin/*` branches deleted on the server are removed (always, so `--prune` is accepted only for git compatibility) |
 | `pull [--allow-unrelated-histories] [REMOTE [BRANCH]]` | Fetch and merge the upstream branch |
 | `push [-u] [-f] [--delete] [REMOTE [SRC[:DST]]]` | Upload a branch (or delete a remote branch) |
 | `pr open -t\|--title T [-m BODY]... [--head B] [--base B]` | Open a pull request on the server |

@@ -931,7 +931,8 @@ class TestRevParse(Base):
         self.assertEqual([x[2] for x in self.oneline(repo, self.env, "origin/feature")],
                          ["feat commit", "second", "first"])
         cf_line = [l for l in run(["log", "--oneline"], repo, self.env).lines if l.startswith(S["cf"][:7])]
-        self.assertEqual(cf_line, [f"{S['cf'][:7]} (feature, origin/feature) feat commit"])
+        # git lists remote-tracking refs before other local branches: "(origin/feature, feature)"
+        self.assertEqual(cf_line, [f"{S['cf'][:7]} (origin/feature, feature) feat commit"])
         run(["branch", "extra"], repo, self.env)
         head_line = run(["log", "--oneline", "-n", "1"], repo, self.env).lines[0]
         self.assertEqual(head_line, f"{S['c6'][:7]} (HEAD -> main, origin/main, extra) sixth")
@@ -1004,7 +1005,7 @@ class TestDetachedHead(Base):
         run(["add", "o.txt"], repo, self.env)
         summary = commit(repo, self.env, "1700000900 +0000", "orphan")
         orphan = rev_parse(repo, self.env, "HEAD")[0]
-        self.assertEqual(summary, f"[detached HEAD {orphan[:7]}] orphan")
+        self.assertEqual(summary.splitlines()[0], f"[detached HEAD {orphan[:7]}] orphan")
         self.assertEqual(self.head_file(repo), orphan + "\n")
         self.assertEqual(rev_parse(repo, self.env, "HEAD~1", "main"), [S["c5"], S["c6"]])
         self.assertEqual(self.oneline(repo, self.env, "-n", "2"),

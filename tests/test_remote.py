@@ -936,6 +936,22 @@ class PullTests(LiveServerCase):
         self.assertEqual(bob.head_commit(), alice.head_commit())
         self.assertEqual(self.server_ref(), alice.head_commit())
 
+    def test_pull_merge_message_has_no_user_name(self):
+        # QA local bug 4: the user name of the clone URL must not end up in history
+        alice, _ = self.alice_with_commit()
+        with_user = self.url.replace("//", "//alice@", 1)
+        alice2, _ = self.clone("alice", "alice2", url=with_user)
+        self.assertIn("alice@", R.remote_url(alice2, "origin"))
+        bob, _ = self.clone("bob")
+        self.commit(bob, {"bob.txt": b"bob\n"}, "bob")
+        self.push("bob", bob)
+        self.commit(alice2, {"x.txt": b"x\n"}, "x")
+        _, outcome = self.pull("alice", alice2)
+        self.assertEqual(outcome.kind, "merged")
+        message = alice2.read_commit(alice2.head_commit()).message
+        self.assertEqual(message, f"Merge branch 'main' of {self.url}\n")
+        self.assertNotIn("alice@", message)
+
     def test_pull_conflict_writes_markers(self):
         alice, _ = self.alice_with_commit({"f.txt": b"line\n"})
         bob, _ = self.clone("bob")

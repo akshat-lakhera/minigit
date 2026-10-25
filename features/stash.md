@@ -45,7 +45,7 @@ Each entry is a commit `W`, exactly like git's:
 
 | Commit | Tree | Parents | Message |
 |---|---|---|---|
-| `W` | the worktree state of every tracked path (index or HEAD); missing files are left out | `HEAD`, `I` (and `U` with `-u`) | the subject above |
+| `W` | the worktree state of every tracked path (index or HEAD); missing files are left out | `HEAD`, `I` (and `U` with `-u`) | the subject above, without a final newline (as git writes it, so the ids match git's) |
 | `I` | the index | `HEAD` | `index on <branch>: <sha7> <subject>` |
 | `U` | the untracked, non-ignored files (only with `-u`) | none (a root commit) | `untracked files on <branch>: <sha7> <subject>` |
 
@@ -58,7 +58,9 @@ the entries as extra tips (`stash@{N}`) and checks that they are complete.
 
 **push**
 - Refused (exit 1): in a bare repository; on an unborn branch ("You do not have the initial commit yet");
-  during a merge / cherry-pick / revert ("you have a merge in progress"); with unmerged paths; without an
+  during a merge / cherry-pick / revert ("you have a merge in progress"); during a rebase, even after a
+  manual `commit` cleared `REBASE_HEAD` ("cannot stash: rebase in progress; run 'minigit rebase --continue',
+  '--skip' or '--abort' first"); with unmerged paths; without an
   identity (checked before anything is written).
 - Nothing to save when index == HEAD, the worktree of every tracked path == HEAD and (with `-u`) there are no
   untracked files. Ignored files are never stashed.
@@ -80,7 +82,7 @@ is written. Then:
   refuse while unmerged paths remain.
 - untracked files of a `-u` entry are restored as untracked files; if any already exists, nothing at all is
   applied ("already exist") and the entry is kept.
-- refused during a merge / cherry-pick / revert, and with unmerged paths.
+- refused during a merge / cherry-pick / revert / rebase, and with unmerged paths.
 
 **drop / list / show / clear** never touch the index or worktree. `pop`, `apply` and `drop` on an empty stack:
 `No stash entries found.`; an index past the end: `stash@{N} does not exist`.

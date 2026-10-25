@@ -288,7 +288,7 @@ def _unmerged_diff(repo, path: str) -> bytes:
     from minigit.index import read_index
 
     stages = read_index(repo).unmerged().get(path, {})
-    entry = stages.get(2) or stages.get(3)
+    entry = stages.get(2)   # as `git diff --ours`: no stage 2 (added by them) means no diff
     if entry is None:
         return b""
     try:
@@ -330,7 +330,7 @@ def diff_command(repo, cwd: str, *, staged: bool, revs: Sequence[str], pathspecs
     from minigit.index import read_index
     from minigit.revparse import resolve_rev
     from minigit.trees import commit_flat
-    from minigit.worktree import worktree_flat
+    from minigit.worktree import worktree_entry
 
     if repo.worktree is not None:
         specs = [repo.relpath(p, cwd) for p in pathspecs]
@@ -362,5 +362,10 @@ def diff_command(repo, cwd: str, *, staged: bool, revs: Sequence[str], pathspecs
         old = staged_flat
         paths = set(staged_flat)
     paths = {p for p in paths if _matches(p, specs) and p not in unmerged}
-    new = worktree_flat(repo, index, sorted(paths))
+    new: FlatTree = {}
+    for p in sorted(paths):
+        # A path missing from the index keeps the revision's mode (Windows has no exec bit to stat).
+        e = worktree_entry(repo, index, p, head_mode=old[p][0] if p in old else None)
+        if e is not None:
+            new[p] = e
     return _render(repo, old, new, True, specs, unmerged)

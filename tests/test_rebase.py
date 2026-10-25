@@ -456,6 +456,24 @@ class RebaseConflictTests(_RebaseCase):
         self.assertEqual(self.get("a.txt"), b"a\nb\nC-feature\n")
         self.assert_no_rebase()
 
+    def test_refusals_name_the_rebase_even_after_a_manual_commit(self):
+        main_tip, _edit, _extra = self.conflicting()
+        self.fail("rebase", "main")
+        expected = "rebase in progress; run 'minigit rebase --continue', '--skip' or '--abort' first"
+        self.assertIn("cannot stash: " + expected, self.fail("stash").err)
+        self.put("a.txt", "a\nb\nresolved\n")
+        self.mg("add", "a.txt")
+        self.mg("commit", "-m", "resolved by hand")
+        self.assertFalse(self.exists(".minigit/REBASE_HEAD"))   # the commit cleared it; the rebase goes on
+        for args in (["stash"], ["switch", "main"], ["checkout", "main"],
+                     ["merge", "main"], ["cherry-pick", main_tip], ["revert", main_tip]):
+            res = self.fail(*args)
+            self.assertIn(expected, res.err, args)
+            self.assertNotIn("REBASE_HEAD", res.err, args)
+            self.assertNotIn("'minigit commit'", res.err, args)
+        self.mg("rebase", "--continue")
+        self.assert_no_rebase()
+
     def test_untracked_file_blocking_a_later_pick_stops_and_continue_retries(self):
         self.commit("base", {"a.txt": "a\nb\nc\n"})
         self.mg("branch", "feature")
@@ -510,8 +528,9 @@ class RebaseRefusalTests(_RebaseCase):
         tip = self.commit("feature one", {"f.txt": "f\n"})
         self.put("new.txt", "mine\n")
         res = self.fail("rebase", "main")
-        self.assertIn("would be overwritten by rebase", res.err)
-        self.assertIn("new.txt", res.err)
+        self.assertIn("error: The following untracked working tree files would be overwritten by rebase:\n"
+                      "\tnew.txt\nPlease move or remove them before you rebase.", res.err)
+        self.assertNotIn("local changes", res.err)
         self.assertEqual(self.get("new.txt"), b"mine\n")
         self.assertEqual(self.sha("HEAD"), tip)
         self.assertIn("On branch feature", self.status())

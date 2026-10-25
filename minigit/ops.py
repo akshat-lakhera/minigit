@@ -13,7 +13,7 @@ from typing import Sequence
 from minigit.errors import MinigitError, NothingToCommit, RefUpdateError, UsageError
 from minigit.objects import EMPTY_TREE, Commit, hash_object, serialize_commit
 from minigit.refs import check_ref_name, short_ref
-from minigit.repo import Repository
+from minigit.repo import REBASE_IN_PROGRESS, Repository
 from minigit.trees import build_tree, commit_flat, commit_tree_sha
 
 Entry = tuple[str, str]
@@ -225,7 +225,8 @@ def _nothing_to_commit_message(repo: Repository, all_: bool) -> str:
 
 
 def commit(repo: Repository, messages: Sequence[str], *, all_: bool = False,
-           allow_empty: bool = False) -> tuple[str, str]:
+           allow_empty: bool = False, stat: bool = False) -> tuple[str, str]:
+    """Commit the index; returns (sha, summary). ``stat`` adds the ``commit`` command's second line."""
     from minigit.index import locked_index
     from minigit.worktree import stage_file, worktree_entry
 
@@ -267,6 +268,7 @@ def commit(repo: Repository, messages: Sequence[str], *, all_: bool = False,
                             author=repo.read_commit(pick).author if pick else None)
         repo.refs.update_head(sha, expected=head)
         repo.clear_operation_state()
+        new_flat = index.flat()
     branch = repo.refs.current_branch()
     subject = message.split("\n", 1)[0]
     if branch is None:
@@ -275,7 +277,55 @@ def commit(repo: Repository, messages: Sequence[str], *, all_: bool = False,
         prefix = f"[{branch} (root-commit) {_abbrev(sha)}]"
     else:
         prefix = f"[{branch} {_abbrev(sha)}]"
-    return sha, f"{prefix} {subject}"
+    # like git, a merge commit (or a commit that changes nothing) gets no stat line
+    line = _shortstat(repo, commit_flat(repo.objects, head), new_flat) if stat and len(parents) < 2 else None
+    return sha, f"{prefix} {subject}" + (f"\n{line}" if line else "")
+
+
+def _shortstat(repo: Repository, old: dict, new: dict) -> str | None:
+    """git's ' N files changed, X insertions(+), Y deletions(-)' between two flat trees, or None.
+
+    Exact renames (a deleted and an added path with the same blob) count as one file with no
+    lines, as with git's rename detection; binary files count as changed with no lines.
+    """
+    from minigit.diff import _opcodes
+    from minigit.util import is_binary, split_lines
+
+    paths = sorted(p for p in set(old) | set(new) if old.get(p) != new.get(p))
+    if not paths:
+        return None
+    added: dict[str, list[str]] = {}
+    deleted: dict[str, list[str]] = {}
+    for p in paths:
+        if p not in old:
+            added.setdefault(new[p][1], []).append(p)
+        elif p not in new:
+            deleted.setdefault(old[p][1], []).append(p)
+    files, skip = len(paths), set()
+    for sha, ps in added.items():
+        k = min(len(ps), len(deleted.get(sha, ())))
+        skip.update(ps[:k])
+        skip.update(deleted.get(sha, [])[:k])
+        files -= k
+    insertions = deletions = 0
+    for p in paths:
+        o, n = old.get(p), new.get(p)
+        if p in skip or (o is not None and n is not None and o[1] == n[1]):
+            continue
+        a = repo.objects.read_typed(o[1], "blob") if o is not None else b""
+        b = repo.objects.read_typed(n[1], "blob") if n is not None else b""
+        if is_binary(a) or is_binary(b):
+            continue
+        for tag, a1, a2, b1, b2 in _opcodes(split_lines(a), split_lines(b)):
+            if tag != "equal":
+                deletions += a2 - a1
+                insertions += b2 - b1
+    out = f" {files} file changed" if files == 1 else f" {files} files changed"
+    if insertions or not deletions:
+        out += f", {insertions} insertion(+)" if insertions == 1 else f", {insertions} insertions(+)"
+    if deletions or not insertions:
+        out += f", {deletions} deletion(-)" if deletions == 1 else f", {deletions} deletions(-)"
+    return out
 
 
 # --------------------------------------------------------------------------- branches
@@ -302,8 +352,10 @@ def branch_list(repo: Repository, *, remotes: bool = False, all_: bool = False) 
             short = short_ref(name)
             items.append(BranchInfo(short, sha, short == current, False, _subject(repo, sha)))
     if remotes or all_:
+        # as in git: 'branch -r' shows origin/main, 'branch -a' shows remotes/origin/main
+        prefix = "remotes/" if all_ else ""
         for name, sha in sorted(repo.refs.list("refs/remotes/").items()):
-            items.append(BranchInfo(short_ref(name), sha, False, True, _subject(repo, sha)))
+            items.append(BranchInfo(prefix + short_ref(name), sha, False, True, _subject(repo, sha)))
     return items
 
 
@@ -436,6 +488,8 @@ def switch(repo: Repository, target: str | None, *, create: str | None = None, s
 
     repo.require_worktree()
     op = repo.operation_in_progress()
+    if op is not None and op[0] == "rebase":
+        raise MinigitError(REBASE_IN_PROGRESS)
     if op is not None:
         raise MinigitError(f"{op[0]} in progress; commit or run 'minigit {op[0]} --abort'")
 

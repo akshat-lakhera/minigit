@@ -264,7 +264,9 @@ Notation:
   - A line without a final `\n` is followed by `\n\\ No newline at end of file\n`.
   - A NUL byte in the first 8000 bytes of either side prints `Binary files a/p and b/p differ`, after the header lines and with no `---`/`+++` lines.
   - A mode-only change prints the header only.
-  - An unmerged path prints `* Unmerged path p`.
+  - An unmerged path prints `* Unmerged path p`, followed by the diff of the work tree against
+    stage 2 ("ours") when that stage exists, which is what `git diff --ours` prints; a path with no
+    stage 2 (an add/unmerged `UA` entry) prints only the marker line.
 
 ### commit `-m M [-m M2...] [-a] [--allow-empty]`
 1. Hold the index lock. With `-a`, re-stage tracked files that were modified or deleted.

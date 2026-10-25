@@ -23,14 +23,14 @@ import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from .errors import CheckoutConflictError, MinigitError, NothingToCommit, UsageError
+from .errors import MinigitError, NothingToCommit, UsageError
 from .index import IndexEntry, locked_index
 from .merge import TreeMergeResult, merge_trees
 from .objects import Commit, Signature, hash_object, serialize_commit
-from .repo import OPERATION_STATE_FILES
+from .repo import OPERATION_STATE_FILES, REBASE_IN_PROGRESS
 from .revparse import resolve_rev
 from .trees import Entry, FlatTree, build_tree, commit_flat, flatten_tree
-from .worktree import (_conflict_message, checkout_tree, ensure_unmodified, entry_with_stat,
+from .worktree import (checkout_tree, conflict_error, ensure_unmodified, entry_with_stat,
                        remove_file, write_file)
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -112,8 +112,7 @@ def _conflicts_message(message: str, conflicts: list[str]) -> str:
 def _require_no_operation(repo: Repository) -> None:
     op = repo.operation_in_progress()
     if op is not None and op[0] == "rebase":
-        raise MinigitError("rebase in progress; finish it first",
-                           hint="use 'minigit rebase --continue', '--skip' or '--abort'")
+        raise MinigitError(REBASE_IN_PROGRESS)
     if op is not None:
         kind = op[0]
         raise MinigitError(f"you have not concluded your {kind} ({_state_file(kind)} exists)",
@@ -151,7 +150,10 @@ def _plan(repo: Repository, index: Index, ours: FlatTree, res: TreeMergeResult, 
 
     # untracked files / directories that block a write
     deleted = {p for p, e in target.items() if e is None and p in ours}
+    in_index = set(index.paths())
     bad: list[str] = []
+    untracked: list[str] = []
+    dirs: list[str] = []
     skip: set[str] = set()
     for p in writes:
         parts = p.split("/")
@@ -161,16 +163,16 @@ def _plan(repo: Repository, index: Index, ours: FlatTree, res: TreeMergeResult, 
             if os.path.lexists(aq) and not os.path.isdir(aq):
                 skip.add(p)
                 if q not in deleted:
-                    bad.append(q)
+                    (bad if q in in_index else untracked).append(q)
                 break
         ap = repo.abspath(p)
         if os.path.isdir(ap):
             skip.add(p)
-            if any(f not in deleted for f in _files_under(ap, p)):
-                bad.append(p)
-    if bad:
-        paths = sorted(set(bad))
-        raise CheckoutConflictError(_conflict_message(paths, action), paths=paths)
+            kept = [f for f in _files_under(ap, p) if f not in deleted]
+            if kept:
+                (bad if any(f in in_index for f in kept) else dirs).append(p)
+    if bad or untracked or dirs:
+        raise conflict_error(action, bad, untracked, dirs)
 
     must_be_clean = (set(changed) | set(res.stages)) - skip
     ensure_unmodified(repo, index, {p: ours.get(p) for p in sorted(must_be_clean)}, action)

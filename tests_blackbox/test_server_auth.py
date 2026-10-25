@@ -292,8 +292,9 @@ class AdminCliTests(unittest.TestCase):
         return json.loads(read(os.path.join(self.srv, "server.json")).decode("utf-8"))
 
     def test_add_user_prints_token_once_and_stores_only_its_sha256(self):
+        # superseded: stderr now carries a "shown only once" note (features/server-admin.md); stdout is the token
         res = run(["server", "add-user", self.srv, "alice"], cwd=self.dir, env=self.env)
-        self.assertEqual(res.stderr, b"", str(res))
+        self.assertIn("note: this is the only time the token for 'alice' is shown", res.err, str(res))
         lines = res.stdout.split(b"\n")
         self.assertEqual(len(lines), 2, f"token must be alone on one line: {res.stdout!r}")
         self.assertEqual(lines[1], b"")
@@ -346,6 +347,14 @@ class AdminCliTests(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.dir, "x")), "'../x' must not escape repos/")
 
     def test_create_repo_is_atomic_and_duplicates_are_refused(self):
+        # superseded: --readers/--writers must name existing users (features/server-admin.md), so create them first
+        ghost = run(["server", "create-repo", self.srv, "proj", "--readers", "alice"], cwd=self.dir, env=self.env,
+                    check=False)
+        self.assertEqual(ghost.returncode, 1, str(ghost))
+        self.assertIn("user 'alice' does not exist", ghost.err)
+        self.assertNotIn("proj", self.server_json()["repos"])
+        for user in ("alice", "bob"):
+            run(["server", "add-user", self.srv, user], cwd=self.dir, env=self.env)
         res = run(["server", "create-repo", self.srv, "proj", "--readers", "alice,bob", "--writers", "alice",
                    "--public", "--allow-force"], cwd=self.dir, env=self.env)
         self.assertEqual(res.out.strip(), "/proj")
@@ -583,6 +592,7 @@ class HttpAuthTests(_LiveServerBase):
                 self.assertEqual(resp.status, 200, str(resp))
 
     def test_anonymous_401_vs_forbidden_403_vs_unknown_404(self):
+        # superseded: anonymous callers get 401 for unknown repos too (no name discovery, SPEC 7.1)
         # private repo, no credentials -> 401 + challenge
         for path in ("/priv/info/refs", "/open/info/refs"):
             with self.subTest(anon=path):
@@ -598,9 +608,9 @@ class HttpAuthTests(_LiveServerBase):
                 self.assertIn("permission denied", payload["error"])
         self.assert_json_error(self.post("/priv/fetch", b"{}", "bob"), 403, "forbidden")
         self.assert_json_error(self.post("/priv/push", b"junk", "bob"), 403, "forbidden")
-        # unknown repo -> 404 for anyone authenticated (bad creds still 401 first)
+        # unknown repo -> 404 for anyone authenticated, 401 for anonymous (bad creds still 401 first)
         self.assert_json_error(self.get("/does-not-exist/info/refs", "alice"), 404, "not_found")
-        self.assert_json_error(self.get("/does-not-exist/info/refs"), 404, "not_found")
+        self.assert_401(self.get("/does-not-exist/info/refs"), msg="anonymous request for an unknown repo")
         self.assert_401(self.get("/does-not-exist/info/refs", "alice", "wrong"))
         # readers: alice reads priv; writers imply read on ro; carol reads ro but may not push
         self.assertEqual(self.get("/priv/info/refs", "alice").status, 200)
@@ -981,11 +991,13 @@ class HttpAuthTests(_LiveServerBase):
 class ClientCliAuthTests(_LiveServerBase):
 
     def test_cli_fails_closed_on_wrong_token_anonymous_forbidden_and_unknown(self):
+        # superseded: with no credentials at all the error is "authentication required ... (no credentials configured)"
         repo = self.create_repo("", "--readers", "alice", "--writers", "alice")
         self.seed(repo)
         cases = [
             ("wrong-token", make_env(os.path.join(self.work, "e-wrong"), "alice", "nope"), "authentication failed", 1),
-            ("anonymous", make_env(os.path.join(self.work, "e-anon")), "authentication failed", 1),
+            ("anonymous", make_env(os.path.join(self.work, "e-anon")),
+             "authentication required for '%s' (no credentials configured)" % f"{self.server.url}/{repo}", 1),
             ("forbidden", self.env_for("bob"), "permission denied", 1),
         ]
         for label, env, text, code in cases:
@@ -1018,6 +1030,7 @@ class ClientCliAuthTests(_LiveServerBase):
         self.assertIn("authentication failed", res.err)
 
     def test_credential_precedence_env_then_url_then_file(self):
+        # superseded: a user:token@ URL keeps "user@" in the remote URL and stores only the "<host>|<user>" key
         repo = self.create_repo("", "--readers", "alice", "--writers", "alice")
         self.seed(repo)
         hostport = self.server.url[len("http://"):]
@@ -1036,12 +1049,12 @@ class ClientCliAuthTests(_LiveServerBase):
         dest, _, res = self.clone(None, repo, label="url-good", env=anon2, url=good_url, check=False)
         self.assertEqual(res.returncode, 0, str(res))
         config = read(os.path.join(dest, ".minigit", "config")).decode()
-        self.assertIn(f"url = {self.server.url}/{repo}", config)
+        self.assertIn(f"url = http://alice@{hostport}/{repo}", config)
         self.assertNotIn(self.tokens["alice"], config, "the token must be stripped from the stored URL")
         self.assertNotIn("alice:", config)
         creds = json.loads(read(anon2["MINIGIT_CREDENTIALS"]).decode())
-        self.assertEqual(creds, {self.server.url: {"user": "alice", "token": self.tokens["alice"]}},
-                         "credentials are keyed by scheme://host:port")
+        self.assertEqual(creds, {f"{self.server.url}|alice": {"user": "alice", "token": self.tokens["alice"]}},
+                         "a user:token@ URL stores only the scheme://host:port|user entry")
         # later commands in that environment use the file (no env, no userinfo)
         self.commit_file(dest, anon2, "b.txt", b"b\n", "via file creds")
         res = run(["push"], cwd=dest, env=anon2, check=False)
@@ -1058,7 +1071,9 @@ class ClientCliAuthTests(_LiveServerBase):
         run(["login", self.server.url + "/" + repo, "--user", "alice", "--token", self.tokens["alice"]],
             cwd=self.work, env=anon3)
         creds = json.loads(read(anon3["MINIGIT_CREDENTIALS"]).decode())
-        self.assertEqual(list(creds), [self.server.url], "login with a repo path still keys by host:port")
+        self.assertEqual(sorted(creds), [self.server.url, f"{self.server.url}|alice"],
+                         "login with a repo path still keys by host:port (host default plus the |user entry)")
+        self.assertEqual(creds[self.server.url], {"user": "alice", "token": self.tokens["alice"]})
         _, _, res = self.clone(None, repo, label="login-good", env=anon3, check=False)
         self.assertEqual(res.returncode, 0, str(res))
         # 4. MINIGIT_TOKEN alone (no MINIGIT_USER) is ignored in favour of the file
@@ -1076,26 +1091,30 @@ class ClientCliAuthTests(_LiveServerBase):
         self.assertFalse(os.path.exists(dest5))
 
     def test_login_keys_are_normalized_and_scoped_to_host_port(self):
+        # superseded: login writes host default + "<host>|<user>"; no creds for this port is "authentication required"
         hostport = self.server.url[len("http://"):]
         env = make_env(os.path.join(self.work, "e1"))
         # scheme/host case and a repo path with trailing slash all map onto the same key
         run(["login", f"HTTP://{hostport.upper()}/open/", "--user", "alice", "--token", self.tokens["alice"]],
             cwd=self.work, env=env)
         creds = json.loads(read(env["MINIGIT_CREDENTIALS"]).decode())
-        self.assertEqual(list(creds), [self.server.url], creds)
+        self.assertEqual(sorted(creds), [self.server.url, f"{self.server.url}|alice"], creds)
         _, _, res = self.clone(None, "priv", label="normalized", env=env, check=False)
         self.assertEqual(res.returncode, 0, str(res))
-        # a second login for the same server replaces, not duplicates
+        # a second login for the same server replaces the host default, not duplicates it
         run(["login", self.server.url, "--user", "bob", "--token", self.tokens["bob"]], cwd=self.work, env=env)
         creds = json.loads(read(env["MINIGIT_CREDENTIALS"]).decode())
-        self.assertEqual(creds, {self.server.url: {"user": "bob", "token": self.tokens["bob"]}})
+        self.assertEqual(creds, {self.server.url: {"user": "bob", "token": self.tokens["bob"]},
+                                 f"{self.server.url}|alice": {"user": "alice", "token": self.tokens["alice"]},
+                                 f"{self.server.url}|bob": {"user": "bob", "token": self.tokens["bob"]}})
         # credentials for another port are not applied to this server
         env2 = make_env(os.path.join(self.work, "e2"))
         run(["login", f"http://{self.server.host}:1/", "--user", "alice", "--token", self.tokens["alice"]],
             cwd=self.work, env=env2)
         dest, _, res = self.clone(None, "priv", label="other-port", env=env2, check=False)
         self.assertEqual(res.returncode, 1, str(res))
-        self.assertIn("authentication failed", res.err)
+        self.assertIn("authentication required", res.err)
+        self.assertIn("(no credentials configured)", res.err)
         self.assertFalse(os.path.exists(dest))
         # login argument validation
         for args, code in ((["login", self.server.url, "--user", "", "--token", "t"], 2),
@@ -1109,18 +1128,19 @@ class ClientCliAuthTests(_LiveServerBase):
                 self.assertNotIn("internal error", res.err)
 
     def test_remote_add_strips_userinfo_and_saves_credentials(self):
+        # superseded: the token is stripped but "alice@" stays in the URL; the token goes under "<host>|alice" only
         env = make_env(os.path.join(self.work, "e"))
         repo_dir = os.path.join(self.work, "local")
         run(["init", repo_dir], cwd=self.work, env=env)
         hostport = self.server.url[len("http://"):]
         run(["remote", "add", "origin", f"http://alice:{self.tokens['alice']}@{hostport}/priv/"], cwd=repo_dir, env=env)
         config = read(os.path.join(repo_dir, ".minigit", "config")).decode()
-        self.assertIn(f"url = {self.server.url}/priv\n", config)
+        self.assertIn(f"url = http://alice@{hostport}/priv\n", config)
         self.assertNotIn(self.tokens["alice"], config)
         self.assertEqual(run(["remote", "-v"], cwd=repo_dir, env=env).out,
-                         f"origin\t{self.server.url}/priv (fetch)\norigin\t{self.server.url}/priv (push)\n")
+                         f"origin\thttp://alice@{hostport}/priv (fetch)\norigin\thttp://alice@{hostport}/priv (push)\n")
         creds = json.loads(read(env["MINIGIT_CREDENTIALS"]).decode())
-        self.assertEqual(creds[self.server.url], {"user": "alice", "token": self.tokens["alice"]})
+        self.assertEqual(creds, {f"{self.server.url}|alice": {"user": "alice", "token": self.tokens["alice"]}})
         res = run(["fetch"], cwd=repo_dir, env=env, check=False)
         self.assertEqual(res.returncode, 0, str(res))
         # the saved credentials are per host, so a repo bob may not read is still refused for alice? no: alice
@@ -1132,6 +1152,7 @@ class ClientCliAuthTests(_LiveServerBase):
         self.assertIn("permission denied", res.err)
 
     def test_corrupt_credentials_file_is_a_clean_error(self):
+        # superseded: an ignored (badly shaped) entry leaves no credentials: "authentication required", not "failed"
         for label, content in (("not json", b"{garbage"), ("json list", b"[]"), ("json string", b'"x"'),
                                ("binary", b"\x00\xff\x00")):
             with self.subTest(case=label):
@@ -1150,7 +1171,8 @@ class ClientCliAuthTests(_LiveServerBase):
         self.assertEqual(res.returncode, 0, str(res))  # pub is anonymous-readable
         _, _, res = self.clone(None, "priv", label="c-shape2", env=env, check=False)
         self.assertEqual(res.returncode, 1, str(res))
-        self.assertIn("authentication failed", res.err)
+        self.assertIn("authentication required", res.err)
+        self.assertIn("(no credentials configured)", res.err)
 
     def test_clone_url_without_a_repository_path_is_a_clear_error(self):
         """http://host:port names the server, not a repository. The client must say so instead of
@@ -1216,8 +1238,13 @@ class ServeLifecycleTests(unittest.TestCase):
         self.env = make_env(self.dir)
 
     def test_serve_announces_itself_writes_ready_file_and_auto_inits_a_nested_root(self):
+        # superseded: serve only creates a missing root with --init (SPEC 7.6); without it the path is refused
         root = os.path.join(self.dir, "nested", "deeper", "root")
-        srv = ServeProcess(root, self.env, quiet=False, cwd=self.dir)
+        res = run(["serve", "--root", root, "--port", "0", "--quiet"], cwd=self.dir, env=self.env, check=False)
+        self.assertEqual(res.returncode, 1, str(res))
+        self.assertIn("is not a minigit server root", res.err)
+        self.assertFalse(os.path.exists(root), "a mistyped root must not be created")
+        srv = ServeProcess(root, self.env, extra=("--init",), quiet=False, cwd=self.dir)
         self.addCleanup(srv.stop)
         srv.start()
         ready = read(srv.ready_file).decode("ascii")
@@ -1249,7 +1276,8 @@ class ServeLifecycleTests(unittest.TestCase):
             socket.create_connection((srv.host, srv.port), timeout=2).close()
 
     def test_serve_with_quiet_logs_nothing_and_default_port_flag_is_respected(self):
-        srv = ServeProcess(os.path.join(self.dir, "srv"), self.env, quiet=True)
+        # superseded: serve needs --init to create a missing root
+        srv = ServeProcess(os.path.join(self.dir, "srv"), self.env, extra=("--init",), quiet=True)
         self.addCleanup(srv.stop)
         srv.start()
         for _ in range(5):
@@ -1260,10 +1288,11 @@ class ServeLifecycleTests(unittest.TestCase):
         self.assertEqual(srv.stdout(), f"Serving minigit on http://127.0.0.1:{srv.port}\n")
 
     def test_second_server_on_the_same_port_fails_cleanly(self):
-        srv = ServeProcess(os.path.join(self.dir, "srv"), self.env)
+        # superseded: serve needs --init to create a missing root
+        srv = ServeProcess(os.path.join(self.dir, "srv"), self.env, extra=("--init",))
         self.addCleanup(srv.stop)
         srv.start()
-        res = run(["serve", "--root", os.path.join(self.dir, "other"), "--port", str(srv.port), "--quiet"],
+        res = run(["serve", "--root", os.path.join(self.dir, "other"), "--init", "--port", str(srv.port), "--quiet"],
                   cwd=self.dir, env=self.env, check=False)
         self.assertEqual(res.returncode, 1, str(res))
         self.assertTrue(res.err.startswith("error:"), str(res))

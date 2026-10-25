@@ -932,6 +932,31 @@ class TestFetchPush(ServerTestCase):
         self.assertEqual(status, 400)
         self.assertEqual(set(res), {"error", "code"})
 
+    def test_ref_lock_error_does_not_leak_server_path(self):
+        # A held ref lock is a 503 "busy"; the lock file's path goes to the server log, not to the client.
+        from unittest import mock
+        base = self.push_initial()
+        c2 = self.commit({"a.txt": b"two\n"}, [base], "second")
+        lock = os.path.join(self.root, "repos", "proj", "refs", "heads", "main.lock")
+        with open(lock, "wb"):
+            pass
+        logged: list[str] = []
+        with mock.patch.object(server, "REF_LOCK_TIMEOUT", 0.0):
+            status, res = server.process_push(
+                self.root, "proj", "alice",
+                push_body([{"ref": "refs/heads/main", "old": base, "new": c2}], self.pack_for([c2], [base])),
+                auth.ServerConfig(self.root), log=logged.append)
+            self.assertEqual(status, 503, res)
+            self.assertEqual(res, {"error": "the repository is busy (cannot lock ref 'refs/heads/main'), try again",
+                                   "code": "busy"})
+            self.assertEqual(len(logged), 1)
+            self.assertIn(lock[:-len(".lock")], logged[0])
+            status, res = self.push([{"ref": "refs/heads/main", "old": base, "new": c2}], b"")
+            self.assertEqual(status, 503, res)
+            self.assertEqual(res["code"], "busy")
+            self.assertNotIn(self.root, res["error"])
+        self.assertEqual(self.server_repo().refs.resolve("refs/heads/main"), base)
+
     def test_concurrent_pushes_have_one_winner(self):
         base = self.push_initial()
         n = 8

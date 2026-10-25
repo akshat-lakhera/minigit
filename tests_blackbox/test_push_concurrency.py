@@ -39,8 +39,10 @@ HEX40 = re.compile(r"^[0-9a-f]{40}$")
 # SPEC 7.5: " ! [rejected]        main -> main (non-fast-forward)"  (or fetch first / stale info)
 REJECT_LINE = re.compile(
     r"^ ! \[rejected\]        (?P<src>\S+) -> (?P<dst>\S+) \((?P<reason>non-fast-forward|fetch first|stale info)\)$")
-PULL_HINT = "hint: Run 'minigit pull' first, then push again (pull first)."
+# superseded: the rejection hints were reworded (git-style); a lost race reads "fetch first", never "stale info"
+PULL_HINT = "hint: Integrate the remote changes first ('minigit pull'), then push again."
 WORK_HINT = "hint: Updates were rejected because the remote contains work that you do not have locally."
+BEHIND_HINT = "hint: Updates were rejected because the tip of your branch is behind its remote counterpart."
 # SPEC 7.2 pack format: MGPK | u32 version=1 | u32 count=0 | sha1 trailer
 EMPTY_PACK = b"MGPK" + (1).to_bytes(4, "big") + (0).to_bytes(4, "big")
 EMPTY_PACK += hashlib.sha1(EMPTY_PACK).digest()
@@ -368,8 +370,10 @@ class PushTestBase(unittest.TestCase):
         if reason is not None:
             self.assertEqual(m.group("reason"), reason, res)
         self.assertEqual(lines[2], f"error: failed to push some refs to '{self.url}'", res)
-        self.assertIn(WORK_HINT, lines, res)
+        # superseded: "non-fast-forward" gets the "tip ... behind" hint, "fetch first" the "remote contains work" one
+        self.assertIn(BEHIND_HINT if m.group("reason") == "non-fast-forward" else WORK_HINT, lines, res)
         self.assertIn(PULL_HINT, lines, res)
+        self.assertNotIn("stale info", res.err)
         self.assertNotIn("Traceback", res.err)
         self.assertNotIn("fatal:", res.err)
         return m.group("reason")
@@ -609,6 +613,7 @@ class NonFastForwardTests(PushTestBase):
         return (a, ea, b, eb, c1, c2, c3)
 
     def test_non_fast_forward_after_fetch_prints_exact_rejection_block(self):
+        # superseded: rejection hints reworded (see PULL_HINT/BEHIND_HINT); a lost race reads "fetch first"
         a, ea, b, eb, c1, c2, c3 = self.diverge()
         res = run(["fetch"], a, ea)
         self.assertIn(f"{c1[:7]}..{c2[:7]}  main -> origin/main", res.out)
@@ -618,13 +623,14 @@ class NonFastForwardTests(PushTestBase):
             f"To {self.url}",
             " ! [rejected]        main -> main (non-fast-forward)",
             f"error: failed to push some refs to '{self.url}'",
-            WORK_HINT,
+            BEHIND_HINT,  # superseded: git's wording for a non-fast-forward after fetch
             PULL_HINT,
         ])
         self.assertEqual(res.out, "")
         self.assertEqual(self.server_ref(), c2)
 
     def test_rejection_before_fetch_says_fetch_first_and_uploads_nothing(self):
+        # superseded: rejection hints reworded (see PULL_HINT/BEHIND_HINT); a lost race reads "fetch first"
         a, ea, b, eb, c1, c2, c3 = self.diverge()
         res = run(["push"], a, ea, check=False)
         self.assert_rejected(res, reason="fetch first")
@@ -644,6 +650,7 @@ class NonFastForwardTests(PushTestBase):
         self.assertEqual(self.server_leftovers(), [])
 
     def test_pushing_an_older_commit_is_non_fast_forward(self):
+        # superseded: rejection hints reworded (see PULL_HINT/BEHIND_HINT); a lost race reads "fetch first"
         self.create_repo()
         a, ea = self.clone("alice")
         c1 = self.commit(a, ea)
@@ -671,6 +678,7 @@ class NonFastForwardTests(PushTestBase):
         self.server_fsck()
 
     def test_force_push_allowed_when_repo_created_with_allow_force(self):
+        # superseded: rejection hints reworded (see PULL_HINT/BEHIND_HINT); a lost race reads "fetch first"
         self.create_repo("--allow-force")
         a, ea = self.clone("alice")
         c1 = self.commit(a, ea)
@@ -691,6 +699,7 @@ class NonFastForwardTests(PushTestBase):
         self.assertIn(f" + {c2[:7]}...{c3[:7]} main -> origin/main (forced update)", res.out)
 
     def test_pull_then_push_recovers_from_rejection(self):
+        # superseded: rejection hints reworded (see PULL_HINT/BEHIND_HINT); a lost race reads "fetch first"
         a, ea, b, eb, c1, c2, c3 = self.diverge()
         self.assert_rejected(run(["push"], a, ea, check=False))
         res = run(["pull"], a, ea)
@@ -713,6 +722,7 @@ class NonFastForwardTests(PushTestBase):
         self.server_fsck()
 
     def test_second_rejection_after_remote_moves_again(self):
+        # superseded: rejection hints reworded (see PULL_HINT/BEHIND_HINT); a lost race reads "fetch first"
         a, ea, b, eb, c1, c2, c3 = self.diverge()
         run(["fetch"], a, ea)
         self.assert_rejected(run(["push"], a, ea, check=False), reason="non-fast-forward")
@@ -745,6 +755,7 @@ class ConcurrentPushTests(PushTestBase):
         return base, clones
 
     def test_two_users_race_exactly_one_wins(self):
+        # superseded: rejection hints reworded (see PULL_HINT/BEHIND_HINT); a lost race reads "fetch first"
         base, clones = self.seeded(["alice", "bob"])
         heads = [self.commit(cwd, env) for cwd, env in clones]
         self.assertNotEqual(heads[0], heads[1])
@@ -756,6 +767,7 @@ class ConcurrentPushTests(PushTestBase):
         self.assertEqual(self.head(*clones[winner], "origin/main"), heads[winner])
 
     def test_three_users_race_then_losers_recover(self):
+        # superseded: rejection hints reworded (see PULL_HINT/BEHIND_HINT); a lost race reads "fetch first"
         base, clones = self.seeded(["alice", "bob", "carol"])
         heads = [self.commit(cwd, env, message=f"{u}-work") for (cwd, env), u in zip(clones, USERS)]
         results = self.race([(["push"], cwd, env) for cwd, env in clones])
@@ -780,6 +792,7 @@ class ConcurrentPushTests(PushTestBase):
         self.assertEqual(self.server_leftovers(), [])
 
     def test_five_processes_race_in_two_rounds(self):
+        # superseded: rejection hints reworded (see PULL_HINT/BEHIND_HINT); a lost race reads "fetch first"
         users = ["alice", "bob", "carol", "alice", "bob"]
         base, clones = self.seeded(users)
         heads = [self.commit(cwd, env) for cwd, env in clones]
@@ -827,6 +840,7 @@ class ConcurrentPushTests(PushTestBase):
         self.server_fsck()
 
     def test_identical_commit_pushed_concurrently_is_safe(self):
+        # superseded: rejection hints reworded (see PULL_HINT/BEHIND_HINT); a lost race reads "fetch first"
         self.create_repo()
         seed, es = self.clone("alice", label="seed")
         base = self.commit(seed, es, message="base")
@@ -872,6 +886,7 @@ class ConcurrentPushTests(PushTestBase):
             self.assertFalse(os.path.exists(os.path.join(self.server_repo, "refs", "heads", "topic")))
 
     def test_ref_file_is_always_complete_while_pushes_race(self):
+        # superseded: rejection hints reworded (see PULL_HINT/BEHIND_HINT); a lost race reads "fetch first"
         base, clones = self.seeded(["alice", "bob", "carol"])
         heads = [self.commit(cwd, env) for cwd, env in clones]
         allowed = {base, *heads}
@@ -907,6 +922,7 @@ class ConcurrentPushTests(PushTestBase):
         self.assertEqual(missing, [], "readers observed the branch file missing during a replace")
 
     def test_two_users_create_same_new_branch_concurrently(self):
+        # superseded: rejection hints reworded (see PULL_HINT/BEHIND_HINT); a lost race reads "fetch first"
         base, clones = self.seeded(["alice", "bob"])
         heads = [self.commit(cwd, env) for cwd, env in clones]
         results = self.race([(["push", "origin", "main:newb"], cwd, env) for cwd, env in clones])
@@ -923,6 +939,7 @@ class ConcurrentPushTests(PushTestBase):
         self.server_fsck()
 
     def test_readers_never_fail_while_pushes_race(self):
+        # superseded: rejection hints reworded (see PULL_HINT/BEHIND_HINT); a lost race reads "fetch first"
         base, clones = self.seeded(["alice", "bob"])
         reader, er = self.clone("carol", label="reader")
         heads = [self.commit(cwd, env) for cwd, env in clones]
@@ -1158,6 +1175,7 @@ class RefUpdateEdgeTests(PushTestBase):
         self.server_fsck()
 
     def test_server_lock_error_does_not_leak_server_filesystem_path(self):
+        # real bug: the 503 "busy" reply carried the lock file's path; fixed in minigit/server.py (_busy)
         a, ea, c1 = self.seeded()
         write(self.lock_path(), b"")
         self.commit(a, ea)
@@ -1198,8 +1216,11 @@ class RefUpdateEdgeTests(PushTestBase):
         # git: "cannot lock ref 'refs/heads/feature': 'refs/heads/feature/x' exists; cannot create ..."
         #      " ! [remote rejected] main -> feature (failed to update ref)"
         self.assertNotIn("(stale info)", res.err, f"a name clash is not stale information:\n{res}")
-        self.assertNotIn("pull", res.err.lower(), f"pulling can never fix a branch-name clash:\n{res}")
-        self.assertRegex(res.err, r"(?i)cannot lock ref|failed to update ref|exists")
+        # superseded: the clash hint is "Choose a different branch name; pulling will not resolve this."
+        self.assertIn("hint: Choose a different branch name; pulling will not resolve this.", res.err)
+        self.assertNotIn("pull", res.err.replace(self.url, "").lower().replace("pulling will not resolve", ""),
+                         f"pulling can never fix a branch-name clash:\n{res}")
+        self.assertRegex(res.err, r"(?i)cannot lock ref|failed to update ref|exists|clashes")
 
 
 if __name__ == "__main__":

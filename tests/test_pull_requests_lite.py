@@ -569,6 +569,9 @@ class PullRequestsLiteTests(_PullRequestBase):
         res = self.fail_pr(alice, a_env, "diff", "2")
         self.assertIn("no longer exists", res.err)
         self.assertEqual(self.pr(alice, a_env, "close", "2").out.strip(), "Closed pull request #2")
+        out = self.pr(alice, a_env, "show", "2").out
+        self.assertRegex(out, r"(?m)^note: branch 'feature' no longer exists\s*$")
+        self.assertNotIn("Mergeable:", out)
 
         # head already merged by hand: the merge reports up to date and marks the PR merged
         self.feature_branch(alice, a_env, "feature3", {"h.txt": "h\n"})

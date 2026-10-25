@@ -470,6 +470,15 @@ class StashStorageTests(_StashCase):
         u_commit = parents[2]
         self.assertEqual(self.parents_of(u_commit), [])
         self.assertEqual(self.message_of(u_commit), f"untracked files on main: {self.base[:7]} base")
+
+        # As in git, the W message has no final newline; the I and U messages end with one.
+        from minigit.repo import Repository
+        store = Repository.open(self.wt).objects
+        self.assertTrue(store.read_typed(older, "commit").endswith(b"\n\nOn main: m1"))
+        self.assertTrue(store.read_typed(top, "commit").endswith(b"\n\nOn main: with untracked"))
+        self.assertTrue(store.read_typed(i_commit, "commit").endswith(f"\n\nindex on main: {self.base[:7]} base\n"
+                                                                       .encode()))
+        self.assertTrue(store.read_typed(u_commit, "commit").endswith(b" base\n"))
         self.assertEqual(self.git("cat-file", "-p", self.tree_of(u_commit)).out.count("\n"), 1)
         self.assertIn("\tnew.txt", self.git("cat-file", "-p", self.tree_of(u_commit)).out)
 

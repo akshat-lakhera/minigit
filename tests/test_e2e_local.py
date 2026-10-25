@@ -100,13 +100,13 @@ class InitAddCommitLogTests(LocalBase):
         self.assertIn("commit message required", res.err)
 
         res = self.mg("commit", "-m", "first")
-        self.assertRegex(res.out, rf"^\[main \(root-commit\) {HEX7}\] first\n$")
+        self.assertRegex(res.out, rf"^\[main \(root-commit\) {HEX7}\] first\n 1 file changed, 1 insertion\(\+\)\n$")
         first = self.head()
 
         self.mg("add", ".")
         self.assertEqual(self.porcelain(), "A  sub/b.txt\n")
         res = self.mg("commit", "-m", "second")
-        self.assertRegex(res.out, rf"^\[main {HEX7}\] second\n$")
+        self.assertRegex(res.out, rf"^\[main {HEX7}\] second\n 1 file changed, 1 insertion\(\+\)\n$")
         second = self.head()
         self.assertNotEqual(first, second)
 

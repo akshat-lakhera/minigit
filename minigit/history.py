@@ -71,12 +71,37 @@ def log_entries(repo, revs: Sequence[str] | None, max_count: int | None,
         raise _unborn_error(repo)
     if max_count is not None and max_count <= 0:
         return []
+    if max_count is not None and len(starts) == 1:
+        chain = _linear_prefix(repo.objects, starts[0], max_count)
+        if chain is not None:
+            return chain
     entries: list[tuple[str, Commit]] = []
     for sha, commit in topo_walk(repo.objects, starts):
         entries.append((sha, commit))
         if max_count is not None and len(entries) >= max_count:
             break
     return entries
+
+
+def _linear_prefix(store, start: str, max_count: int) -> list[tuple[str, Commit]] | None:
+    """The first ``max_count`` commits of ``topo_walk(store, [start])`` without walking the rest.
+
+    While every commit taken so far has at most one parent, everything still reachable is an
+    ancestor of the last parent, so that parent is the only commit topo_walk can yield next. A
+    merge before the limit makes the order depend on the whole graph: None (use topo_walk).
+    """
+    from minigit.objects import parse_commit
+
+    entries: list[tuple[str, Commit]] = []
+    sha = start
+    while True:
+        commit = parse_commit(store.read_typed(sha, "commit"))
+        entries.append((sha, commit))
+        if len(entries) >= max_count or not commit.parents:
+            return entries
+        if len(commit.parents) > 1:
+            return None
+        sha = commit.parents[0]
 
 
 def _decor_suffix(decor: dict[str, list[str]], sha: str) -> str:

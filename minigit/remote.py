@@ -10,6 +10,8 @@ import os
 import re
 import shutil
 import stat
+import sys
+import sys
 import urllib.parse
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -149,6 +151,14 @@ def _fetch_with(repo: Repository, remote: str, rem: HttpRemote, info: RemoteRefs
             pack_mod.check_connectivity(store, sha, complete)
 
     prefix = f"refs/remotes/{remote}/"
+    for ref in sorted(heads):
+        try:
+            check_ref_name(prefix + ref[len(HEADS):])
+            _check_windows_ref_name(prefix + ref[len(HEADS):])
+        except MinigitError as e:
+            # git refuses such names too; skipping keeps the rest of the fetch usable
+            print(f"warning: ignoring branch '{ref[len(HEADS):]}' on '{remote}': {e.message}", file=sys.stderr)
+            del heads[ref]
     existing = repo.refs.list(prefix)
     changes: list[RefChange] = []
     # deletions first, so a branch "a" can be replaced by "a/b" (and vice versa)
@@ -331,8 +341,9 @@ def pull(repo: Repository, remote: str | None = None, branch: str | None = None,
             raise MinigitError(f"couldn't find remote ref '{branch}' on '{remote}'",
                                hint="check the branch name with: minigit fetch")
         raise MinigitError(f"no upstream '{remote}/{branch}' (push with -u first)")
+    shown_url = split_url(url)[0]  # the user name of the URL does not belong in history
     outcome = merge_mod.merge(repo, tracking, label=f"{remote}/{branch}",
-                              message=f"Merge branch '{branch}' of {url}", allow_unrelated=allow_unrelated)
+                              message=f"Merge branch '{branch}' of {shown_url}", allow_unrelated=allow_unrelated)
     return changes, outcome
 
 

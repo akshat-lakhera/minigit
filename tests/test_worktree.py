@@ -650,8 +650,28 @@ class CheckoutTests(TmpCase):
         with self.assertRaises(errors.CheckoutConflictError) as cm:
             wt.checkout_tree(self.repo, self.index, self.old, self.new)
         self.assertEqual(cm.exception.paths, ["added.txt"])
+        self.assertEqual(
+            cm.exception.message,
+            "The following untracked working tree files would be overwritten by checkout:\n"
+            "\tadded.txt\n"
+            "Please move or remove them before you switch branches.")
         self.assertEqual(self.read("added.txt"), b"my untracked\n")
         self.assertEqual(self.read("change.txt"), b"v1\n")
+
+    def test_local_changes_and_untracked_files_are_reported_separately(self) -> None:
+        self.write("change.txt", b"my work\n")
+        self.write("added.txt", b"my untracked\n")
+        with self.assertRaises(errors.CheckoutConflictError) as cm:
+            wt.checkout_tree(self.repo, self.index, self.old, self.new, operation="rebase")
+        self.assertEqual(cm.exception.paths, ["added.txt", "change.txt"])
+        self.assertEqual(
+            cm.exception.message,
+            "Your local changes to the following files would be overwritten by rebase:\n"
+            "\tchange.txt\n"
+            "Please commit your changes or restore them before you rebase.\n"
+            "error: The following untracked working tree files would be overwritten by rebase:\n"
+            "\tadded.txt\n"
+            "Please move or remove them before you rebase.")
 
     def test_untracked_identical_file_is_adopted(self) -> None:
         self.write("added.txt", b"hi\n")
@@ -731,7 +751,10 @@ class CheckoutTests(TmpCase):
                                  {"same.txt": self.old["same.txt"], "nothere": None,
                                   "change.txt": self.old["change.txt"]}, "merge")
         self.assertEqual(cm.exception.paths, ["nothere", "same.txt"])
-        self.assertIn("would be overwritten by merge:", cm.exception.message)
+        self.assertIn("Your local changes to the following files would be overwritten by merge:\n\tsame.txt\n",
+                      cm.exception.message)
+        self.assertIn("untracked working tree files would be overwritten by merge:\n\tnothere\n",
+                      cm.exception.message)
 
 
 class RealRepositoryTests(unittest.TestCase):

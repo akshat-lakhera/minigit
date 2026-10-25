@@ -28,6 +28,10 @@ TIMEOUT = 60
 
 OVERWRITE_HEAD = "Your local changes to the following files would be overwritten by checkout:"
 OVERWRITE_TAIL = "Please commit your changes or restore them before you switch branches."
+UNTRACKED_HEAD = "The following untracked working tree files would be overwritten by checkout:"
+UNTRACKED_TAIL = "Please move or remove them before you switch branches."
+UNTRACKED_HEAD = "The following untracked working tree files would be overwritten by checkout:"
+UNTRACKED_TAIL = "Please move or remove them before you switch branches."
 MERGE_BLOCK = "merge in progress; commit or run 'minigit merge --abort'"
 
 _TEMPLATE_ROOT: str | None = None
@@ -806,8 +810,9 @@ class DirtyWorktreeTests(MinigitCase):
                 for rel, data in edits.items():
                     self.w(rel, data)
                 res = self.mg_fail("switch", "feature")
-                self.assertIn(OVERWRITE_HEAD, res.err)
-                self.assertIn(OVERWRITE_TAIL, res.err)
+                # tracked changes and untracked files get git's two different blocks
+                self.assertTrue(OVERWRITE_HEAD in res.err or UNTRACKED_HEAD in res.err, res.err)
+                self.assertTrue(OVERWRITE_TAIL in res.err or UNTRACKED_TAIL in res.err, res.err)
                 for rel, data in edits.items():
                     self.assertIn(f"\t{rel}\n", res.err, f"{rel} not listed")
                     self.assertEqual(self.r(rel), data.encode(), f"{rel} was clobbered")

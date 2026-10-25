@@ -300,7 +300,7 @@ class InitTests(Base):
         write(os.path.join(target, "f.txt"), "f\n")
         self.mg("add", "f.txt", cwd=target)
         res = self.mg("commit", "-m", "root on dev", cwd=target)
-        self.assertRegex(res.out, rf"^\[dev \(root-commit\) {HEX7}\] root on dev\n$")
+        self.assertRegex(res.out, rf"^\[dev \(root-commit\) {HEX7}\] root on dev\n( \d+ files? changed.*\n)?$")
         self.assertIn("On branch dev", self.mg("status", cwd=target).out)
         self.assertRegex(self.mg("log", "--oneline", cwd=target).out, rf"^{HEX7} \(HEAD -> dev\) root on dev\n$")
         # a relative directory argument resolves against cwd
@@ -450,7 +450,7 @@ class AddTests(Base):
         self.assertEqual(self.mg("status", "--porcelain", cwd=sub).out,
                          "A  a.txt\nA  c.txt\nA  other/x.txt\nA  sub/b.txt\nA  sub/c.txt\n")
         res = self.mg("commit", "-m", "from sub", cwd=sub)
-        self.assertRegex(res.out, rf"^\[main \(root-commit\) {HEX7}\] from sub\n$")
+        self.assertRegex(res.out, rf"^\[main \(root-commit\) {HEX7}\] from sub\n( \d+ files? changed.*\n)?$")
         # adding an unchanged tracked file from its own directory is a silent no-op
         res = self.mg("add", "x.txt", cwd=self.path("other"))
         self.assertEqual((res.rc, res.out, res.err), (0, "", ""))
@@ -623,7 +623,7 @@ class AddTests(Base):
             self.mg("add", n)  # by explicit name too
         self.assertEqual(len(self.ls_files()), len(names))
         res = self.mg("commit", "-m", "ünïcode ✓")
-        self.assertRegex(res.out, rf"^\[main \(root-commit\) {HEX7}\] ünïcode ✓\n$")
+        self.assertRegex(res.out, rf"^\[main \(root-commit\) {HEX7}\] ünïcode ✓\n( \d+ files? changed.*\n)?$")
         for n in names:
             self.assertEqual(self.mg("cat-file", "-p", f"HEAD:{n}").stdout, (n + "\n").encode("utf-8"), n)
         self.assertEqual(self.porcelain(), "")
@@ -905,7 +905,7 @@ class CommitTests(Base):
         root_sha = git_hash("tree", tree_root)
         commit_bytes = git_commit(root_sha, [], "first")
         commit_sha = git_hash("commit", commit_bytes)
-        self.assertEqual(res.out, f"[main (root-commit) {commit_sha[:7]}] first\n")
+        self.assertEqual(res.out.splitlines()[0], f"[main (root-commit) {commit_sha[:7]}] first")
         self.assertEqual(self.head(), commit_sha)
         self.assertEqual(self.gitfile("refs/heads/main"), commit_sha + "\n")
         self.assertEqual(self.gitfile("HEAD"), "ref: refs/heads/main\n")
@@ -937,7 +937,7 @@ class CommitTests(Base):
         self.mg("add", "a.txt")
         res = self.mg("commit", "-m", "second")
         second = self.head()
-        self.assertEqual(res.out, f"[main {second[:7]}] second\n")
+        self.assertEqual(res.out.splitlines(), [f"[main {second[:7]}] second", " 1 file changed, 1 insertion(+), 1 deletion(-)"])
         self.assertNotEqual(first, second)
         tree = git_hash("tree", git_tree([("100644", "a.txt", git_hash("blob", b"a2\n"))]))
         expected = git_commit(tree, [first], "second")
@@ -1007,11 +1007,13 @@ class CommitTests(Base):
         base = self.head()
         self.write("untracked.txt", "u\n")
         res = self.fail_mg("commit", "-m", "clean index")
-        self.assertEqual(res.err, "error: nothing to commit, working tree clean\n")
+        # git's wording when only untracked files are present
+        self.assertEqual(res.err, "error: nothing added to commit but untracked files present (use \"minigit add\" to track)\n")
         self.assertEqual(self.head(), base)
         self.write("a.txt", "dirty but unstaged\n")
         res = self.fail_mg("commit", "-m", "unstaged change is not a commit")
-        self.assertEqual(res.err, "error: nothing to commit, working tree clean\n")
+        # git's wording when a tracked file is modified but not staged
+        self.assertEqual(res.err, 'error: no changes added to commit (use "minigit add" and/or "minigit commit -a")\n')
         self.assertEqual(self.head(), base)
         res = self.mg("commit", "--allow-empty", "-m", "same tree again")
         new = self.head()
@@ -1029,7 +1031,7 @@ class CommitTests(Base):
         os.remove(self.path("y.txt"))
         self.write("untracked.txt", "u\n")
         res = self.mg("commit", "-a", "-m", "all")
-        self.assertRegex(res.out, rf"^\[main {HEX7}\] all\n$")
+        self.assertRegex(res.out, rf"^\[main {HEX7}\] all\n( \d+ files? changed.*\n)?$")
         self.assertEqual(self.porcelain(), "?? untracked.txt\n", "-a never stages untracked files")
         self.assertEqual(self.mg("cat-file", "-p", "HEAD:x.txt").stdout, b"x2\n")
         self.assertEqual(sorted(r[3] for r in self.tree_listing("HEAD:")), ["x.txt", "z.txt"])
@@ -1045,7 +1047,8 @@ class CommitTests(Base):
         # -a with nothing modified is "nothing to commit"
         self.write("z.txt", "staged\n")
         res = self.fail_mg("commit", "-a", "-m", "no-op")
-        self.assertEqual(res.err, "error: nothing to commit, working tree clean\n")
+        # git's wording when an untracked file is still present
+        self.assertEqual(res.err, 'error: nothing added to commit but untracked files present (use "minigit add" to track)\n')
 
     def test_identity_sources_and_missing_identity(self):
         self.write("a.txt", "a\n")
@@ -1131,7 +1134,7 @@ class CommitTests(Base):
         self.mg("add", "d.txt")
         res = self.mg("commit", "-m", "detached work")
         d = self.head()
-        self.assertEqual(res.out, f"[detached HEAD {d[:7]}] detached work\n")
+        self.assertEqual(res.out.splitlines()[0], f"[detached HEAD {d[:7]}] detached work")
         self.assertEqual(self.gitfile("HEAD"), d + "\n", "a detached commit moves HEAD itself")
         self.assertEqual(self.gitfile("refs/heads/main"), c2 + "\n", "the branch must not move")
         self.assertIn(f"parent {c1}\n", self.mg("cat-file", "-p", "HEAD").out)

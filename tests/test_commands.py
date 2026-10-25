@@ -461,8 +461,45 @@ class CommitTests(RepoCase):
         with self.assertRaises(NothingToCommit) as cm:
             ops.commit(self.repo, ["x"])
         self.assertEqual(cm.exception.message, "nothing to commit, working tree clean")
-        sha, _ = ops.commit(self.repo, ["empty"], allow_empty=True)
+        sha, summary = ops.commit(self.repo, ["empty"], allow_empty=True, stat=True)
         self.assertEqual(self.repo.head_commit(), sha)
+        self.assertEqual(summary, f"[main {sha[:7]}] empty")   # no stat line when nothing changed
+
+    def test_summary_has_the_git_stat_line(self):
+        def commit(msg):
+            return ops.commit(self.repo, [msg], stat=True)[1].split("\n", 1)[1]
+
+        self.write("a.txt", "1\n2\n3\n")
+        self.write("b.txt", "b\n")
+        self.add("a.txt", "b.txt")
+        sha, summary = ops.commit(self.repo, ["root"], stat=True)
+        self.assertEqual(summary, f"[main (root-commit) {sha[:7]}] root\n 2 files changed, 4 insertions(+)")
+        self.write("b.txt", "b\nmore\n")
+        self.add("b.txt")
+        self.assertEqual(commit("one more line"), " 1 file changed, 1 insertion(+)")
+        self.write("a.txt", "1\ntwo\n3\n4\n5\n")
+        self.add("a.txt")
+        self.assertEqual(commit("edit"), " 1 file changed, 3 insertions(+), 1 deletion(-)")
+        self.write("a.txt", "1\ntwo\n3\n4\n5")    # only the final newline goes
+        self.add("a.txt")
+        self.assertEqual(commit("no eol"), " 1 file changed, 1 insertion(+), 1 deletion(-)")
+        os.unlink(os.path.join(self.wt, "b.txt"))
+        self.write("c.txt", "b\nmore\n")
+        self.add("b.txt", "c.txt")
+        self.assertEqual(commit("rename"), " 1 file changed, 0 insertions(+), 0 deletions(-)")
+        os.unlink(os.path.join(self.wt, "a.txt"))
+        self.add("a.txt")
+        self.assertEqual(commit("delete"), " 1 file changed, 5 deletions(-)")
+        self.write("img.bin", b"\0\1\2")
+        self.add("img.bin")
+        self.assertEqual(commit("binary"), " 1 file changed, 0 insertions(+), 0 deletions(-)")
+        # concluding a merge prints no stat line, as in git
+        self.repo.refs.write_special("MERGE_HEAD", self.repo.read_commit(self.repo.head_commit()).parents[0])
+        self.write("m.txt", "m\n")
+        self.add("m.txt")
+        sha, summary = ops.commit(self.repo, ["merge"], stat=True)
+        self.assertEqual(summary, f"[main {sha[:7]}] merge")
+        self.assertEqual(len(self.repo.read_commit(sha).parents), 2)
 
     def test_nothing_to_commit_wording_matches_the_worktree(self):
         self.commit_file("a.txt", "a\n")
@@ -552,6 +589,61 @@ class CommitTests(RepoCase):
 # =========================================================================== log / show
 
 class HistoryTests(RepoCase):
+    def _chain(self, n: int, parent: str | None = None, ts: int = 1700000000) -> list[str]:
+        """``n`` commits of an empty tree written directly to the store, oldest first."""
+        from minigit.objects import Commit, Signature, serialize_commit
+        store = self.repo.objects
+        tree = store.write("tree", b"")
+        shas: list[str] = []
+        for i in range(n):
+            sig = Signature("T", "t@example.com", ts + i, 0)
+            parents = (parent,) if parent else ()
+            parent = store.write("commit", serialize_commit(
+                Commit(tree=tree, parents=parents, author=sig, committer=sig, message=f"c{i}\n")))
+            shas.append(parent)
+        return shas
+
+    def test_log_n_stops_walking_once_n_commits_are_taken(self):
+        import time
+        from unittest import mock
+        shas = self._chain(300)
+        self.repo.refs.update("refs/heads/main", shas[-1])
+        reads: list[str] = []
+        real = self.repo.objects.read_typed
+
+        def counting(sha, kind):
+            reads.append(sha)
+            return real(sha, kind)
+
+        with mock.patch.object(self.repo.objects, "read_typed", side_effect=counting):
+            t0 = time.monotonic()
+            entries = history.log_entries(self.repo, None, 1)
+            elapsed = time.monotonic() - t0
+        self.assertEqual([s for s, _ in entries], [shas[-1]])
+        self.assertEqual(reads, [shas[-1]])     # one commit read, not 300
+        self.assertLess(elapsed, 1.0)
+        full = [s for s, _ in history.log_entries(self.repo, None, None)]
+        self.assertEqual(full, shas[::-1])
+        self.assertEqual([s for s, _ in history.log_entries(self.repo, None, 10)], full[:10])
+        self.assertEqual([s for s, _ in history.log_entries(self.repo, None, 500)], full)
+
+    def test_log_n_with_a_merge_matches_the_full_order(self):
+        from minigit.objects import Commit, Signature, serialize_commit
+        base = self._chain(3)
+        left = self._chain(2, base[-1], ts=1700000100)
+        right = self._chain(2, base[-1], ts=1700000050)
+        store = self.repo.objects
+        sig = Signature("T", "t@example.com", 1700000200, 0)
+        merge = store.write("commit", serialize_commit(
+            Commit(tree=store.write("tree", b""), parents=(left[-1], right[-1]), author=sig, committer=sig,
+                   message="merge\n")))
+        tip = self._chain(2, merge, ts=1700000300)[-1]
+        self.repo.refs.update("refs/heads/main", tip)
+        full = [s for s, _ in history.log_entries(self.repo, None, None)]
+        self.assertEqual(len(full), 10)
+        for n in range(1, 12):
+            self.assertEqual([s for s, _ in history.log_entries(self.repo, None, n)], full[:n], n)
+
     def test_unborn(self):
         with self.assertRaises(MinigitError) as cm:
             history.log_entries(self.repo, None, None)
@@ -675,7 +767,9 @@ class BranchTests(RepoCase):
         self.assertEqual(ops.format_branch_list(items, True), f"  feature {c1[:7]} one\n* main    {c1[:7]} one\n")
         self.assertEqual([i.name for i in ops.branch_list(self.repo, remotes=True)], ["origin/main"])
         self.assertEqual([i.name for i in ops.branch_list(self.repo, all_=True)],
-                         ["feature", "main", "origin/main"])
+                         ["feature", "main", "remotes/origin/main"])
+        self.assertEqual(ops.format_branch_list(ops.branch_list(self.repo, all_=True), False),
+                         "  feature\n* main\n  remotes/origin/main\n")
         self.assertEqual(ops.branch_delete(self.repo, "feature"), f"Deleted branch feature (was {c1[:7]}).")
         with self.assertRaises(MinigitError) as cm:
             ops.branch_delete(self.repo, "feature")
@@ -787,6 +881,21 @@ class SwitchTests(RepoCase):
         self.write("keep.txt", "k\n")
         ops.switch(self.repo, "main")
         self.assertTrue(self.exists("keep.txt"))
+
+    def test_untracked_file_in_the_way_is_not_called_a_local_change(self):
+        self.commit_file("a.txt", "1\n")
+        ops.switch(self.repo, None, create="b2")
+        self.commit_file("t.txt", "theirs\n")
+        ops.switch(self.repo, "main")
+        self.write("t.txt", "mine\n")
+        with self.assertRaises(CheckoutConflictError) as cm:
+            ops.switch(self.repo, "b2")
+        self.assertEqual(cm.exception.paths, ["t.txt"])
+        self.assertEqual(cm.exception.message,
+                         "The following untracked working tree files would be overwritten by checkout:\n"
+                         "\tt.txt\nPlease move or remove them before you switch branches.")
+        self.assertEqual(self.read("t.txt"), b"mine\n")
+        self.assertEqual(self.repo.refs.current_branch(), "main")
 
     def test_detach_and_checkout_rev(self):
         c1 = self.commit_file("a.txt", "1\n", "one")

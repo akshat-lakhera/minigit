@@ -129,6 +129,8 @@ def _require_no_operation(repo: Repository, what: str) -> None:
     op = repo.operation_in_progress()
     if op is not None:
         kind = op[0]
+        if kind == "rebase":
+            raise _errors().MinigitError(f"cannot {what}: " + _m("repo").REBASE_IN_PROGRESS)
         state = _m("repo").OPERATION_STATE_FILES[kind]
         raise _errors().MinigitError(f"cannot {what}: you have a {kind} in progress ({state} exists)",
                                      hint=f"finish it with 'minigit commit', or run 'minigit {kind} --abort'")
@@ -244,9 +246,11 @@ def push(repo: Repository, message: str | None = None, include_untracked: bool =
         sig = repo.identity()   # identity errors before anything is written
         branch, label = _label(repo, head)
 
-        def commit(tree: str, parents: tuple[str, ...], msg: str) -> str:
+        def commit(tree: str, parents: tuple[str, ...], msg: str, final_newline: bool = True) -> str:
             c = objects.Commit(tree=tree, parents=parents, author=sig, committer=sig, message=msg + "\n")
-            return store.write("commit", objects.serialize_commit(c))
+            data = objects.serialize_commit(c)
+            # git writes the W commit's message without a final newline (the I and U ones have one)
+            return store.write("commit", data if final_newline else data[:-1])
 
         parents = [head, commit(trees.build_tree(store, staged), (head,), f"index on {label}")]
         if untracked:
@@ -254,7 +258,7 @@ def push(repo: Repository, message: str | None = None, include_untracked: bool =
             parents.append(commit(trees.build_tree(store, u_flat), (), f"untracked files on {label}"))
         message = (message or "").strip()
         subject = f"On {branch}: {message}" if message else f"WIP on {label}"
-        w_sha = commit(trees.build_tree(store, w_flat), tuple(parents), subject)
+        w_sha = commit(trees.build_tree(store, w_flat), tuple(parents), subject, final_newline=False)
         write_stack(repo, [w_sha] + stack)
 
         # Back to HEAD: untracked files (with -u), then files only in the index, then HEAD's versions.

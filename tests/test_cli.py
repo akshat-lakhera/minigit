@@ -449,7 +449,7 @@ class RepoCommandTests(CliTestCase):
 
     def test_commit(self):
         out = self.ok("commit", "-m", "one", "-m", "two", "-a", "--allow-empty")
-        self.ops.commit.assert_called_once_with(self.repo, ["one", "two"], all_=True, allow_empty=True)
+        self.ops.commit.assert_called_once_with(self.repo, ["one", "two"], all_=True, allow_empty=True, stat=True)
         self.assertEqual(out, "[main 0123456] subject\n")
 
     def test_commit_nothing_to_commit(self):
@@ -711,12 +711,27 @@ class RemoteCommandTests(CliTestCase):
         self.assertIn("error: could not connect", err)
 
     def test_fetch(self):
+        self.ops.get_upstream.return_value = None   # no upstream configured: fall back to origin
         out = self.ok("fetch")
         self.remote.fetch.assert_called_with(self.repo, "origin")
         self.remote.remote_url.assert_called_with(self.repo, "origin")
         self.remote.format_fetch.assert_called_with("http://h:1/p", ["change"])
         self.assertIn("main -> origin/main", out)
         self.ok("fetch", "upstream")
+        self.remote.fetch.assert_called_with(self.repo, "upstream")
+
+    def test_fetch_uses_the_branch_remote_by_default(self):
+        # like git: 'fetch' with no argument talks to branch.<name>.remote, not always origin
+        self.ops.get_upstream.return_value = ("up", "refs/heads/main")
+        self.ok("fetch")
+        self.remote.fetch.assert_called_with(self.repo, "up")
+
+    def test_fetch_prune_option(self):
+        # QA multiuser bug 13: 'fetch --prune' is accepted (fetch removes deleted origin/* refs anyway)
+        self.ops.get_upstream.return_value = None
+        self.ok("fetch", "--prune")
+        self.remote.fetch.assert_called_with(self.repo, "origin")
+        self.ok("fetch", "--prune", "upstream")
         self.remote.fetch.assert_called_with(self.repo, "upstream")
 
     def test_pull_merged(self):
@@ -881,6 +896,29 @@ class ServerCommandTests(CliTestCase):
         rc, _, err = self.cli("server")
         self.assertEqual(rc, 2)
         self.assertIn("subcommand", err)
+
+
+class ServerHelpTests(unittest.TestCase):
+    def test_every_serve_and_server_argument_has_help(self):
+        # QA docs bug 5: positionals such as ROOT, REPO, NAME and options such as --host had no help text
+        import argparse
+
+        def walk(parser, path):
+            for action in parser._actions:
+                if isinstance(action, argparse._SubParsersAction):
+                    for name, sub in action.choices.items():
+                        yield from walk(sub, path + [name])
+                elif not isinstance(action, argparse._HelpAction):
+                    yield path, action
+
+        top = cli.build_parser()._minigit_sub.choices
+        seen = 0
+        for command in ("serve", "server"):
+            for path, action in walk(top[command], [command]):
+                seen += 1
+                with self.subTest(command=" ".join(path), argument=action.dest):
+                    self.assertTrue(action.help, "missing help text")
+        self.assertGreater(seen, 30)
 
 
 # ---------------------------------------------------------------------------

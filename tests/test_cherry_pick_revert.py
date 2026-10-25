@@ -557,7 +557,8 @@ class CherryPickConflictTests(SequencerCase):
         self.assertEqual(r.porcelain(), ["M  f.txt"])
         res = r.run("commit")                                   # no -m: MERGE_MSG is used
         self.assertEqual(res.returncode, 0, res)
-        self.assertRegex(res.out.strip(), SUMMARY_RE + "feat change$")
+        self.assertRegex(res.out.strip(), SUMMARY_RE + "feat change\n 1 file changed, 1 insertion\\(\\+\\), "
+                                          "1 deletion\\(-\\)$")
         self.assertEqual(r.message(), "feat change\n")
         self.assertEqual(r.parents(), [main])
         self.assertEqual(r.header("HEAD", "author"), [f"{FEAT_AUTHOR[0]} <{FEAT_AUTHOR[1]}> {FEAT_AUTHOR[2]}"])
@@ -762,7 +763,7 @@ class CherryPickConflictTests(SequencerCase):
         # commit without -m takes the prepared message; the author is the current identity
         res = r.run("commit")
         self.assertEqual(res.returncode, 0, res)
-        self.assertRegex(res.out.strip(), SUMMARY_RE + "feat change$")
+        self.assertRegex(res.out.strip(), SUMMARY_RE + "feat change\n 2 files changed, 2 insertions\\(\\+\\)$")
         self.assertEqual(r.message(), "feat change\n")
         self.assertEqual(r.parents(), [main])
         self.assertEqual(r.header("HEAD", "author"), ["QA Tester <qa@example.com> 1700000000 +0000"])

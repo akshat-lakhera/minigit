@@ -301,6 +301,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("directory", nargs="?", help="target directory")
 
     s = cmd("fetch", "Download objects and update remote-tracking branches")
+    s.add_argument("--prune", action="store_true",
+                   help="delete remote-tracking branches that no longer exist on the server "
+                        "(fetch always does this; the option is accepted for git compatibility)")
     s.add_argument("remote", nargs="?", help="remote name (default: origin)")
 
     s = cmd("pull", "Fetch and merge the upstream branch")
@@ -326,7 +329,8 @@ def build_parser() -> argparse.ArgumentParser:
     s = cmd("serve", "Run the minigit HTTP server",
             epilog="Browse the repositories at http://HOST:PORT/-/ (unless --no-web).")
     s.add_argument("--root", required=True, help="server root directory")
-    s.add_argument("--host", default="127.0.0.1", help="address to listen on (default: 127.0.0.1)")
+    s.add_argument("--host", default="127.0.0.1",
+                   help="address to listen on (default: 127.0.0.1; 0.0.0.0 accepts other machines)")
     s.add_argument("--init", action="store_true",
                    help="create the server root if it does not exist yet")
     s.add_argument("--port", type=_port, default=8765, help="port (0 picks a free port)")
@@ -528,7 +532,7 @@ def cmd_diff(ns, cwd):
 
 def cmd_commit(ns, cwd):
     _sha, summary = _m("ops").commit(_repo(cwd), list(ns.messages), all_=ns.all_,
-                                     allow_empty=ns.allow_empty)
+                                     allow_empty=ns.allow_empty, stat=True)
     _say(summary)
 
 
@@ -701,7 +705,7 @@ def cmd_clone(ns, cwd):
 def cmd_fetch(ns, cwd):
     remote = _m("remote")
     repo = _repo(cwd)
-    name = ns.remote or "origin"
+    name = ns.remote or _default_remote(repo)
     changes = remote.fetch(repo, name)
     _say(remote.format_fetch(remote.remote_url(repo, name), changes))
 

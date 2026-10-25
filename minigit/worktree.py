@@ -91,21 +91,38 @@ def _rmtree(path: str) -> None:
         shutil.rmtree(path, onerror=onerror)
 
 
-def _conflict_message(paths: list[str], operation: str) -> str:
-    if operation in ("checkout", "switch"):
-        tail = "Please commit your changes or restore them before you switch branches."
-    elif operation == "merge":
-        tail = "Please commit your changes or restore them before you merge."
-    else:
-        tail = f"Please commit your changes or restore them before you {operation}."
-    listing = "".join(f"\t{p}\n" for p in paths)
-    return f"Your local changes to the following files would be overwritten by {operation}:\n{listing}{tail}"
+def _conflict_message(paths: list[str], operation: str, untracked: Iterable[str] = (),
+                      dirs: Iterable[str] = ()) -> str:
+    """The wording of git: local changes to tracked ``paths``, directories in the way that hold
+    untracked files (``dirs``), untracked files in the way (``untracked``); one ``error:`` block each."""
+    action = "switch branches" if operation in ("checkout", "switch") else operation
+
+    def listing(ps: Iterable[str]) -> str:
+        return "".join(f"\t{p}\n" for p in sorted(set(ps)))
+
+    blocks: list[str] = []
+    if paths:
+        blocks.append(f"Your local changes to the following files would be overwritten by {operation}:\n"
+                      f"{listing(paths)}Please commit your changes or restore them before you {action}.")
+    if dirs:
+        blocks.append("Updating the following directories would lose untracked files in them:\n" + listing(dirs))
+    if untracked:
+        blocks.append(f"The following untracked working tree files would be overwritten by {operation}:\n"
+                      f"{listing(untracked)}Please move or remove them before you {action}.")
+    return "\nerror: ".join(blocks)
 
 
-def _raise_conflicts(paths: Iterable[str], operation: str) -> None:
-    ps = sorted(set(paths))
-    if ps:
-        raise CheckoutConflictError(_conflict_message(ps, operation), paths=ps)
+def conflict_error(operation: str, paths: Iterable[str] = (), untracked: Iterable[str] = (),
+                   dirs: Iterable[str] = ()) -> CheckoutConflictError:
+    ps, us, ds = sorted(set(paths)), sorted(set(untracked)), sorted(set(dirs))
+    return CheckoutConflictError(_conflict_message(ps, operation, us, ds), paths=sorted(set(ps + us + ds)))
+
+
+def _raise_conflicts(paths: Iterable[str], operation: str, untracked: Iterable[str] = (),
+                     dirs: Iterable[str] = ()) -> None:
+    ps, us, ds = list(paths), list(untracked), list(dirs)
+    if ps or us or ds:
+        raise conflict_error(operation, ps, us, ds)
 
 
 # ---------------------------------------------------------------------------- filesystem quirks
@@ -493,6 +510,9 @@ def checkout_tree(repo: "Repository", index: Index, old: FlatTree, new: FlatTree
     check_checkout_paths(repo, new, (p for p in changed if new.get(p) is not None), operation)
     wt: dict[str, Entry | None] = {}
     conflicts: list[str] = []
+    untracked: list[str] = []      # files in the way that neither the index nor ``old`` knows
+    dirs: list[str] = []           # directories in the way that hold only untracked files
+    in_index = set(index.paths())
     removed = {p for p in changed if new.get(p) is None and p in old}
     ignore_case = fs_ignores_case(repo)
     removed_folded = {p.casefold() for p in removed} if ignore_case else set()
@@ -526,26 +546,25 @@ def checkout_tree(repo: "Repository", index: Index, old: FlatTree, new: FlatTree
             wt[p] = w
             ok = (w == i) if i is not None else (w is None or w == n)
             if not ok:
-                conflicts.append(p)
+                (untracked if i is None and o is None else conflicts).append(p)
         # 2. dir/file clashes
         for p in changed:
             if new.get(p) is None:
                 continue
             path = _abs(repo, p)
             if os.path.isdir(path) and not os.path.islink(path):
-                for f in _files_under(path, p):
-                    if not going_away(f):
-                        conflicts.append(p)
-                        break
+                kept = [f for f in _files_under(path, p) if not going_away(f)]
+                if kept:
+                    (conflicts if any(f in in_index for f in kept) else dirs).append(p)
             parts = p.split("/")
             for k in range(1, len(parts)):
                 a = "/".join(parts[:k])
                 a_abs = _abs(repo, a)
                 if os.path.islink(a_abs) or (os.path.lexists(a_abs) and not os.path.isdir(a_abs)):
                     if not going_away(a):
-                        conflicts.append(a)
+                        (conflicts if a in in_index else untracked).append(a)
                     break
-        _raise_conflicts(conflicts, operation)
+        _raise_conflicts(conflicts, operation, untracked, dirs)
 
     # 3. apply: deletions first, deepest first
     deletions = [p for p in changed if new.get(p) is None]
@@ -570,9 +589,11 @@ def checkout_tree(repo: "Repository", index: Index, old: FlatTree, new: FlatTree
 def ensure_unmodified(repo: "Repository", index: Index, expected: dict[str, Entry | None], operation: str) -> None:
     """Raise CheckoutConflictError listing every path whose worktree entry differs from ``expected``."""
     bad: list[str] = []
+    untracked: list[str] = []
+    in_index = set(index.paths())
     for p in sorted(expected):
         exp = expected[p]
         w = worktree_entry(repo, index, p, head_mode=exp[0] if exp else None)
         if w != exp:
-            bad.append(p)
-    _raise_conflicts(bad, operation)
+            (untracked if exp is None and p not in in_index else bad).append(p)
+    _raise_conflicts(bad, operation, untracked)

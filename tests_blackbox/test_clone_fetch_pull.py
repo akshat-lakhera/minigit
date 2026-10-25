@@ -582,12 +582,15 @@ class CloneTests(ServerCase):
         res = bob(self.ws, "clone", f"http://bob:{token}@{host}/{name}", "b")
         b = os.path.join(self.ws, "b")
         self.assertNotIn(token, res.text)
-        self.assertEqual(self.config(bob, b, "remote.origin.url"), url)
+        # the user name stays in the URL (like git); only the token is stripped and stored
+        self.assertEqual(self.config(bob, b, "remote.origin.url"), url.replace("http://", "http://bob@", 1))
         self.assertNotIn(token, get(b, ".minigit/config").decode("utf-8", "replace"))
         with open(bob.credentials_file, encoding="utf-8") as fh:
             creds = json.load(fh)
-        self.assertIn(self.url, creds)
-        self.assertEqual((creds[self.url]["user"], creds[self.url]["token"]), ("bob", token))
+        key = f"{self.url}|bob"  # URL credentials are stored per user; only login sets the host default
+        self.assertIn(key, creds)
+        self.assertNotIn(self.url, creds)
+        self.assertEqual((creds[key]["user"], creds[key]["token"]), ("bob", token))
         new = self.commit(self.alice, a, {"f.txt": "2\n"})
         self.alice(a, "push")
         bob(b, "fetch")   # credentials must now come from the credentials file
@@ -777,7 +780,7 @@ class FetchTests(ServerCase):
         self.assertEqual(self.ref_file(b, "refs/heads/feature"), local)
         res = self.bob(b, "pull", check=False)
         self.assertExit(res, 1)
-        self.assertIn("no upstream 'origin/feature'", res.err)
+        self.assertIn("couldn't find remote ref 'feature'", res.err)
         self.assertEqual(self.rev(self.bob, b, "HEAD"), local)
 
 
@@ -969,7 +972,7 @@ class PullTests(ServerCase):
         self.assertEqual(self.config(self.bob, b, "branch.main.merge"), "refs/heads/main")
         res = self.bob(b, "pull", "origin", "nosuch", check=False)
         self.assertExit(res, 1)
-        self.assertIn("no upstream 'origin/nosuch'", res.err)
+        self.assertIn("couldn't find remote ref 'nosuch'", res.err)
         self.assertEqual(self.ref_file(b, "refs/heads/main"), feat)
 
     def test_pull_follows_branch_merge_config_to_differently_named_branch(self):

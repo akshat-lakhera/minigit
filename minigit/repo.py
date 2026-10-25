@@ -22,6 +22,8 @@ OPERATION_STATE_FILES = {"merge": "MERGE_HEAD", "cherry-pick": "CHERRY_PICK_HEAD
                          "rebase": "REBASE_HEAD"}
 # A rebase is in progress while this directory exists, even between picks (features/rebase.md).
 REBASE_STATE_DIR = "rebase"
+# The refusal every other command gives while a rebase is in progress.
+REBASE_IN_PROGRESS = "rebase in progress; run 'minigit rebase --continue', '--skip' or '--abort' first"
 
 
 def _is_bare_gitdir(path: str) -> bool:
@@ -150,14 +152,15 @@ class Repository:
         return self.refs.read_special("REVERT_HEAD")
 
     def operation_in_progress(self) -> tuple[str, str] | None:
-        """("merge"|"cherry-pick"|"revert", sha) for the first state file present, else None."""
+        """("rebase", orig_head) while .minigit/rebase/ exists (with or without REBASE_HEAD), else
+        ("merge"|"cherry-pick"|"revert", sha) for the first state file present, else None."""
+        if os.path.isdir(self.gpath(REBASE_STATE_DIR)):
+            orig = self.read_state(REBASE_STATE_DIR + "/orig-head") or b""
+            return "rebase", orig.decode("ascii", "replace").strip()
         for kind, name in OPERATION_STATE_FILES.items():
             sha = self.refs.read_special(name)
             if sha is not None:
                 return kind, sha
-        if os.path.isdir(self.gpath(REBASE_STATE_DIR)):
-            orig = self.read_state(REBASE_STATE_DIR + "/orig-head") or b""
-            return "rebase", orig.decode("ascii", "replace").strip()
         return None
 
     def clear_operation_state(self) -> None:

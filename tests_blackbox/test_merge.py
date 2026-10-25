@@ -367,7 +367,8 @@ class FastForwardTests(MergeCase):
 
         res = r.run("merge", "feat", check=False)
         self.assertEqual(res.returncode, 1, res)
-        self.assertIn("would be overwritten by merge", res.err, res)
+        self.assertIn("The following untracked working tree files would be overwritten by merge:\n\tadded.txt\n"
+                      "Please move or remove them before you merge.", res.err, res)
         self.assertEqual(r.read("added.txt"), b"my own version\n")
         self.assertEqual(r.sha("HEAD"), base)
         # a non-empty untracked directory with that name is refused too, and kept intact
@@ -375,7 +376,9 @@ class FastForwardTests(MergeCase):
         r.write("added.txt/precious.txt", b"precious\n")
         res = r.run("merge", "feat", check=False)
         self.assertEqual(res.returncode, 1, res)
-        self.assertIn("would be overwritten by merge", res.err, res)
+        # SUPERSEDED: added.txt is a directory here; git says the same "would lose untracked files" line.
+        self.assertIn("Updating the following directories would lose untracked files in them:\n\tadded.txt\n",
+                      res.err, res)
         self.assertEqual(r.read("added.txt/precious.txt"), b"precious\n")
         self.assertEqual(r.sha("HEAD"), base)
         # an EMPTY untracked directory is not an obstacle: git replaces it with the file
@@ -1218,7 +1221,8 @@ class RefusalTests(MergeCase):
         self.assertFalse(r.exists("f.txt"))
         self.assertIsNone(r.state("MERGE_HEAD"))
 
-    def test_file_directory_clash_is_refused_before_touching_anything(self):
+    def test_file_directory_clash_is_a_conflict_that_abort_undoes(self):
+        # SUPERSEDED: like git, a file/directory clash is a CONFLICT (file moved to x~HEAD), not a refusal.
         r = self.repo
         base = self.seed()
         r.run("switch", "-c", "feat")
@@ -1230,9 +1234,21 @@ class RefusalTests(MergeCase):
 
         res = r.run("merge", "feat", check=False)
         self.assertEqual(res.returncode, 1, res)
-        self.assertIn("'x' is a file on one side and a directory on the other", res.err, res)
+        self.assertIn("CONFLICT (file/directory): directory in the way of x from HEAD; "
+                      "moving it to x~HEAD instead.", res.out, res)
+        self.assertEqual(r.read("x~HEAD"), b"file side\n")
+        self.assertEqual(r.read("x/inner.txt"), b"dir side\n")
+        self.assertEqual(r.stages_of("x~HEAD"), {2})
+        self.assertEqual(r.stages_of("x/inner.txt"), {0})
+        self.assertEqual(sorted(r.porcelain()), ["A  x/inner.txt", "AU x~HEAD", "D  x"])
+        self.assertIsNotNone(r.state("MERGE_HEAD"))
+        self.assertEqual(r.sha("HEAD"), ours)
+
+        r.run("merge", "--abort")
         self.assertEqual(r.read("x"), b"file side\n")
+        self.assertFalse(r.exists("x~HEAD"))
         self.assertFalse(r.exists("x/inner.txt"))
+        self.assertTrue(all(st == 0 for _, st, _ in r.ls_stages()))
         self.assertIsNone(r.state("MERGE_HEAD"))
         self.assertEqual(r.sha("HEAD"), ours)
         self.assertEqual(r.porcelain(), [])

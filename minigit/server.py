@@ -75,6 +75,7 @@ class HttpError(Exception):
         self.message = message
         self.headers = headers or []
         self.extra = extra or {}
+        self.detail: str | None = None  # for the server log only, never sent to the client
 
 
 def _json_problem(exc: BaseException) -> str:
@@ -293,18 +294,30 @@ def _evaluate(repo: Repository, updates: list[dict], force: bool, allow_force: b
     return results, rejected
 
 
+def _busy(exc: errors.LockError, ref: str | None = None) -> HttpError:
+    """A 503 for a held lock; the lock file's path stays in the server log, not in the reply."""
+    what = f" (cannot lock ref '{ref}')" if ref else ""
+    err = HttpError(503, "busy", f"the repository is busy{what}, try again")
+    err.detail = _msg(exc)
+    return err
+
+
 def _apply(repo: Repository, updates: list[dict]) -> None:
     applied: list[dict] = []
+    failed = None
     try:
         for upd in updates:
+            failed = upd["ref"]
             repo.refs.update(upd["ref"], upd["new"], expected=upd["cur"], timeout=REF_LOCK_TIMEOUT)
             applied.append(upd)
-    except errors.MinigitError:
+    except errors.MinigitError as e:
         for upd in reversed(applied):  # best-effort rollback of an atomic batch
             try:
                 repo.refs.update(upd["ref"], upd["cur"], expected=upd["new"], timeout=REF_LOCK_TIMEOUT)
             except errors.MinigitError:
                 pass
+        if isinstance(e, errors.LockError):
+            raise _busy(e, failed) from None
         raise
     head_target = repo.refs.head_target()
     if head_target is not None and repo.refs.resolve("HEAD") is None:
@@ -315,8 +328,12 @@ def _apply(repo: Repository, updates: list[dict]) -> None:
                 repo.refs.set_symbolic_head(target)
 
 
-def process_push(root: str, repo_name: str, user: str, body: bytes, cfg: ServerConfig) -> tuple[int, dict]:
-    """Steps 3-9 of SPEC.md section 7.4 (auth and body limits are the handler's job)."""
+def process_push(root: str, repo_name: str, user: str, body: bytes, cfg: ServerConfig,
+                 log: Callable[[str], None] | None = None) -> tuple[int, dict]:
+    """Steps 3-9 of SPEC.md section 7.4 (auth and body limits are the handler's job).
+
+    ``log`` receives server-side details (such as a lock file's path) left out of the reply.
+    """
     try:
         req, pack_bytes = _parse_push_frame(body)
         updates, force = _parse_updates(req)
@@ -354,8 +371,6 @@ def process_push(root: str, repo_name: str, user: str, body: bytes, cfg: ServerC
                 return 409, {"ok": False, "code": "rejected", "error": "push rejected", "results": results}
             try:
                 _apply(repo, updates)
-            except errors.LockError as e:
-                raise HttpError(503, "busy", _msg(e))
             except errors.RefUpdateError as e:
                 raise HttpError(409, "rejected", f"push rejected: {_msg(e)}",
                                 extra={"ok": False, "results": [
@@ -377,6 +392,8 @@ def process_push(root: str, repo_name: str, user: str, body: bytes, cfg: ServerC
         finally:
             lock.release()
     except HttpError as e:
+        if e.detail and log is not None:
+            log(e.detail)
         return e.status, _error_payload(e)
 
 
@@ -513,7 +530,8 @@ class MinigitHandler(BaseHTTPRequestHandler):
         except HttpError as e:
             self._send_json(e.status, _error_payload(e), e.headers)
         except errors.LockError as e:
-            self._send_json(503, {"error": _msg(e), "code": "busy"})
+            self.log_error("%s", _msg(e))  # the lock path is for the server log only
+            self._send_json(503, {"error": "the repository is busy, try again", "code": "busy"})
         except Exception as e:  # noqa: BLE001 - every failure must become a response
             if getattr(self.server, "verbose", False) or os.environ.get("MINIGIT_DEBUG") == "1":
                 sys.stderr.write(traceback.format_exc())
@@ -578,7 +596,8 @@ class MinigitHandler(BaseHTTPRequestHandler):
                 raise HttpError(405, "method_not_allowed", f"{method} not allowed on push")
             self._require(cfg.can_write(user, repo_name), user, "write to", repo_name)
             body = self._read_body()
-            status, payload = process_push(root, repo_name, user or "-", body, cfg)
+            status, payload = process_push(root, repo_name, user or "-", body, cfg,
+                                           log=lambda detail: self.log_error("%s", detail))
             self._send_json(status, payload)
             return
         if rest[:1] == ["pulls"]:

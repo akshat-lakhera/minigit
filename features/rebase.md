@@ -69,7 +69,7 @@ stopped rebase, and `--abort` only has to put HEAD, the index and the worktree b
 | bad `<upstream>` / `--onto` / `<branch>` | `unknown revision 'nosuch'` |
 | tracked file differs from the index | `cannot rebase: you have unstaged changes` |
 | index differs from HEAD | `cannot rebase: your index contains uncommitted changes` |
-| an untracked file (or a local change) is in the way of checking out the new base | `Your local changes to the following files would be overwritten by rebase: ...` |
+| an untracked file is in the way of checking out the new base | `The following untracked working tree files would be overwritten by rebase: ...` / `Please move or remove them before you rebase.` |
 
 Untracked files that are not in the way are left alone.
 
@@ -99,7 +99,9 @@ You are currently rebasing branch 'feature' on '1234567'.
 ```
 
 While the rebase is stopped, `switch`, `checkout <branch>`, `switch -c`, `merge`, `cherry-pick`, `revert`
-and a new `rebase` are refused (`rebase in progress`), and `branch -d/-D <branch being rebased>` fails with
+and a new `rebase` are refused (`rebase in progress; run 'minigit rebase --continue', '--skip' or '--abort'
+first`; a new `rebase`: `rebase in progress; finish it first`; `stash` prefixes `cannot stash: `), also after
+a manual `commit` has cleared `REBASE_HEAD`, and `branch -d/-D <branch being rebased>` fails with
 `cannot delete the branch '<name>': it is being rebased`. Path-level commands (`add`, `rm`, `restore`,
 `checkout REV -- path`, `diff`) and `commit` keep working.
 
@@ -146,11 +148,13 @@ Plus `.minigit/REBASE_HEAD` (the commit a conflict stopped on; listed in `OPERAT
 - `minigit/rebase.py`: `add_parser`, `cmd_rebase` (CLI), `start`, `continue_`, `skip`, `abort`,
   `status_info`, `patch_id`, the replay loop.
 - `minigit/sequencer.py`: `_apply` is reused with `action="rebase"` (conflict state file `REBASE_HEAD`,
-  `could not apply` wording); `_require_no_operation` refuses with `rebase in progress`.
-- `minigit/repo.py`: `"rebase": "REBASE_HEAD"` in `OPERATION_STATE_FILES`; `operation_in_progress()` also
-  reports a rebase while `.minigit/rebase/` exists.
+  `could not apply` wording); `_require_no_operation` refuses with `REBASE_IN_PROGRESS`.
+- `minigit/repo.py`: `"rebase": "REBASE_HEAD"` in `OPERATION_STATE_FILES`; `operation_in_progress()`
+  reports a rebase whenever `.minigit/rebase/` exists (checked first, with or without `REBASE_HEAD`);
+  `REBASE_IN_PROGRESS` is the shared refusal text.
 - `minigit/status.py`: `StatusResult.rebasing` and the long-format lines; `minigit/revparse.py`: `REBASE_HEAD`;
-  `minigit/merge.py`: refuses with `rebase in progress`; `minigit/ops.py`: `branch -d/-D` of the branch being
+  `minigit/merge.py`, `minigit/stash.py` and `switch`/`checkout` in `minigit/ops.py` refuse with
+  `REBASE_IN_PROGRESS`; `minigit/ops.py`: `branch -d/-D` of the branch being
   rebased is refused.
 
 ## 4. Limitations

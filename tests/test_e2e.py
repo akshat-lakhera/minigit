@@ -142,7 +142,8 @@ class SingleUserWorkflowTests(CliCase):
         self.assertIn("\tnew file:   README.md", status)
 
         res = self.git("commit", "-m", "initial import")
-        self.assertRegex(res.out, rf"^\[main \(root-commit\) {HEX7}\] initial import\n$")
+        self.assertRegex(res.out, rf"^\[main \(root-commit\) {HEX7}\] initial import\n"
+                                  r" 4 files changed, 6 insertions\(\+\)\n$")
         first = self.head(self.repo)
         self.assertIn("nothing to commit, working tree clean", self.git("status").out)
         self.assertIn("nothing to commit", self.git_fail("commit", "-m", "again").err)
@@ -159,7 +160,7 @@ class SingleUserWorkflowTests(CliCase):
         self.assertEqual(self.git("diff").out, "")
         self.assertIn("@@ -1 +1,2 @@\n hello\n+world\n", self.git("diff", "--staged").out)
         res = self.git("commit", "-m", "add world", "-m", "A longer body.")
-        self.assertRegex(res.out, rf"^\[main {HEX7}\] add world\n$")
+        self.assertRegex(res.out, rf"^\[main {HEX7}\] add world\n 1 file changed, 1 insertion\(\+\)\n$")
         second = self.head(self.repo)
         self.assertIn("+world\n", self.git("diff", "HEAD~1", "HEAD").out)
         self.assertIn("+world\n", self.git("diff", f"{first[:7]}..{second[:7]}").out)

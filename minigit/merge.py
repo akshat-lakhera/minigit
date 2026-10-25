@@ -11,16 +11,16 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from . import merge3
-from .errors import CheckoutConflictError, MinigitError
+from .errors import MinigitError
 from .graph import commit_time, is_ancestor, merge_bases, merge_bases_many
 from .index import IndexEntry, locked_index
 from .objects import Commit, ObjectStore, hash_object, serialize_commit
-from .repo import OPERATION_STATE_FILES
+from .repo import OPERATION_STATE_FILES, REBASE_IN_PROGRESS
 from .revparse import resolve_ref, resolve_rev
 from .trees import Entry, FlatTree, build_tree, commit_flat
 from .util import is_binary
-from .worktree import (check_checkout_paths, checkout_tree, ensure_unmodified, entry_with_stat, remove_file,
-                       write_file)
+from .worktree import (check_checkout_paths, checkout_tree, conflict_error, ensure_unmodified, entry_with_stat,
+                       remove_file, write_file)
 
 if TYPE_CHECKING:  # pragma: no cover
     from .index import Index
@@ -239,14 +239,6 @@ def default_merge_message(repo: Repository, rev: str) -> str:
     return f"Merge commit '{rev}'"
 
 
-def _overwrite_error(paths: list[str]) -> CheckoutConflictError:
-    listing = "".join(f"\t{p}\n" for p in paths)
-    return CheckoutConflictError(
-        "Your local changes to the following files would be overwritten by merge:\n"
-        f"{listing}Please commit your changes or restore them before you merge.",
-        paths=list(paths))
-
-
 def _depth_first(paths) -> list[str]:
     return sorted(paths, key=lambda s: (-s.count("/"), s))
 
@@ -260,10 +252,13 @@ def _files_under(abs_dir: str, rel_dir: str):
 
 
 def _check_obstacles(repo: Repository, target: dict[str, Entry | None], ours: FlatTree,
-                     writes: list[str]) -> set[str]:
+                     writes: list[str], index: Index) -> set[str]:
     """Refuse untracked files/dirs that block a write. Returns paths to skip in the stat check."""
     deleted = {p for p, e in target.items() if e is None and p in ours}
+    in_index = set(index.paths())
     bad: list[str] = []
+    untracked: list[str] = []
+    dirs: list[str] = []
     skip: set[str] = set()
     for p in writes:
         parts = p.split("/")
@@ -273,15 +268,16 @@ def _check_obstacles(repo: Repository, target: dict[str, Entry | None], ours: Fl
             if os.path.lexists(aq) and not os.path.isdir(aq):
                 skip.add(p)
                 if q not in deleted:
-                    bad.append(q)
+                    (bad if q in in_index else untracked).append(q)
                 break
         ap = repo.abspath(p)
         if os.path.isdir(ap):
             skip.add(p)
-            if any(f not in deleted for f in _files_under(ap, p)):
-                bad.append(p)
-    if bad:
-        raise _overwrite_error(sorted(set(bad)))
+            kept = [f for f in _files_under(ap, p) if f not in deleted]
+            if kept:
+                (bad if any(f in in_index for f in kept) else dirs).append(p)
+    if bad or untracked or dirs:
+        raise conflict_error("merge", bad, untracked, dirs)
     return skip
 
 
@@ -317,7 +313,7 @@ def _three_way(repo: Repository, index: Index, head: str, theirs: str, ours: Fla
 
     # Safety: nothing is touched unless every affected path is clean in the worktree.
     check_checkout_paths(repo, {p: e for p, e in target.items() if e is not None}, writes, "merge")
-    skip = _check_obstacles(repo, target, ours, writes)
+    skip = _check_obstacles(repo, target, ours, writes, index)
     must_be_clean = (set(changed) | set(res.stages)) - skip
     ensure_unmodified(repo, index, {p: ours.get(p) for p in sorted(must_be_clean)}, "merge")
 
@@ -358,8 +354,7 @@ def merge(repo: Repository, rev: str, *, message: str | None = None, label: str 
     store = repo.objects
     op = repo.operation_in_progress()
     if op is not None and op[0] == "rebase":
-        raise MinigitError("cannot merge: rebase in progress",
-                           hint="use 'minigit rebase --continue', '--skip' or '--abort'")
+        raise MinigitError(REBASE_IN_PROGRESS)
     if op is not None:
         raise MinigitError(f"you have not concluded your {op[0]} ({OPERATION_STATE_FILES[op[0]]} exists)",
                            hint=f"commit the result, or run 'minigit {op[0]} --abort'")
@@ -373,8 +368,10 @@ def merge(repo: Repository, rev: str, *, message: str | None = None, label: str 
                                hint="fix them, 'minigit add' them and commit")
         head = repo.head_commit()
         head_flat = repo.head_flat()
-        if index.flat() != head_flat:
-            raise MinigitError("you have staged changes; commit them first")
+        # Like git: a fast-forward keeps staged changes and refuses (in checkout_tree) only those
+        # on paths it changes; a real merge commit needs an index that matches HEAD.
+        flat = index.flat()
+        staged = sorted(p for p in set(flat) | set(head_flat) if flat.get(p) != head_flat.get(p))
         if head is None:
             checkout_tree(repo, index, {}, commit_flat(store, theirs), operation="merge")
             outcome = MergeOutcome("fast-forward", theirs, None, [], ["Fast-forward"])
@@ -385,6 +382,8 @@ def merge(repo: Repository, rev: str, *, message: str | None = None, label: str 
             outcome = MergeOutcome("fast-forward", theirs, head, [],
                                    [f"Updating {head[:7]}..{theirs[:7]}", "Fast-forward"])
         else:
+            if staged:
+                raise MinigitError("you have staged changes; commit them first: " + ", ".join(staged))
             outcome, merge_msg = _three_way(repo, index, head, theirs, head_flat, rev, label, message,
                                             allow_unrelated)
     # The index is written; now move refs / record merge state.

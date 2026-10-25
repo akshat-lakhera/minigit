@@ -142,6 +142,8 @@ def format_pull_show(pull: dict) -> str:
     ]
     if pull.get("state") == "open":
         lines.append(f"Mergeable: {_mergeable_text(pull)}")
+    elif isinstance(pull.get("missing_branch"), str):
+        lines.append(f"note: branch '{pull['missing_branch']}' no longer exists")
     body = pull.get("body") or ""
     if body.strip():
         lines.append("")

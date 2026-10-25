@@ -7,6 +7,9 @@ import time
 import unittest
 
 from minigit import diff as diffmod
+from minigit.index import IndexEntry, locked_index
+from minigit.objects import hash_object
+from minigit.repo import Repository
 from tests.helpers import make_env, run, write
 
 
@@ -94,6 +97,37 @@ class CliTest(unittest.TestCase):
         self.assertIn("+<<<<<<<", out)
         self.assertIn("+>>>>>>>", out)
         self.assertIn("@@", out)
+
+    def test_diff_rev_keeps_revision_mode_for_path_missing_from_index(self):
+        write(os.path.join(self.wt, "run.sh"), "echo hi\n")
+        self.m("add", "run.sh")
+        self.m("commit", "-m", "c1")
+        with locked_index(Repository.open(self.wt)) as index:
+            e = index.get("run.sh")
+            index.put(IndexEntry("run.sh", "100755", e.sha, e.size, e.mtime_ns, 0))
+        self.m("commit", "-m", "make executable")
+        self.m("rm", "--cached", "run.sh")
+        out = self.m("diff", "HEAD").out
+        if os.name == "nt":   # no exec bit on disk: the mode comes from HEAD, so nothing changed
+            self.assertEqual(out, "")
+        else:                 # the file on disk is not executable
+            self.assertEqual(out, "diff --git a/run.sh b/run.sh\nold mode 100755\nnew mode 100644\n")
+
+    def test_unmerged_path_without_stage_2_prints_no_diff(self):
+        x = hash_object("blob", b"x\n")
+        y = hash_object("blob", b"y\n")
+        repo = Repository.open(self.wt)
+        repo.objects.write("blob", b"x\n")
+        repo.objects.write("blob", b"y\n")
+        with locked_index(repo) as index:
+            index.put(IndexEntry("au.txt", "100644", x, 0, 0, 2))
+            index.put(IndexEntry("ua.txt", "100644", y, 0, 0, 3))
+        for n in ("au.txt", "ua.txt"):
+            write(os.path.join(self.wt, n), "x\n")
+        # like `git diff --ours`: compared with stage 2 only; ua.txt has none, so no diff of stage 3
+        self.assertEqual(self.m("diff").out, "* Unmerged path au.txt\n* Unmerged path ua.txt\n")
+        write(os.path.join(self.wt, "au.txt"), "x\nmore\n")
+        self.assertIn("* Unmerged path au.txt\ndiff --git a/au.txt b/au.txt\n", self.m("diff").out)
 
 
 if __name__ == "__main__":

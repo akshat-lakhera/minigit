@@ -640,9 +640,27 @@ class MergeCommandTests(RepoCase):
         with self.assertRaises(CheckoutConflictError) as ctx:
             M.merge(self.repo, "feature")
         self.assertEqual(ctx.exception.paths, ["new.txt"])
+        self.assertEqual(ctx.exception.message,
+                         "The following untracked working tree files would be overwritten by merge:\n"
+                         "\tnew.txt\nPlease move or remove them before you merge.")
         self.assertEqual(self.read("new.txt"), b"untracked\n")
         self.assertIsNone(self.repo.merge_head())
         self.assert_index_matches_head()
+
+    def test_untracked_file_in_the_way_of_a_fast_forward_uses_untracked_wording(self):
+        self.commit_files("base", {"a.txt": b"a\n"})
+        self.branch("feature")
+        self.switch("feature")
+        self.commit_files("more", {"b.txt": b"b\n"})
+        self.switch("main")
+        self.write("b.txt", b"mine\n")
+        with self.assertRaises(CheckoutConflictError) as ctx:
+            M.merge(self.repo, "feature")
+        self.assertEqual(ctx.exception.paths, ["b.txt"])
+        self.assertIn("The following untracked working tree files would be overwritten by merge:\n\tb.txt\n"
+                      "Please move or remove them before you merge.", ctx.exception.message)
+        self.assertNotIn("local changes", ctx.exception.message)
+        self.assertEqual(self.read("b.txt"), b"mine\n")
 
     def test_detached_head_merge_by_sha(self):
         c0, cm, cf = self.diverge({"f": b"1\n2\n3\n"}, {"f": b"one\n2\n3\n"}, {"f": b"1\n2\nthree\n"})
@@ -660,6 +678,8 @@ class MergeCommandTests(RepoCase):
         with self.assertRaises(CheckoutConflictError) as ctx:
             M.merge(self.repo, "feature")
         self.assertEqual(ctx.exception.paths, ["thing"])
+        self.assertEqual(ctx.exception.message,
+                         "Updating the following directories would lose untracked files in them:\n\tthing\n")
         self.assertEqual(self.read("thing/inner.txt"), b"u\n")
 
     def test_dirty_conflicting_file_refused(self):
@@ -683,7 +703,45 @@ class MergeCommandTests(RepoCase):
         self.stage("f")
         with self.assertRaises(MinigitError) as cm:
             M.merge(self.repo, "feature")
-        self.assertEqual(cm.exception.message, "you have staged changes; commit them first")
+        self.assertEqual(cm.exception.message, "you have staged changes; commit them first: f")
+
+    def test_fast_forward_keeps_unrelated_staged_change(self):
+        self.commit_files("base", {"a.txt": b"a\n", "u.txt": b"u\n"})
+        self.branch("feature")
+        self.switch("feature")
+        c1 = self.commit_files("more", {"a.txt": b"a2\n", "f.txt": b"f\n"})
+        self.switch("main")
+        self.write("u.txt", b"staged\n")
+        self.stage("u.txt")
+        out = M.merge(self.repo, "feature")
+        self.assertEqual(out.kind, "fast-forward")
+        self.assertEqual(self.head(), c1)
+        self.assertEqual(self.read("a.txt"), b"a2\n")
+        self.assertEqual(self.read("u.txt"), b"staged\n")
+        with locked_index(self.repo) as idx:
+            flat = idx.flat()
+        self.assertEqual(flat["u.txt"][1], M.hash_object("blob", b"staged\n"))
+        self.assertEqual(flat["f.txt"], commit_flat(self.repo.objects, c1)["f.txt"])
+
+    def test_fast_forward_refuses_staged_change_on_a_path_it_changes(self):
+        self.commit_files("base", {"a.txt": b"a\n", "u.txt": b"u\n"})
+        self.branch("feature")
+        self.switch("feature")
+        self.commit_files("more", {"a.txt": b"a2\n", "f.txt": b"f\n"})
+        self.switch("main")
+        before = self.head()
+        self.write("a.txt", b"mine\n")
+        self.stage("a.txt")
+        self.write("f.txt", b"also mine\n")
+        self.stage("f.txt")
+        with self.assertRaises(CheckoutConflictError) as cm:
+            M.merge(self.repo, "feature")
+        self.assertEqual(cm.exception.paths, ["a.txt", "f.txt"])
+        self.assertEqual(cm.exception.message,
+                         "Your local changes to the following files would be overwritten by merge:\n"
+                         "\ta.txt\n\tf.txt\nPlease commit your changes or restore them before you merge.")
+        self.assertEqual(self.head(), before)
+        self.assertEqual(self.read("a.txt"), b"mine\n")
 
     def test_unrelated_histories_refused(self):
         self.commit_files("base", {"a": b"a\n"})
