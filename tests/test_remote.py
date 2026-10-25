@@ -1,0 +1,852 @@
+"""tests.test_remote -- owner: M6 client.
+
+Unit tests for minigit.transport and minigit.remote.  The transport tests run
+against a tiny fake HTTP server defined here; the collaboration tests run the
+real protocol against an in-process ``server.make_server`` on localhost.
+"""
+from __future__ import annotations
+
+import base64
+import contextlib
+import http.server
+import json
+import os
+import socket
+import struct
+import tempfile
+import threading
+import unittest
+from unittest import mock
+
+from minigit import auth, errors, index, objects, pack, server, trees
+from minigit import remote as R
+from minigit import transport as T
+from minigit.repo import Repository
+
+IDENTITY_ENV = {
+    "MINIGIT_AUTHOR_NAME": "Test User",
+    "MINIGIT_AUTHOR_EMAIL": "test@example.com",
+    "MINIGIT_AUTHOR_DATE": "1700000000 +0000",
+}
+
+
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+class _EnvCase(unittest.TestCase):
+    """Temp dir + isolated environment (credentials, global config, identity)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.tmp = self._tmp.name
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("MINIGIT_USER", "MINIGIT_TOKEN", "HTTP_PROXY", "http_proxy")}
+        env.update(IDENTITY_ENV)
+        env["MINIGIT_CREDENTIALS"] = os.path.join(self.tmp, "credentials.json")
+        env["MINIGIT_GLOBAL_CONFIG"] = os.path.join(self.tmp, "globalconfig")
+        self._env = mock.patch.dict(os.environ, env, clear=True)
+        self._env.start()
+
+    def tearDown(self):
+        self._env.stop()
+        self._tmp.cleanup()
+
+
+# ===================================================================== URLs
+
+class SplitUrlTests(unittest.TestCase):
+    def test_no_userinfo(self):
+        self.assertEqual(T.split_url("http://h:1/proj"), ("http://h:1/proj", None))
+
+    def test_userinfo_is_stripped(self):
+        self.assertEqual(T.split_url("http://alice:TOK@127.0.0.1:8765/proj"),
+                         ("http://127.0.0.1:8765/proj", ("alice", "TOK")))
+
+    def test_percent_encoded_token(self):
+        self.assertEqual(T.split_url("http://a%40b:t%3Ak@h:1/p"), ("http://h:1/p", ("a@b", "t:k")))
+
+    def test_user_without_token(self):
+        self.assertEqual(T.split_url("http://alice@h:1/p"), ("http://h:1/p", ("alice", "")))
+
+    def test_trailing_slash_kept_by_split(self):
+        self.assertEqual(T.split_url("http://h:1/p/")[0], "http://h:1/p/")
+
+    def test_check_url_rejects_non_http(self):
+        for bad in ("ftp://h/p", "proj", "http://", "/tmp/repo", "http://h:notaport/p"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(errors.RemoteError):
+                    T.check_url(bad)
+
+    def test_credential_key(self):
+        self.assertEqual(T.credential_key("http://Alice:x@LocalHost:8765/proj/"), "http://localhost:8765")
+        self.assertEqual(T.credential_key("http://h/p"), "http://h:80")
+        self.assertEqual(T.credential_key("https://h/p"), "https://h:443")
+
+
+# ============================================================== credentials
+
+class CredentialTests(_EnvCase):
+    URL = "http://127.0.0.1:8765/proj"
+
+    def test_credentials_path_env_and_default(self):
+        self.assertEqual(T.credentials_path(), os.environ["MINIGIT_CREDENTIALS"])
+        del os.environ["MINIGIT_CREDENTIALS"]
+        self.assertEqual(T.credentials_path(),
+                         os.path.join(os.path.expanduser("~"), ".minigit-credentials.json"))
+
+    def test_none_when_nothing_configured(self):
+        self.assertIsNone(T.load_credentials(self.URL))
+
+    def test_save_and_load_file(self):
+        T.save_credentials(self.URL, "alice", "TOK")
+        with open(T.credentials_path(), "rb") as fh:
+            data = json.loads(fh.read())
+        entry = {"user": "alice", "token": "TOK"}
+        self.assertEqual(data, {"http://127.0.0.1:8765": entry, "http://127.0.0.1:8765|alice": entry})
+        self.assertEqual(T.load_credentials("http://127.0.0.1:8765/other"), ("alice", "TOK"))
+        self.assertIsNone(T.load_credentials("http://127.0.0.1:9999/proj"))
+        self.assertFalse(os.path.exists(T.credentials_path() + ".lock"))
+
+    def test_save_keeps_other_hosts_and_overwrites_same_host(self):
+        T.save_credentials(self.URL, "alice", "1")
+        T.save_credentials("http://other:1/p", "bob", "2")
+        T.save_credentials(self.URL, "carol", "3")
+        self.assertEqual(T.load_credentials(self.URL), ("carol", "3"))
+        self.assertEqual(T.load_credentials("http://other:1/x"), ("bob", "2"))
+
+    def test_order_env_then_userinfo_then_file(self):
+        T.save_credentials(self.URL, "filer", "F")
+        with_info = "http://urler:U@127.0.0.1:8765/proj"
+        self.assertEqual(T.load_credentials(self.URL), ("filer", "F"))
+        self.assertEqual(T.load_credentials(with_info), ("urler", "U"))
+        os.environ["MINIGIT_USER"] = "enver"
+        self.assertEqual(T.load_credentials(with_info), ("urler", "U"), "env needs user AND token")
+        os.environ["MINIGIT_TOKEN"] = "E"
+        self.assertEqual(T.load_credentials(with_info), ("enver", "E"))
+        self.assertEqual(T.load_credentials(self.URL), ("enver", "E"))
+
+    def test_corrupt_file_is_a_clear_error(self):
+        with open(T.credentials_path(), "wb") as fh:
+            fh.write(b"{not json")
+        with self.assertRaises(errors.MinigitError) as cm:
+            T.load_credentials(self.URL)
+        self.assertIn("corrupt", str(cm.exception))
+
+    @unittest.skipIf(os.name == "nt", "POSIX permissions")
+    def test_file_mode_600(self):
+        T.save_credentials(self.URL, "alice", "TOK")
+        self.assertEqual(os.stat(T.credentials_path()).st_mode & 0o777, 0o600)
+
+    def test_login_writes_credentials(self):
+        R.login("http://127.0.0.1:8765/proj", "alice", "TOK")
+        self.assertEqual(T.load_credentials(self.URL), ("alice", "TOK"))
+        with self.assertRaises(errors.MinigitError):
+            R.login(self.URL, "alice", "")
+        with self.assertRaises(errors.MinigitError):
+            R.login("not-a-url", "alice", "TOK")
+
+    def test_http_remote_strips_userinfo_and_trailing_slash(self):
+        rem = T.HttpRemote("http://alice:TOK@127.0.0.1:8765/proj/")
+        self.assertEqual(rem.url, "http://127.0.0.1:8765/proj")
+        self.assertEqual(rem.credentials, ("alice", "TOK"))
+        self.assertNotIn("TOK", rem.url)
+
+
+# ==================================================== transport vs fake HTTP
+
+class _FakeHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.0"
+
+    def log_message(self, *args):  # silence
+        pass
+
+    def _handle(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length) if length else b""
+        self.server.requests.append({"method": self.command, "path": self.path,
+                                     "headers": {k.lower(): v for k, v in self.headers.items()},
+                                     "body": body})
+        status, ctype, payload, *extra = self.server.responder(self.command, self.path, body)
+        if isinstance(payload, (dict, list)):
+            payload = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(payload)))
+        for key, value in (extra[0] if extra else {}).items():
+            self.send_header(key, value)
+        if status == 401:
+            self.send_header("WWW-Authenticate", 'Basic realm="minigit"')
+        self.end_headers()
+        self.wfile.write(payload)
+
+    do_GET = do_POST = _handle
+
+
+class TransportFakeServerTests(_EnvCase):
+    def setUp(self):
+        super().setUp()
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _FakeHandler)
+        self.httpd.daemon_threads = True
+        self.httpd.requests = []
+        self.httpd.responder = lambda m, p, b: (200, "application/json", {})
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+        self.url = self.base + "/proj"
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.thread.join(5)
+        super().tearDown()
+
+    def respond(self, status, payload, ctype="application/json"):
+        self.httpd.responder = lambda m, p, b: (status, ctype, payload)
+
+    def test_info_refs_headers_and_parse(self):
+        sha = "a" * 40
+        self.respond(200, {"protocol": 1, "head": "refs/heads/main", "refs": {"refs/heads/main": sha}})
+        rem = T.HttpRemote(f"http://alice:s3cret@127.0.0.1:{self.httpd.server_address[1]}/proj/")
+        info = rem.info_refs()
+        self.assertEqual(info, T.RemoteRefs(head="refs/heads/main", refs={"refs/heads/main": sha}))
+        req = self.httpd.requests[-1]
+        self.assertEqual((req["method"], req["path"]), ("GET", "/proj/info/refs"))
+        self.assertEqual(req["headers"]["x-minigit-protocol"], "1")
+        self.assertEqual(req["headers"]["authorization"],
+                         "Basic " + base64.b64encode(b"alice:s3cret").decode())
+
+    def test_no_authorization_header_without_credentials(self):
+        self.respond(200, {"protocol": 1, "head": None, "refs": {}})
+        info = T.HttpRemote(self.url).info_refs()
+        self.assertEqual(info, T.RemoteRefs(head=None, refs={}))
+        self.assertNotIn("authorization", self.httpd.requests[-1]["headers"])
+
+    def test_proxy_environment_is_ignored(self):
+        os.environ["HTTP_PROXY"] = os.environ["http_proxy"] = "http://127.0.0.1:1"
+        self.respond(200, {"protocol": 1, "head": None, "refs": {}})
+        self.assertEqual(T.HttpRemote(self.url).info_refs().refs, {})
+
+    def test_malformed_info_refs(self):
+        for payload in ({"protocol": 1, "refs": {"refs/heads/main": "xyz"}},
+                        {"protocol": 1, "refs": {"refs/../x": "a" * 40}},
+                        {"protocol": 2, "refs": {}}, [1, 2]):
+            with self.subTest(payload=payload):
+                self.respond(200, payload)
+                with self.assertRaises(errors.RemoteError):
+                    T.HttpRemote(self.url).info_refs()
+        self.respond(200, b"<html>", "text/html")
+        with self.assertRaises(errors.RemoteError):
+            T.HttpRemote(self.url).info_refs()
+
+    def test_401_is_auth_error(self):
+        self.respond(401, {"error": "authentication required", "code": "auth"})
+        with self.assertRaises(errors.AuthError) as cm:
+            T.HttpRemote(self.url).info_refs()
+        self.assertEqual(str(cm.exception),
+                         f"authentication required for '{self.url}' (no credentials configured)")
+        self.assertEqual(cm.exception.status, 401)
+        with mock.patch.dict(os.environ, {"MINIGIT_USER": "alice", "MINIGIT_TOKEN": "bad"}):
+            with self.assertRaises(errors.AuthError) as cm:
+                T.HttpRemote(self.url).info_refs()
+        self.assertEqual(str(cm.exception),
+                         f"authentication failed for '{self.url}': check user/token (minigit login)")
+
+    def test_403_is_permission_denied(self):
+        self.respond(403, {"error": "user 'bob' may not write to 'proj'", "code": "forbidden"})
+        with self.assertRaises(errors.PermissionDeniedError) as cm:
+            T.HttpRemote(self.url).push([], b"")
+        self.assertTrue(str(cm.exception).startswith("permission denied: "))
+        self.assertIn("bob", str(cm.exception))
+        self.respond(403, {"error": "permission denied: nope", "code": "forbidden"})
+        with self.assertRaises(errors.PermissionDeniedError) as cm:
+            T.HttpRemote(self.url).info_refs()
+        self.assertEqual(str(cm.exception), "permission denied: nope")
+
+    def test_other_status_uses_body_error(self):
+        self.respond(404, {"error": "repository 'proj' not found", "code": "not_found"})
+        with self.assertRaises(errors.RemoteError) as cm:
+            T.HttpRemote(self.url).info_refs()
+        self.assertEqual(str(cm.exception), "repository 'proj' not found")
+        self.assertEqual((cm.exception.status, cm.exception.code), (404, "not_found"))
+        self.respond(500, b"boom", "text/plain")
+        with self.assertRaises(errors.RemoteError) as cm:
+            T.HttpRemote(self.url).info_refs()
+        self.assertIn("500", str(cm.exception))
+
+    def test_redirects_are_not_followed(self):
+        # Following a redirect would send the Authorization header to another host.
+        target = self.base + "/elsewhere/info/refs"
+        self.httpd.responder = lambda m, p, b: (
+            (302, "text/plain", b"moved", {"Location": target}) if p.startswith("/proj/")
+            else (200, "application/json", {"protocol": 1, "head": None, "refs": {}}))
+        rem = T.HttpRemote(f"http://alice:s3cret@127.0.0.1:{self.httpd.server_address[1]}/proj")
+        with self.assertRaises(errors.RemoteError) as cm:
+            rem.info_refs()
+        self.assertIn("302", str(cm.exception))
+        self.assertEqual([r["path"] for r in self.httpd.requests], ["/proj/info/refs"])
+
+    def test_connection_refused(self):
+        url = f"http://127.0.0.1:{_free_port()}/proj"
+        with self.assertRaises(errors.RemoteError) as cm:
+            T.HttpRemote(url, timeout=5).info_refs()
+        self.assertTrue(str(cm.exception).startswith(f"could not connect to server at {url}: "))
+
+    def test_fetch_pack_request(self):
+        self.respond(200, b"PACKBYTES", "application/x-minigit-pack")
+        data = T.HttpRemote(self.url).fetch_pack(["a" * 40], ["b" * 40])
+        self.assertEqual(data, b"PACKBYTES")
+        req = self.httpd.requests[-1]
+        self.assertEqual((req["method"], req["path"]), ("POST", "/proj/fetch"))
+        self.assertEqual(json.loads(req["body"]), {"want": ["a" * 40], "have": ["b" * 40]})
+        self.assertEqual(req["headers"]["content-length"], str(len(req["body"])))
+
+    def test_push_framing_and_ok(self):
+        result = {"ok": True, "results": [{"ref": "refs/heads/main", "status": "ok"}]}
+        self.respond(200, result)
+        upd = [{"ref": "refs/heads/main", "old": None, "new": "c" * 40}]
+        self.assertEqual(T.HttpRemote(self.url).push(upd, b"PACK", force=True), result)
+        req = self.httpd.requests[-1]
+        self.assertEqual(req["path"], "/proj/push")
+        self.assertEqual(req["headers"]["content-type"], "application/x-minigit-push")
+        body = req["body"]
+        self.assertTrue(body.startswith(b"MGPUSH1\n"))
+        (n,) = struct.unpack(">I", body[8:12])
+        meta = json.loads(body[12:12 + n])
+        self.assertEqual(meta, {"protocol": 1, "force": True, "updates": upd})
+        self.assertEqual(body[12 + n:], b"PACK")
+
+    def test_push_409_raises_push_rejected(self):
+        results = [{"ref": "refs/heads/main", "status": "rejected", "reason": "stale",
+                    "current": "d" * 40, "message": "remote ref changed"}]
+        self.respond(409, {"ok": False, "code": "rejected", "error": "push rejected", "results": results})
+        with self.assertRaises(errors.PushRejectedError) as cm:
+            T.HttpRemote(self.url).push([], b"")
+        self.assertEqual(cm.exception.results, results)
+        self.assertEqual(cm.exception.url, self.url)
+        self.assertEqual(cm.exception.status, 409)
+
+    def test_list_repos(self):
+        self.respond(200, {"repos": ["b", "a"]})
+        self.assertEqual(T.HttpRemote(self.url).list_repos(), ["a", "b"])
+        self.assertEqual(self.httpd.requests[-1]["path"], "/")
+
+
+# ========================================================== format helpers
+
+class FormatTests(unittest.TestCase):
+    A, B = "a1b2c3d" + "0" * 33, "e4f5a6b" + "0" * 33
+
+    def test_format_fetch_lines(self):
+        changes = [
+            R.RefChange("refs/remotes/origin/main", self.A, self.B, "updated"),
+            R.RefChange("refs/remotes/origin/hot", self.A, self.B, "forced"),
+            R.RefChange("refs/remotes/origin/feature", None, self.B, "new"),
+            R.RefChange("refs/remotes/origin/old", self.A, None, "deleted"),
+            R.RefChange("refs/remotes/origin/same", self.A, self.A, "up-to-date"),
+        ]
+        self.assertEqual(R.format_fetch("http://h:1/p", changes).split("\n"), [
+            "From http://h:1/p",
+            "   a1b2c3d..e4f5a6b  main -> origin/main",
+            " + a1b2c3d...e4f5a6b hot -> origin/hot (forced update)",
+            " * [new branch]      feature -> origin/feature",
+            " - [deleted]         old -> origin/old",
+        ])
+        self.assertEqual(R.format_fetch("u", [changes[-1]]), "")
+        self.assertEqual(R.format_fetch("u", []), "")
+
+    def test_format_push_rejection(self):
+        for reason, text in (("non-fast-forward", "non-fast-forward"), ("fetch-first", "fetch first"),
+                             ("stale", "stale info")):
+            err = errors.PushRejectedError("push rejected", url="http://h:1/p", results=[
+                {"ref": "refs/heads/main", "status": "rejected", "reason": reason}])
+            self.assertEqual(R.format_push_rejection(err, "main", "main"), "\n".join([
+                "To http://h:1/p",
+                f" ! [rejected]        main -> main ({text})",
+                "error: failed to push some refs to 'http://h:1/p'",
+                "hint: Updates were rejected because the remote contains work that you do not have locally.",
+                "hint: Run 'minigit pull' first, then push again (pull first).",
+            ]))
+
+    def test_guess_dir(self):
+        self.assertEqual(R._guess_dir("http://h:1/proj"), "proj")
+        self.assertEqual(R._guess_dir("http://h:1/a/proj.git/"), "proj")
+        with self.assertRaises(errors.UsageError):
+            R._guess_dir("http://h:1/")
+
+
+# ============================================ live in-process server tests
+
+class LiveServerCase(_EnvCase):
+    allow_force = False
+
+    def setUp(self):
+        super().setUp()
+        self.root = os.path.join(self.tmp, "srv")
+        auth.server_init(self.root)
+        self.tokens = {name: auth.add_user(self.root, name) for name in ("alice", "bob", "reader")}
+        auth.create_repo(self.root, "proj", readers=("*",), writers=("alice", "bob"),
+                         allow_force=self.allow_force)
+        self.httpd = server.make_server(self.root, "127.0.0.1", 0)
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+        self.url = self.base + "/proj"
+        self.server_repo = Repository.open(os.path.join(self.root, "repos", "proj"))
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.thread.join(5)
+        super().tearDown()
+
+    # -- helpers -------------------------------------------------------------
+    @contextlib.contextmanager
+    def as_user(self, name, token=None):
+        with mock.patch.dict(os.environ, {"MINIGIT_USER": name,
+                                          "MINIGIT_TOKEN": token or self.tokens[name]}):
+            yield
+
+    def clone(self, who, dirname=None, url=None):
+        with self.as_user(who):
+            repo, msgs = R.clone(url or self.url, dirname or who, self.tmp)
+        return repo, msgs
+
+    def commit(self, repo, files, message):
+        """Write files (bytes, or None to delete), stage them, and commit on HEAD."""
+        store = repo.objects
+        with index.locked_index(repo) as idx:
+            for path, data in files.items():
+                full = repo.abspath(path)
+                if data is None:
+                    if os.path.exists(full):
+                        os.unlink(full)
+                    idx.remove(path)
+                    continue
+                os.makedirs(os.path.dirname(full), exist_ok=True)
+                with open(full, "wb") as fh:
+                    fh.write(data)
+                sha = store.write("blob", data)
+                idx.put(index.IndexEntry(path=path, mode="100644", sha=sha, size=len(data), mtime_ns=0))
+            flat = idx.flat()
+        tree = trees.build_tree(store, flat)
+        head = repo.head_commit()
+        sig = repo.identity()
+        c = objects.Commit(tree=tree, parents=(head,) if head else (), author=sig, committer=sig,
+                           message=message.rstrip() + "\n")
+        sha = store.write("commit", objects.serialize_commit(c))
+        repo.refs.update_head(sha, expected=head)
+        return sha
+
+    def push(self, who, repo, *args, **kw):
+        with self.as_user(who):
+            return R.push(repo, *args, **kw)
+
+    def fetch(self, who, repo, remote="origin"):
+        with self.as_user(who):
+            return R.fetch(repo, remote)
+
+    def pull(self, who, repo, *args):
+        with self.as_user(who):
+            return R.pull(repo, *args)
+
+    def server_ref(self, name="refs/heads/main"):
+        return self.server_repo.refs.resolve(name)
+
+    def read(self, repo, path):
+        with open(repo.abspath(path), "rb") as fh:
+            return fh.read()
+
+    def alice_with_commit(self, files=None, message="first"):
+        alice, _ = self.clone("alice")
+        sha = self.commit(alice, files or {"a.txt": b"alpha\n", "dir/b.txt": b"beta\n"}, message)
+        self.push("alice", alice, set_upstream=True)
+        return alice, sha
+
+
+class CloneTests(LiveServerCase):
+    def test_clone_empty_repository(self):
+        repo, msgs = self.clone("alice")
+        self.assertIn("warning: You appear to have cloned an empty repository.", msgs)
+        self.assertEqual(repo.refs.read_raw("HEAD"), "ref: refs/heads/main")
+        self.assertIsNone(repo.head_commit())
+        self.assertEqual(repo.config.get("remote.origin.url"), self.url)
+        self.assertEqual(repo.worktree, os.path.join(self.tmp, "alice"))
+
+    def test_clone_with_userinfo_saves_credentials_and_strips_url(self):
+        url = f"http://alice:{self.tokens['alice']}@127.0.0.1:{self.httpd.server_address[1]}/proj"
+        repo, _ = R.clone(url, None, self.tmp)  # dir name guessed: "proj"
+        self.assertEqual(repo.worktree, os.path.join(self.tmp, "proj"))
+        self.assertEqual(repo.config.get("remote.origin.url"), self.url.replace("://", "://alice@"))
+        self.assertEqual(T.load_credentials(self.url), ("alice", self.tokens["alice"]))
+        # the saved credentials are then used without env or userinfo
+        self.commit(repo, {"x": b"1\n"}, "x")
+        self.assertEqual(R.push(repo)[0], f"To {self.url.replace('://', '://alice@')}")
+
+    def test_clone_nonempty_bytes_identical(self):
+        files = {"crlf.txt": b"one\r\ntwo\r\n", "bin.dat": bytes(range(256)) * 4 + b"\x00\r\n",
+                 "noeol.txt": b"no newline", "sub/deep/x.txt": b"x\n"}
+        _, sha = self.alice_with_commit(files)
+        bob, msgs = self.clone("bob")
+        self.assertEqual(msgs, ["Cloning into 'bob'..."])
+        self.assertEqual(bob.head_commit(), sha)
+        self.assertEqual(bob.refs.read_raw("HEAD"), "ref: refs/heads/main")
+        self.assertEqual(bob.refs.resolve("refs/remotes/origin/main"), sha)
+        self.assertEqual(bob.config.get("branch.main.remote"), "origin")
+        self.assertEqual(bob.config.get("branch.main.merge"), "refs/heads/main")
+        for path, data in files.items():
+            self.assertEqual(self.read(bob, path), data, path)
+        self.assertEqual(index.read_index(bob).flat(), trees.commit_flat(bob.objects, sha))
+
+    def test_clone_picks_server_head_branch(self):
+        alice, _ = self.clone("alice")
+        alice.refs.set_symbolic_head("refs/heads/dev")
+        self.commit(alice, {"d": b"d\n"}, "dev work")
+        self.push("alice", alice)
+        bob, _ = self.clone("bob")
+        self.assertEqual(bob.refs.read_raw("HEAD"), "ref: refs/heads/dev")
+        self.assertEqual(self.read(bob, "d"), b"d\n")
+
+    def test_clone_into_nonempty_dir_refused(self):
+        os.makedirs(os.path.join(self.tmp, "busy"))
+        with open(os.path.join(self.tmp, "busy", "f"), "wb") as fh:
+            fh.write(b"x")
+        with self.assertRaises(errors.MinigitError) as cm:
+            self.clone("alice", "busy")
+        self.assertIn("destination 'busy' already exists and is not empty", str(cm.exception))
+
+    def test_clone_into_existing_empty_dir(self):
+        os.makedirs(os.path.join(self.tmp, "empty"))
+        repo, _ = self.clone("alice", "empty")
+        self.assertTrue(os.path.isdir(os.path.join(self.tmp, "empty", ".minigit")))
+
+    def test_failed_clone_removes_directory(self):
+        self.alice_with_commit()
+        with mock.patch.object(R, "_fetch_with", side_effect=errors.ObjectError("missing object x")):
+            with self.assertRaises(errors.ObjectError):
+                self.clone("bob")
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "bob")))
+        os.makedirs(os.path.join(self.tmp, "keep"))
+        with mock.patch.object(R, "_fetch_with", side_effect=errors.ObjectError("missing object x")):
+            with self.assertRaises(errors.ObjectError):
+                self.clone("bob", "keep")
+        self.assertEqual(os.listdir(os.path.join(self.tmp, "keep")), [])
+
+    def test_clone_unknown_repo_and_bad_auth(self):
+        with self.assertRaises(errors.RemoteError) as cm:
+            self.clone("alice", "nope", url=self.base + "/nope")
+        self.assertEqual(cm.exception.status, 404)
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "nope")))
+        with self.as_user("alice", token="wrong"):
+            with self.assertRaises(errors.AuthError) as cm:
+                R.clone(self.url, "bad", self.tmp)
+        self.assertIn("authentication failed", str(cm.exception))
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "bad")))
+        with self.assertRaises(errors.AuthError):  # no credentials at all
+            R.clone(self.url, "anon", self.tmp)
+
+    def test_login_then_clone(self):
+        R.login(self.url, "bob", self.tokens["bob"])
+        repo, _ = R.clone(self.url, "viafile", self.tmp)
+        self.assertIsNotNone(repo)
+
+    def test_list_repos(self):
+        with self.as_user("alice"):
+            self.assertEqual(T.HttpRemote(self.url).list_repos(), ["proj"])
+
+
+class PushFetchTests(LiveServerCase):
+    def test_push_new_branch_with_upstream(self):
+        alice, _ = self.clone("alice")
+        sha = self.commit(alice, {"a": b"a\n"}, "a")
+        lines = self.push("alice", alice, set_upstream=True)
+        self.assertEqual(lines, [f"To {self.url}", " * [new branch]      main -> main",
+                                 "branch 'main' set up to track 'origin/main'."])
+        self.assertEqual(self.server_ref(), sha)
+        self.assertEqual(alice.refs.resolve("refs/remotes/origin/main"), sha)
+        self.assertEqual(alice.config.get("branch.main.merge"), "refs/heads/main")
+        self.assertEqual(self.push("alice", alice), ["Everything up-to-date"])
+
+    def test_push_fast_forward_line(self):
+        alice, first = self.alice_with_commit()
+        second = self.commit(alice, {"a.txt": b"changed\n"}, "second")
+        lines = self.push("alice", alice)
+        self.assertEqual(lines, [f"To {self.url}", f"   {first[:7]}..{second[:7]}  main -> main"])
+        self.assertEqual(self.server_ref(), second)
+
+    def test_only_missing_objects_are_sent(self):
+        alice, _ = self.alice_with_commit({"a.txt": b"a\n", "b.txt": b"b\n", "dir/c.txt": b"c\n"})
+        bob, _ = self.clone("bob")
+        self.commit(alice, {"dir/c.txt": b"c2\n"}, "change c")
+        sent = []
+        orig_push = T.HttpRemote.push
+
+        def spy_push(rem, updates, data, *, force=False):
+            sent.append(data)
+            return orig_push(rem, updates, data, force=force)
+
+        with mock.patch.object(T.HttpRemote, "push", spy_push):
+            self.push("alice", alice)
+        # commit + root tree + dir tree + new blob
+        self.assertEqual(pack.pack_count(sent[0]), 4)
+
+        received = []
+        orig_fetch = T.HttpRemote.fetch_pack
+
+        def spy_fetch(rem, wants, haves):
+            data = orig_fetch(rem, wants, haves)
+            received.append((wants, haves, data))
+            return data
+
+        with mock.patch.object(T.HttpRemote, "fetch_pack", spy_fetch):
+            changes = self.fetch("bob", bob)
+            self.assertEqual(len(received), 1)
+            self.assertEqual(pack.pack_count(received[0][2]), 4)
+            self.assertIn(bob.head_commit(), received[0][1])
+            self.assertEqual([c.kind for c in changes], ["updated"])
+            # a second fetch has nothing to want: no fetch request at all
+            changes = self.fetch("bob", bob)
+            self.assertEqual(len(received), 1)
+            self.assertEqual([c.kind for c in changes], ["up-to-date"])
+            self.assertEqual(R.format_fetch(self.url, changes), "")
+
+    def test_fetch_new_updated_deleted_branches(self):
+        alice, first = self.alice_with_commit()
+        bob, _ = self.clone("bob")
+        self.push("alice", alice, None, "main:feature")
+        second = self.commit(alice, {"a.txt": b"2\n"}, "two")
+        self.push("alice", alice)
+        changes = self.fetch("bob", bob)
+        self.assertEqual(R.format_fetch(self.url, changes).split("\n"), [
+            f"From {self.url}",
+            " * [new branch]      feature -> origin/feature",
+            f"   {first[:7]}..{second[:7]}  main -> origin/main",
+        ])
+        self.assertEqual(bob.refs.resolve("refs/remotes/origin/feature"), first)
+        lines = self.push("alice", alice, None, "feature", delete=True)
+        self.assertEqual(lines, [f"To {self.url}", " - [deleted]         feature"])
+        self.assertIsNone(self.server_ref("refs/heads/feature"))
+        self.assertIsNone(alice.refs.resolve("refs/remotes/origin/feature"))
+        changes = self.fetch("bob", bob)
+        self.assertEqual([(c.ref, c.kind) for c in changes],
+                         [("refs/remotes/origin/main", "up-to-date"),
+                          ("refs/remotes/origin/feature", "deleted")])
+        self.assertIsNone(bob.refs.resolve("refs/remotes/origin/feature"))
+
+    def test_delete_default_branch_rejected(self):
+        alice, sha = self.alice_with_commit()
+        with self.assertRaises(errors.PushRejectedError) as cm:
+            self.push("alice", alice, None, "main", delete=True)
+        self.assertEqual(cm.exception.results[0]["reason"], "delete-default-branch")
+        self.assertIn("[rejected]", R.format_push_rejection(cm.exception))
+        self.assertEqual(self.server_ref(), sha)
+
+    def test_delete_missing_remote_branch(self):
+        alice, _ = self.alice_with_commit()
+        with self.assertRaises(errors.MinigitError):
+            self.push("alice", alice, None, "ghost", delete=True)
+
+    def test_non_ff_rejection_fetch_first_then_non_ff(self):
+        alice, base = self.alice_with_commit()
+        bob, _ = self.clone("bob")
+        bob_sha = self.commit(bob, {"bob.txt": b"bob\n"}, "bob work")
+        self.push("bob", bob)
+        self.commit(alice, {"alice.txt": b"alice\n"}, "alice work")
+        with self.assertRaises(errors.PushRejectedError) as cm:
+            self.push("alice", alice)
+        text = R.format_push_rejection(cm.exception, "main", "main")
+        self.assertIn(" ! [rejected]        main -> main (fetch first)", text)
+        self.assertIn("pull first", text)
+        self.assertEqual(R.format_push_rejection(cm.exception), text)  # src/dst attached by push
+        self.assertEqual(self.server_ref(), bob_sha)
+        # after a fetch (but no merge) the local pre-check says non-fast-forward
+        self.fetch("alice", alice)
+        with self.assertRaises(errors.PushRejectedError) as cm:
+            self.push("alice", alice)
+        text = R.format_push_rejection(cm.exception, "main", "main")
+        self.assertIn("(non-fast-forward)", text)
+        self.assertIn("hint: Run 'minigit pull' first, then push again (pull first).", text)
+        self.assertEqual(self.server_ref(), bob_sha)
+        self.assertEqual(alice.refs.resolve("refs/remotes/origin/main"), bob_sha)
+        self.assertNotEqual(base, bob_sha)
+
+    def test_server_side_stale_rejection(self):
+        alice, _ = self.alice_with_commit()
+        bob, _ = self.clone("bob")
+        self.commit(alice, {"a.txt": b"alice\n"}, "alice 2")
+        bob_sha = self.commit(bob, {"b.txt": b"bob\n"}, "bob 2")
+        orig_info = T.HttpRemote.info_refs
+        raced = []
+
+        def racing_info_refs(rem):
+            info = orig_info(rem)
+            if not raced:  # bob sneaks in between alice's info/refs and her push
+                raced.append(True)
+                self.push("bob", bob)
+            return info
+
+        with mock.patch.object(T.HttpRemote, "info_refs", racing_info_refs):
+            with self.assertRaises(errors.PushRejectedError) as cm:
+                self.push("alice", alice)
+        self.assertEqual(cm.exception.results[0]["reason"], "stale")
+        text = R.format_push_rejection(cm.exception)
+        self.assertIn("main -> main (stale info)", text)
+        self.assertIn("pull first", text)
+        self.assertEqual(self.server_ref(), bob_sha)
+
+    def test_force_disabled(self):
+        alice, first = self.alice_with_commit()
+        self.commit(alice, {"a.txt": b"2\n"}, "two")
+        self.push("alice", alice)
+        alice.refs.update_head(first)  # rewrite history: drop "two"
+        self.commit(alice, {"a.txt": b"3\n"}, "three")
+        with self.assertRaises(errors.PushRejectedError) as cm:
+            self.push("alice", alice, force=True)
+        self.assertEqual(cm.exception.results[0]["reason"], "force-disabled")
+        self.assertIn("pull first", R.format_push_rejection(cm.exception))
+
+    def test_detached_head_needs_refspec(self):
+        alice, sha = self.alice_with_commit()
+        alice.refs.set_detached_head(sha)
+        with self.assertRaises(errors.MinigitError):
+            self.push("alice", alice)
+        lines = self.push("alice", alice, "origin", "HEAD:topic")
+        self.assertEqual(lines, [f"To {self.url}", " * [new branch]      HEAD -> topic"])
+        self.assertEqual(self.server_ref("refs/heads/topic"), sha)
+
+    def test_push_unborn_branch_is_an_error(self):
+        alice, _ = self.clone("alice")
+        with self.assertRaises(errors.MinigitError) as cm:
+            self.push("alice", alice)
+        self.assertIn("does not match any commit", str(cm.exception))
+
+    def test_read_only_user_permission_denied(self):
+        self.alice_with_commit()
+        reader, _ = self.clone("reader")
+        self.commit(reader, {"r": b"r\n"}, "reader")
+        with self.assertRaises(errors.PermissionDeniedError) as cm:
+            self.push("reader", reader)
+        self.assertTrue(str(cm.exception).startswith("permission denied"))
+
+    def test_unknown_remote(self):
+        alice, _ = self.clone("alice")
+        with self.assertRaises(errors.MinigitError) as cm:
+            self.fetch("alice", alice, "upstream")
+        self.assertEqual(str(cm.exception), "no remote 'upstream' configured")
+
+
+class ForcePushTests(LiveServerCase):
+    allow_force = True
+
+    def test_forced_update_lines(self):
+        alice, first = self.alice_with_commit()
+        bob, _ = self.clone("bob")
+        two = self.commit(alice, {"a.txt": b"2\n"}, "two")
+        self.push("alice", alice)
+        self.fetch("bob", bob)
+        alice.refs.update_head(first)
+        three = self.commit(alice, {"a.txt": b"3\n"}, "three")
+        lines = self.push("alice", alice, force=True)
+        self.assertEqual(lines[1], f" + {two[:7]}...{three[:7]} main -> main (forced update)")
+        self.assertEqual(self.server_ref(), three)
+        changes = self.fetch("bob", bob)
+        self.assertEqual(R.format_fetch(self.url, changes).split("\n")[1],
+                         f" + {two[:7]}...{three[:7]} main -> origin/main (forced update)")
+
+
+class PullTests(LiveServerCase):
+    def test_pull_fast_forward(self):
+        alice, _ = self.alice_with_commit()
+        bob, _ = self.clone("bob")
+        new = self.commit(alice, {"a.txt": b"updated\n", "new.txt": b"n\n"}, "update")
+        self.push("alice", alice)
+        changes, outcome = self.pull("bob", bob)
+        self.assertEqual([c.kind for c in changes], ["updated"])
+        self.assertEqual(outcome.kind, "fast-forward")
+        self.assertEqual(bob.head_commit(), new)
+        self.assertEqual(self.read(bob, "a.txt"), b"updated\n")
+        self.assertEqual(self.read(bob, "new.txt"), b"n\n")
+        _, outcome = self.pull("bob", bob)
+        self.assertEqual(outcome.kind, "up-to-date")
+
+    def test_pull_merge_then_push_converges(self):
+        alice, _ = self.alice_with_commit()
+        bob, _ = self.clone("bob")
+        self.commit(bob, {"bob.txt": b"bob\n"}, "bob")
+        self.push("bob", bob)
+        self.commit(alice, {"alice.txt": b"alice\n"}, "alice")
+        with self.assertRaises(errors.PushRejectedError):
+            self.push("alice", alice)
+        _, outcome = self.pull("alice", alice)
+        self.assertEqual(outcome.kind, "merged")
+        merge_commit = alice.read_commit(alice.head_commit())
+        self.assertEqual(len(merge_commit.parents), 2)
+        self.assertEqual(merge_commit.message, f"Merge branch 'main' of {self.url}\n")
+        self.assertEqual(self.read(alice, "bob.txt"), b"bob\n")
+        self.push("alice", alice)
+        _, outcome = self.pull("bob", bob)
+        self.assertEqual(outcome.kind, "fast-forward")
+        self.assertEqual(bob.head_commit(), alice.head_commit())
+        self.assertEqual(self.server_ref(), alice.head_commit())
+
+    def test_pull_conflict_writes_markers(self):
+        alice, _ = self.alice_with_commit({"f.txt": b"line\n"})
+        bob, _ = self.clone("bob")
+        self.commit(bob, {"f.txt": b"bob\n"}, "bob")
+        self.push("bob", bob)
+        self.commit(alice, {"f.txt": b"alice\n"}, "alice")
+        _, outcome = self.pull("alice", alice)
+        self.assertEqual(outcome.kind, "conflict")
+        self.assertEqual(outcome.conflicts, ["f.txt"])
+        content = self.read(alice, "f.txt")
+        self.assertIn(b"<<<<<<< HEAD\nalice\n=======\nbob\n>>>>>>> origin/main", content)
+        self.assertIsNotNone(alice.merge_head())
+
+    def test_pull_without_upstream(self):
+        alice, sha = self.alice_with_commit()
+        alice.refs.update("refs/heads/feature", sha, expected=None)
+        alice.refs.set_symbolic_head("refs/heads/feature")
+        with self.assertRaises(errors.MinigitError) as cm:
+            self.pull("alice", alice)
+        self.assertEqual(str(cm.exception), "no upstream 'origin/feature' (push with -u first)")
+
+    def test_pull_into_empty_clone(self):
+        bob, _ = self.clone("bob")
+        _, sha = self.alice_with_commit()
+        _, outcome = self.pull("bob", bob)
+        self.assertEqual(outcome.kind, "fast-forward")
+        self.assertEqual(bob.head_commit(), sha)
+        self.assertEqual(self.read(bob, "a.txt"), b"alpha\n")
+
+
+class RemoteConfigTests(_EnvCase):
+    def test_add_list_remove(self):
+        repo, _ = Repository.init(os.path.join(self.tmp, "r"))
+        R.remote_add(repo, "origin", "http://alice:TOK@127.0.0.1:1/proj/")
+        # the stored URL keeps the user name (never the token) so a clone remembers who it acts as
+        self.assertEqual(R.remote_list(repo), {"origin": "http://alice@127.0.0.1:1/proj"})
+        self.assertEqual(R.remote_url(repo, "origin"), "http://alice@127.0.0.1:1/proj")
+        self.assertEqual(T.load_credentials("http://127.0.0.1:1/proj"), ("alice", "TOK"))
+        with self.assertRaises(errors.MinigitError):
+            R.remote_add(repo, "origin", "http://127.0.0.1:1/other")
+        with self.assertRaises(errors.MinigitError):
+            R.remote_add(repo, "bad name", "http://127.0.0.1:1/other")
+        with self.assertRaises(errors.MinigitError):
+            R.remote_add(repo, "up", "ftp://127.0.0.1/other")
+        sha = repo.objects.write("blob", b"x")  # any object; tracking refs only store a sha
+        repo.refs.update("refs/remotes/origin/main", sha)
+        repo.config.set("branch.main.remote", "origin")
+        repo.config.set("branch.main.merge", "refs/heads/main")
+        R.remote_remove(repo, "origin")
+        self.assertEqual(R.remote_list(repo), {})
+        self.assertEqual(repo.refs.list("refs/remotes/"), {})
+        self.assertIsNone(repo.config.get("branch.main.remote"))
+        with self.assertRaises(errors.MinigitError) as cm:
+            R.remote_remove(repo, "origin")
+        self.assertEqual(str(cm.exception), "no remote 'origin' configured")
+
+
+if __name__ == "__main__":
+    unittest.main()

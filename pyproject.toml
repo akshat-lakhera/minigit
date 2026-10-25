@@ -1,0 +1,19 @@
+# Optional: "pip install ." puts a "minigit" command on PATH. Nothing needs to be
+# installed to use minigit from the checkout ("python -m minigit" or bin/minigit).
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "minigit"
+version = "0.1.0"
+description = "A small but really working git clone with a multi-user HTTP server (standard library only)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+minigit = "minigit.cli:main"
+
+[tool.setuptools]
+packages = ["minigit"]

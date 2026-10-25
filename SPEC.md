@@ -1,0 +1,993 @@
+# minigit SPEC (v1, the contract for every builder)
+
+Python 3.11, standard library only. Must run on Windows and Linux. Run with `python -m minigit <cmd>`, or with `bin/minigit` (POSIX) or `bin\minigit.cmd` (Windows).
+Tests are run from `E:\ideas\minigit` with `python -m unittest discover -s tests -t .`
+
+## 0. Judging summary (short)
+
+| Criterion | A (correctness-first) | B (collaboration-first) |
+|---|---|---|
+| Correctness | 9: git index v2, Myers diff, recursive merge | 8: git objects, difflib + bzr merge3 |
+| Simplicity | 5: a lot of git machinery | 8 |
+| Parallel buildability | 6 | 9: frozen signatures, only the CLI prints |
+| Multi-user safety | 8: quarantine, CAS | 9: invariants I1-I4, ACLs, ready-file |
+
+**Synthesis.** The base is B. These pieces come from A: the `merge --abort` rule "index differs from HEAD" (no `MERGE_PATHS` file), the printed `Serving` line next to the ready-file, the stricter hint text, and the remote-tracking update on push. B pieces that were dropped: `ProcessLock`, the `--tls` flags, and audit-log assertions (`audit.log` is still written).
+
+**Global rules for all builders**
+- All paths passed between modules are `str`. The library never calls `os.chdir`. Every user path is resolved against an explicit `cwd` argument.
+- **Only `cli.py` prints.** Library functions return data or message strings and raise `MinigitError` subclasses.
+- **All file content I/O is binary.** There is no newline conversion anywhere. Repo-relative paths are POSIX strings (`a/b.txt`), encoded with `utf-8`/`surrogateescape`.
+- An `Entry` is `tuple[str, str]` = `(mode, sha)`. Modes are the strings `"100644"`, `"100755"` and `"40000"`. A `FlatTree` is `dict[str, Entry]` and holds files only.
+- `ANY = object()` is a sentinel defined in `refs.py`. It means "do not check".
+- Exit codes:
+  - 0: success. This includes "Already up to date." and "Everything up-to-date".
+  - 1: any `MinigitError`. This covers refusals, conflicts, rejected pushes and "nothing to commit".
+  - 2: usage error.
+- Environment variables:
+  - `MINIGIT_GLOBAL_CONFIG`: global config path. Default `~/.minigitconfig`.
+  - `MINIGIT_CREDENTIALS`: credentials file. Default `~/.minigit-credentials.json`.
+  - `MINIGIT_USER`, `MINIGIT_TOKEN`: credentials for a single call.
+  - `MINIGIT_AUTHOR_NAME`, `MINIGIT_AUTHOR_EMAIL`, `MINIGIT_AUTHOR_DATE` (`"<unix> <+hhmm>"`): identity overrides.
+  - `MINIGIT_DEBUG=1`: print tracebacks.
+
+---
+
+## 1. On-disk layout
+
+```
+<worktree>/
+  .minigitignore
+  .minigit/
+    HEAD            "ref: refs/heads/main\n" (attached) | "<40hex>\n" (detached)
+    config          INI (section 1.2)
+    index           binary (section 3); absent = empty index
+    objects/ab/<38 hex>       loose zlib objects
+    refs/heads/<branch>       "<40hex>\n"
+    refs/remotes/<remote>/<branch>
+    ORIG_HEAD       "<40hex>\n"  written by merge/reset/pull
+    MERGE_HEAD      "<40hex>\n"  present only while a conflicted merge is open
+    MERGE_MSG       default message for the merge commit
+    *.lock          short-lived lock files (O_EXCL)
+```
+- A **bare repo** is the gitdir itself: `HEAD`, `config` (with `core.bare = true`), `objects/` and `refs/`. It has no index and no worktree.
+- **Discovery:** walk up from `cwd` until a directory contains `.minigit/`. A directory that contains `HEAD`, `objects/` and a `config` with `bare = true` opens as bare. Otherwise raise `NotARepositoryError("not a minigit repository (or any parent): <cwd>")`.
+
+**Server root:**
+```
+ROOT/
+  server.json     users + repo ACLs (section 7.1)
+  audit.log       append-only lines: "<unix> <user> <repo> <ref> <old|-> <new|-> <ok|reason>\n"
+  repos/<name>/   bare repos
+```
+
+### 1.2 Config file format
+The format is git-style INI with a hand-written parser (do not use `configparser`):
+- Section lines are `[core]` or `[remote "origin"]`.
+- Entry lines are `\tkey = value`.
+- Lines starting with `#` or `;` are comments.
+- Keys are case-insensitive, and are stored lowercased.
+
+The key `remote.origin.url` maps to section `remote`, subsection `origin`, key `url`. It is split at the first dot and the last dot. `user.name` has no subsection.
+
+Known keys:
+- `core.bare`
+- `user.name`, `user.email`
+- `remote.<n>.url`
+- `branch.<b>.remote`, `branch.<b>.merge` (for example `refs/heads/main`)
+
+Lookup order: the repo `config` first, then the global config. The `MINIGIT_AUTHOR_*` variables beat both for identity. Writes are atomic (`util.atomic_write`).
+
+---
+
+## 2. Objects (git-identical)
+
+- `sha = sha1(b"<type> <len>\0" + content).hexdigest()`.
+- The file `objects/sha[:2]/sha[2:]` holds `zlib.compress(header + content)`.
+- **Write** is idempotent. If the object exists, return. Otherwise write `objects/xx/tmp-<pid>-<rand>`, run `fsync`, then call `replace_with_retry`. If a `PermissionError` remains and the destination exists, unlink the tmp file and return.
+- **Read** decompresses with a 64 MiB cap, checks the header and the length, and re-hashes. A mismatch raises `ObjectError`.
+- **Fixtures:**
+  - empty blob: `e69de29bb2d1d6434b8b29ae775ad8c2e48c5391`
+  - `b"hello\n"`: `ce013625030ba8dba906f756967f9e9ca394464a`
+  - empty tree: `4b825dc642cb6eb9a060e54bf8d69288fbee4904`
+- **blob:** raw bytes.
+- **tree:** repeated `b"<mode> <name>\0" + 20-byte binary sha`.
+  - Entries are sorted by key `name.encode() + (b"/" if mode == "40000" else b"")`.
+  - Names are validated on both serialize and parse. Rejected names: `""`, `.`, `..`, `.minigit` in any case, and any name containing `/`, `\` or NUL. Violations raise `ObjectError`.
+  - *(Integration)* Also rejected on every platform, so a tree pushed from Linux is always safe to check out on Windows: names containing `:` (a `C:` component makes `os.path.join` leave the worktree; `a:b` is an NTFS stream) and Windows aliases of the gitdir (`.minigit` followed by dots/spaces, the 8.3 name `MINIGI~N`).
+- **commit:** UTF-8 text.
+  ```
+  tree <sha>\n
+  parent <sha>\n          (0..n)
+  author <name> <<email>> <unix> <+hhmm>\n
+  committer <same format>\n
+  \n
+  <message>               (always ends with exactly one "\n")
+  ```
+- Out of scope: tag objects, symlinks (symlinked files are read as regular files; symlinked dirs are skipped), packs with deltas, gc.
+
+---
+
+## 3. Index (binary)
+
+```
+header : struct ">4sII"  b"MIDX", version=1, count
+entry  : struct ">I20sQQBH"  mode(int 0o100644|0o100755), sha(20B), size, mtime_ns, stage(0..3), path_len
+         then path_len bytes (path utf-8/surrogateescape)
+trailer: 20B sha1 over all preceding bytes
+```
+- Entries are sorted by `(path, stage)`.
+  - Stage 0 is a normal entry.
+  - Stages 1, 2 and 3 hold base, ours and theirs for a conflicted path.
+- `put(stage 0 entry)` removes stages 1-3 of that path.
+- A bad magic, version, length or trailer raises `MinigitError("index file is corrupt; run 'minigit reset' to rebuild it from HEAD")`.
+- **Stat cache:** an entry is clean without hashing when `size == st_size`, `mtime_ns == st_mtime_ns`, and the entry is not racy.
+  - Racy means `entry.mtime_ns == 0` or `entry.mtime_ns + 2_000_000_000 >= index.file_mtime_ns`.
+  - `file_mtime_ns` is the index file's own mtime when it was loaded, or 0 if there was no file.
+- **Mutation:** every command that changes the index holds `index.lock` (via `index.locked_index`). It loads, mutates, writes the lock and replaces. `status` only reads the index.
+
+---
+
+## 4. Refs, locks, atomicity
+
+- **`LockFile(path, timeout)`:**
+  - Creates `path + ".lock"` with `os.O_CREAT|os.O_EXCL|os.O_WRONLY|getattr(os, "O_BINARY", 0)`.
+  - Polls every 25 ms until `timeout`. On failure: `LockError("unable to lock '<path>': <name>.lock exists. If no other minigit process is running, delete it.")`.
+  - *(Integration)* On Windows, `O_EXCL` fails with `PermissionError` while the previous holder's lock file is still being deleted or renamed. That is retried for up to `max(timeout, 1 s)` instead of failing at once.
+  - `commit()` runs `fsync`, `close`, then `replace_with_retry(lock, path)`.
+  - `__exit__` without a commit deletes the lock file.
+- **`replace_with_retry`:** 40 attempts, 25 ms apart, retrying on `PermissionError` (on Windows, readers briefly block the replace).
+- **Ref names** (`check_ref_name`) must start with `refs/` or equal `HEAD`. Rejected:
+  - an empty component
+  - a component starting with `.` or ending with `.lock`
+  - `..`, `//`, `@{`
+  - control characters and space
+  - any of `~^:?*[\`
+  - a trailing `/`
+- **`RefStore.update(name, new, expected=ANY, timeout=0.0)` is a compare-and-swap:**
+  1. Lock `<ref>.lock`.
+  2. Read the current value.
+  3. If `expected is not ANY` and `current != expected`, raise `RefUpdateError`. `expected=None` means the ref must not exist.
+  4. `new=None` deletes the ref and prunes empty parent directories up to `refs/heads` or `refs/remotes/<r>`.
+  5. Otherwise write `new + "\n"` and commit.
+  - A file/dir clash (`refs/heads/a` exists while creating `refs/heads/a/b`, or the reverse) raises `RefUpdateError`.
+- **HEAD:** `update_head(new, expected)` updates the branch that HEAD points to (an unborn branch is allowed), or HEAD itself when detached.
+
+---
+
+## 5. Revision syntax (`revparse`)
+
+- **Base names:**
+  - `HEAD`, `@`, `ORIG_HEAD`, `MERGE_HEAD`
+  - a full 40-hex sha
+  - a name, looked up in this order: `refs/<n>` if it starts with `refs/`, then `refs/heads/<n>`, then `refs/remotes/<n>`
+  - a hex prefix of at least 4 characters, resolved by listing `objects/xx/`
+- **Suffixes**, applied left to right: `~N`, `^` (= `^1`), `^N`.
+- `rev:path` resolves to a blob or tree (used by show and cat-file). `A..B` is handled only by `diff`.
+- **Errors** (all `RevisionError`):
+  - `unknown revision 'x'`
+  - `ambiguous short id 'abcd' (matches N objects)`
+  - `'<x>' is not a commit`
+  - `path 'p' does not exist in '<rev>'`
+
+---
+
+## 6. Local command semantics
+
+Notation:
+- `H` = the HEAD flat tree (`{}` if unborn).
+- `I` = the stage-0 index flat.
+- `U` = unmerged paths.
+- `W(p)` = `worktree.worktree_entry`, or `None` if missing.
+- **Mode from stat:** on Windows (`os.name == "nt"`), use the previous index or HEAD mode, else `"100644"`. On POSIX, `"100755"` if `st_mode & 0o111`, else `"100644"`.
+
+### Ignore (`.minigitignore`, root and nested)
+- Blank lines and `#` lines are skipped. `!` negates. A trailing `/` means directories only.
+- A leading `/`, or any inner `/`, anchors the pattern to the ignore file's directory. With no `/`, the pattern matches the basename at any depth.
+- `**` is supported. `*`, `?` and `[...]` do not match `/`.
+- The last match wins. Ignored directories are not descended.
+- `.minigit` is always ignored. Tracked files are never treated as ignored.
+
+### init
+- `init [--bare] [-b B] [dir]` creates the layout and sets `HEAD = ref: refs/heads/B` (default `main`).
+- On an existing repo it changes nothing and reports reinit.
+
+### add `<pathspec>... [-f]`
+- **Directory, or `.`:** stage every non-ignored file under it, and remove index entries under it whose files are gone.
+- **File:** stage it. A stage-0 entry also clears conflict stages.
+- **Missing but tracked:** remove it from the index.
+- **Explicitly named ignored file** without `-f`: `MinigitError("path 'p' is ignored by .minigitignore (use -f)")`.
+- **No match:** `pathspec 'x' did not match any files`.
+- The whole command is all-or-nothing: the index is written once.
+
+### rm `[--cached] [-r] [-f] <paths>`
+- Every path must be tracked, and a directory needs `-r`.
+- Without `-f`: refuse if `W != I` or `I != H` with `'p' has staged or local changes (use -f)`. With `--cached`, refuse only when `I` matches neither `H` nor `W`.
+- Remove the index entry. Without `--cached`, also delete the file and prune empty directories.
+
+### status
+- **XY per path:**
+  - Unmerged: stages {1,2,3}=`UU`, {2,3}=`AA`, {1,2}=`UD`, {1,3}=`DU`, {2}=`AU`, {3}=`UA`.
+  - **X** (I vs H): `A`, `D`, `M`, or space.
+  - **Y** (W vs I): `D` (missing), `M`, or space.
+  - Untracked: `??`, listed as individual files (no directory collapsing).
+  - A staged deletion whose file is still on disk shows both `D ` and `??`.
+- **Porcelain:** one `XY path` line per path, sorted by path.
+- **Long format:**
+  ```
+  On branch main            | HEAD detached at abc1234
+  No commits yet            (only when unborn, after a blank line)
+  Your branch is ahead of 'origin/main' by N commit(s).   | behind ... by M commit(s), and can be fast-forwarded. | have diverged, N and M ... | up to date with 'origin/main'.
+  You have unmerged paths.  | All conflicts fixed but you are still merging.   (when MERGE_HEAD)
+
+  Changes to be committed:
+  \tnew file:   p | \tmodified:   p | \tdeleted:    p
+
+  Unmerged paths:
+  \tboth modified:   p | both added: | deleted by us: | deleted by them: | added by us: | added by them:
+
+  Changes not staged for commit:
+  \tmodified:   p | \tdeleted:    p
+
+  Untracked files:
+  \tp
+
+  nothing to commit, working tree clean     (only if all sections are empty)
+  ```
+
+### diff
+- **Forms:**
+
+  | Invocation | old | new |
+  |---|---|---|
+  | `diff` | I | W (tracked paths) |
+  | `diff --staged` / `--cached` | H | I |
+  | `diff <rev>` | rev | W over `rev ∪ I` |
+  | `diff <a> <b>` / `diff a..b` | a | b |
+
+  `-- <paths>` filters by prefix (`p == s` or `p.startswith(s + "/")`).
+- **Per changed file:**
+  ```
+  diff --git a/p b/p
+  new file mode 100644 | deleted file mode 100644 | old mode 100644\nnew mode 100755
+  index <old7>..<new7>[ <mode>]   (0000000 for absent; " <mode>" only when both modes are equal)
+  --- a/p | --- /dev/null
+  +++ b/p | +++ /dev/null
+  @@ -s[,l] +s[,l] @@
+  ```
+  - Hunks come from `difflib.SequenceMatcher(None, a, b, autojunk=False).get_grouped_opcodes(3)` over `split_lines` (`keepends`, split on `\n`).
+  - Range rules: `,l` is omitted when `l == 1`. When `l == 0`, `start = i1` (else `i1 + 1`).
+  - A line without a final `\n` is followed by `\n\\ No newline at end of file\n`.
+  - A NUL byte in the first 8000 bytes of either side prints `Binary files a/p and b/p differ`, after the header lines and with no `---`/`+++` lines.
+  - A mode-only change prints the header only.
+  - An unmerged path prints `* Unmerged path p`.
+
+### commit `-m M [-m M2...] [-a] [--allow-empty]`
+1. Hold the index lock. With `-a`, re-stage tracked files that were modified or deleted.
+2. If `U` is non-empty: `cannot commit: unresolved conflicts in: a, b`.
+3. `tree = build_tree(I)`. The parents are `[head]` (or none), plus `MERGE_HEAD` if it exists.
+4. Without a merge and without `--allow-empty`, if tree == parent tree (or the empty tree when unborn): `NothingToCommit("nothing to commit, working tree clean")`.
+5. The message is the `-m` values joined with `"\n\n"`. Otherwise use `MERGE_MSG` with lines starting with `#` dropped. Otherwise: `UsageError("commit message required: use -m")`.
+6. Normalize the message: `rstrip()` + `"\n"`. An empty message gives `aborting commit due to empty commit message`.
+7. Write the object, then `update_head(new, expected=head)`. Remove `MERGE_HEAD` and `MERGE_MSG`.
+8. Return `[main (root-commit) abc1234] subject` or `[main abc1234] subject` (`[detached HEAD abc1234]` when detached).
+- **Identity:** `MINIGIT_AUTHOR_NAME`/`_EMAIL`, else `user.name`/`user.email`. If missing: `please set your identity: minigit config --global user.name "You"; minigit config --global user.email you@example.com`. The time is `MINIGIT_AUTHOR_DATE` or now, with the local tz offset. The committer equals the author.
+
+### log `[--oneline] [-n N] [--all] [rev...]`
+- Topological order with committer time as the tie-breaker. This is Kahn's algorithm over the reachable set, using a heap keyed `(-committer_ts, insertion_seq)`. A parent is never printed before its children.
+- Decorations: `(HEAD -> main, origin/main, feature)`, or `(HEAD, main)` when detached.
+- **Full format:**
+  ```
+  commit <sha>[ (decor)]
+  Merge: <p1_7> <p2_7>          (merge commits only)
+  Author: Name <email>
+  Date:   Tue Oct 20 09:05:03 2026 +0530
+
+      message lines indented 4 spaces
+
+  ```
+  There is a blank line between commits.
+- **`--oneline`:** `<sha7>[ (decor)] <subject>`.
+- An unborn HEAD gives `your current branch 'main' does not have any commits yet`.
+
+### show `[spec]`
+- **Commit:** the log full header, then the diff against the first parent (or the empty tree). A merge commit shows the header only.
+- **Blob:** raw bytes.
+- **Tree:** `<mode> <type> <sha>\t<name>` lines.
+
+### branch
+- **List:** `* main` or `  feature`, sorted. `-v` appends ` <sha7> <subject>`. `-r` lists `origin/x`; `-a` lists both.
+- **`branch N [START]`:** `update(ref, sha, expected=None)`. If it exists: `a branch named 'N' already exists`.
+- **`-d N`:**
+  - Refuse the current branch: `cannot delete the branch 'N' you are on`.
+  - Refuse a branch not merged into HEAD (or its upstream tracking ref): `the branch 'N' is not fully merged (use -D)`.
+- `-D` forces the delete.
+
+### switch / checkout
+- **Forms:**
+  - `switch B`
+  - `switch -c B [START]` / `checkout -b B [START]`
+  - `switch --detach REV`
+  - `checkout REV`: a non-branch REV detaches HEAD and returns a "HEAD is now at ..." note.
+  - `checkout [REV] -- paths`: same as `restore` (worktree from the index, or with REV, both from REV).
+- **DWIM:** if no local `B` exists and exactly one `refs/remotes/*/B` does, create `B` there, set the upstream, and switch.
+- **Preconditions:** while `MERGE_HEAD` exists: `merge in progress; commit or run 'minigit merge --abort'`. `switch -c B` with no start point only changes HEAD's target, which works on an unborn HEAD.
+- **`checkout_tree(repo, index, old, new, force=False)`:**
+  1. **Plan.** For each `p` with `old.get(p) != new.get(p)`:
+     - A path in `U` is a conflict.
+     - `i = I.get(p)`. The index is OK if `i == old.get(p)` or `i == new.get(p)`.
+     - The worktree is OK if `W(p) == i` when `i` exists. When `i` does not exist, it is OK if `W(p) is None` or `W(p) == new.get(p)` (an untracked file in the way is refused).
+     - **Dir/file clash:** the target needs file `p` but disk has dir `p/` containing anything not tracked in `old` and removed by this switch, or the target needs `p/x` and disk has an untracked file `p`. Either is a conflict.
+  2. If any conflict was found, raise `CheckoutConflictError(paths=[...])` with the message `Your local changes to the following files would be overwritten by checkout:\n\t<p>...\nPlease commit your changes or restore them before you switch branches.` Nothing has been touched.
+  3. **Apply.** Delete first, deepest paths first (file, index entry, empty directories). Then write: makedirs, write bytes, `chmod 0o755`/`0o644` on POSIX, and `index.put(entry_with_stat)`.
+  4. The caller writes the index, then updates HEAD.
+
+### reset `[--soft|--mixed|--hard] [REV]` / `reset [REV] -- paths`
+- `target = resolve_rev(REV or HEAD)`. Write `ORIG_HEAD = old head`.
+- **soft:** `update_head(target)`. Refused while `MERGE_HEAD` exists.
+- **mixed (default):** move HEAD, then index := `flatten(target)`. Keep the old stat where `(mode, sha)` is unchanged; otherwise use `mtime_ns=0`. Remove the `MERGE_*` files.
+- **hard:** do what mixed does, then for `p` in T, write the file if `W(p) != T[p]`. For `p` in (old index paths, any stage, ∪ old H) − T, delete the file. Untracked files are never touched.
+- **Path form:** set those index entries to REV's version, or remove them if REV lacks the path. HEAD does not move.
+
+### restore `[--staged] [--worktree] [--source REV] <paths>`
+- The default is the worktree from the index.
+- `--staged`: the index from the source (default HEAD), or remove the entry when the source lacks the path.
+- With both flags, both come from the source (default HEAD).
+- A path that is in neither the source nor the index gives `pathspec 'p' did not match`.
+
+### merge-base (`graph.merge_bases`)
+1. `A* = ancestors(a)`, inclusive.
+2. BFS from `b`. A node in `A*` becomes a candidate, and its parents are not expanded.
+3. Drop candidates that are ancestors of another candidate.
+- `best_merge_base` picks the candidate with the highest committer time, breaking ties by the lowest sha. It returns `None` if the histories are unrelated.
+
+### merge `<rev> [-m M] [--no-ff]` / merge --abort
+1. **Preconditions:**
+   - No `MERGE_HEAD`: `you have not concluded your merge (MERGE_HEAD exists)`.
+   - `U` empty.
+   - `I == H`: `you have staged changes; commit them first`.
+2. **Unborn HEAD:** `checkout_tree({}, T)`, then `update_head(theirs, expected=None)`. kind is `"fast-forward"`.
+3. `is_ancestor(theirs, head)` → kind `"up-to-date"`, message `Already up to date.`
+4. **Fast-forward** when `is_ancestor(head, theirs)` and `--no-ff` is not given:
+   - Write `ORIG_HEAD`.
+   - Run `checkout_tree(H, T)`.
+   - `update_head(theirs, expected=head)`.
+   - Messages: `Updating <h7>..<t7>`, `Fast-forward`.
+5. **Three-way merge:**
+   - `base = best_merge_base`. If it is `None`: `refusing to merge unrelated histories`.
+   - `B, O, T` are the flat trees, merged with `merge.merge_trees` (rules below).
+6. **Safety, checked before writing:** for every `p` whose result (stage-0 entry or conflict worktree content) differs from `O.get(p)`, require `W(p) == O.get(p)`. Otherwise raise `CheckoutConflictError` with "...would be overwritten by merge:...".
+7. **Write:**
+   - `ORIG_HEAD = head`.
+   - Index: clean results at stage 0, conflicted paths as stages.
+   - Worktree: clean results, plus conflict contents.
+   - **No conflicts:** create a commit with parents `[head, theirs]`, then `update_head(expected=head)`. kind is `"merged"`, message `Merge made by the 'three-way' strategy.`
+   - **Conflicts:** write `MERGE_HEAD` and `MERGE_MSG` (the message plus `\n# Conflicts:\n#\t<p>` lines). kind is `"conflict"`. The messages are the CONFLICT lines plus `Automatic merge failed; fix conflicts and then commit the result.` The CLI exits 1.
+8. **Default message:**
+   - A `refs/heads/x` rev: `Merge branch 'x'`.
+   - A `refs/remotes/o/x` rev: `Merge remote-tracking branch 'o/x'`.
+   - Otherwise: `Merge commit '<rev>'`.
+   - pull passes `Merge branch 'x' of <url>`.
+9. **`merge --abort`:**
+   - Requires `MERGE_HEAD`, else `there is no merge to abort (MERGE_HEAD missing)`.
+   - For every path `p` in (all index paths, any stage) ∪ H where `p ∈ U` or `I.get(p) != H.get(p)`: restore the file and index entry from H, or delete the file and entry if `p ∉ H`.
+   - Remove `MERGE_HEAD` and `MERGE_MSG`. This is correct because of precondition `I == H`, and unrelated dirty files survive.
+
+**Tree merge rules (`merge_trees`), for each `p` in `B ∪ O ∪ T` (b, o, t are Entry or None):**
+- `o == t` → o. `b == o` → t (including deletion). `b == t` → o.
+- **Both present, not binary, contents differ:** `merge3.merge_blobs(b_data or None, o_data, t_data)`.
+  - **Mode:** if `o.mode == (b.mode if b else o.mode)`, take `t.mode`, else `o.mode`. If both changed differently, keep ours and add a warning message.
+  - **Clean:** write the blob and stage 0.
+  - **Conflict:** stages 1 (if b), 2 and 3. The worktree gets the marker content. Message `CONFLICT (content): Merge conflict in p`, or `CONFLICT (add/add): Merge conflict in p` when b is None.
+- **Modify/delete** (one side None, the other changed from b): stages 1 plus 2 or 3. The worktree keeps the surviving side's content. Message: `CONFLICT (modify/delete): p deleted in <theirs_label> and modified in HEAD.`, or the mirror form (`deleted in HEAD and modified in <theirs_label>`).
+- **Binary on either side:** stages 1 (if b), 2 and 3. The worktree keeps ours. Message `CONFLICT (binary): Merge conflict in p`.
+- **File/dir clash** (a result path is also a directory prefix of another result path): raise `MinigitError("merge conflict: 'p' is a file on one side and a directory on the other (not supported)")` before touching anything.
+
+**merge3 (bzr-style diff3 on `split_lines`):**
+1. Compute `am = SequenceMatcher(None, base, ours, autojunk=False).get_matching_blocks()`, and `bm` the same way for theirs.
+2. Intersect the matching base ranges to get the sync regions `(bs, be, os, oe, ts, te)`. Add a sentinel at the ends.
+3. Between sync regions, take the chunk `(base[ib:bs], ours[io:os], theirs[it:ts])`:
+   - ours == base → take theirs.
+   - theirs == base → take ours.
+   - ours == theirs → take ours.
+   - Otherwise it is a conflict:
+     ```
+     <<<<<<< HEAD
+     ours
+     =======
+     theirs
+     >>>>>>> <theirs_label>
+     ```
+- The marker newline is `\r\n` if ours' first line ends with `\r\n`, else `\n`.
+- If a chunk's last line lacks a newline, add one before the next marker.
+
+---
+
+## 7. Collaboration
+
+### 7.1 server.json and auth
+```json
+{"version": 1,
+ "users": {"alice": {"token_sha256": "<hex>"}},
+ "repos": {"proj": {"readers": ["*"], "writers": ["*"], "public": false, "allow_force": false}}}
+```
+- `"*"` means any authenticated user. `public: true` allows anonymous reads.
+- The file is reloaded on every request and written under `LockFile(server.json, timeout=5)` + `atomic_write`.
+- **Name rules:** user names match `^[A-Za-z0-9_.-]{1,64}$`. Repo names match `^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$` and must not contain `..`.
+- **Tokens:** `secrets.token_urlsafe(24)`, printed once. Only `sha256(token).hexdigest()` is stored, and it is compared with `hmac.compare_digest`.
+- **Transport auth:** `Authorization: Basic base64(user:token)`.
+  - Missing or bad credentials: 401 with `WWW-Authenticate: Basic realm="minigit"`.
+  - Authenticated user who may read the repo but not write to it: 403.
+  - Unknown repo, or a repo the caller may not read: the same response, so private repo names cannot be discovered. Anonymous callers get 401, signed-in callers get 404 `repository '<name>' not found`.
+  - An empty ACL list (`--readers ""`) means nobody; it is never promoted to `*`.
+- **Client credential order:**
+  1. `MINIGIT_USER` + `MINIGIT_TOKEN`.
+  2. The URL userinfo (`http://alice:TOK@host:port/proj`).
+  3. The credentials file: JSON `{"http://host:port": {"user": "...", "token": "..."}}`, keyed by `scheme://host:port`.
+- **Storing credentials:** `clone` and `remote add` strip the userinfo from the stored URL and save it to the credentials file. `minigit login URL --user U --token T` also writes it (chmod 600 on POSIX).
+
+### 7.2 HTTP protocol v1
+- **Server:** `ThreadingHTTPServer`, `daemon_threads=True`, `protocol_version = "HTTP/1.0"`. Every response sets `Content-Length`.
+- **Client:** `urllib.request` with `build_opener(ProxyHandler({}))` and a 60 s timeout. *(Integration)* Redirects are not followed (urllib would forward the `Authorization` header to the new host); a 3xx is an error.
+- Every request carries the header `X-Minigit-Protocol: 1`. A missing or other value gets 400.
+- The base URL is `http://host:port/<repo>`, and a trailing `/` is tolerated.
+- Error bodies are JSON: `{"error": "<human message>", "code": "<machine_code>"}`.
+
+| Method + path | Perm | Request | 200 response |
+|---|---|---|---|
+| `GET /` | optional | – | `{"repos": [readable names]}` |
+| `GET /<repo>/info/refs` | read | – | `{"protocol":1,"head":"refs/heads/main"\|null,"refs":{"refs/heads/main":"<sha>",...}}` |
+| `POST /<repo>/fetch` | read | JSON `{"want":[sha],"have":[sha]}` | body = pack, `Content-Type: application/x-minigit-pack` |
+| `POST /<repo>/push` | write | `application/x-minigit-push` body (below) | JSON results |
+
+In `info/refs`, `head` is the bare repo's symbolic HEAD target, even when that target is unborn. `null` means detached.
+
+Status codes:
+- 400 malformed request, bad ref name, or a want not reachable from any current server ref
+- 401, 403, 404 as above
+- 409 push rejected
+- 411 no `Content-Length`
+- 413 body larger than `max_push_bytes` (default 256 MiB)
+- 422 bad pack or missing objects
+- 503 lock timeout (30 s)
+- 500 internal error (traceback only in the server log)
+
+**Pack:**
+```
+b"MGPK" | u32be version=1 | u32be count
+count x ( 20B binary sha | u32be len | len bytes = zlib(b"<type> <size>\0" + content) )
+20B sha1 of all preceding bytes
+```
+The receiver checks:
+- the trailer;
+- each entry: inflate with a 64 MiB cap, require `eof` and no `unused_data`, check the header type and size, and check that the sha matches;
+- that trees parse with valid names and modes, and that commits parse.
+
+Objects are stored with `ObjectStore.write`.
+
+**Push body:** `b"MGPUSH1\n" | u32be json_len | json | pack`
+```json
+{"protocol":1,"force":false,"updates":[{"ref":"refs/heads/main","old":"<sha>|null","new":"<sha>|null"}]}
+```
+The client sends one update per push. The server applies several updates all or nothing.
+
+Push responses:
+```json
+200 {"ok":true,"results":[{"ref":"refs/heads/main","status":"ok","old":"..","new":".."}]}
+409 {"ok":false,"code":"rejected","error":"push rejected","results":[{"ref":"refs/heads/main","status":"rejected",
+     "reason":"stale|non-fast-forward|force-disabled|delete-default-branch|ref-clash","current":"<sha>|null","message":"..."}]}
+```
+Messages:
+- non-ff: `the remote branch has commits you do not have; run 'minigit pull' first, then push again`
+- stale: `remote ref changed since you last fetched (expected X, found Y); run 'minigit pull' first`
+- ref-clash: `cannot create 'refs/heads/a/b': it clashes with the existing branch 'refs/heads/a'` (also case-only differences); the client prints no "pull first" hint.
+
+Any HTTP method the server does not implement gets a JSON 405 `method_not_allowed`. A request body that is not valid JSON, including JSON nested too deeply, gets 400. Trees with duplicate or unsorted entry names are malformed: the server answers a push containing one with 422 `bad_pack`, and `fsck` reports it.
+
+### 7.3 Object negotiation (only missing objects move)
+- `closure(store, tips, seen)` walks commit → tree + parents, and tree → entries, skipping anything in `seen`.
+- **Fetch:**
+  - want = advertised tips missing locally. have = every local ref value plus HEAD.
+  - The server checks that each want is reachable from a current server ref (a commit-only walk). Otherwise 400.
+  - The server sends `closure(wants) − closure(haves ∩ server_has)`.
+  - When there are no wants, the client skips the request.
+- **Push:** the client sends `closure(new) − closure({fresh advertised tips that exist locally})`.
+- **Connectivity (`check_connectivity`):**
+  - `complete` = commit ancestors of all current refs.
+  - From the tip, walk commits not in `complete`. Each must exist and be a commit. Its tree is walked fully (shared memo), and each entry must exist with the right type (`40000` → tree, else blob). Then the walk continues into the parents.
+  - A missing object raises `ObjectError("missing object <sha>")`.
+
+### 7.4 Server push processing (exact order)
+1. Authenticate, and require write permission (401/403).
+2. Require `Content-Length <= max_push_bytes` (411/413), then read the body.
+3. Parse the frame and the JSON (400). For each update:
+   - `check_ref_name`, and the ref must start with `refs/heads/`;
+   - old and new are hex40 or null;
+   - refs are unique.
+4. `pack.unpack` into the store (422). This is safe before any ref check: objects are immutable and unreachable until a ref points at them.
+5. For each `new != null`: `new` must be a commit, and `check_connectivity(new)` must pass (422).
+6. Acquire the per-repo `threading.Lock`. These locks live in a dict guarded by a global lock and keyed by the real path, with a 30 s timeout (503).
+7. For each update, read `cur = refs.resolve(ref)`:
+   - `cur != old` → `stale`.
+   - `new` and `cur` both non-null and `not is_ancestor(cur, new)`: `force` with `allow_force` is allowed; `force` without `allow_force` → `force-disabled`; otherwise `non-fast-forward`.
+   - `new == null` and `ref == bare HEAD target` → `delete-default-branch`.
+8. **Any rejection:** apply nothing and return 409.
+   - **Otherwise:** `refs.update(ref, new, expected=cur, timeout=5)` for each update.
+   - Then, if bare HEAD's target is unborn and this push created a branch, set HEAD to the first pushed branch.
+9. Append to `audit.log`, release the lock, and respond 200.
+
+Readers take no lock: ref files are replaced atomically, and objects never change.
+
+### 7.5 Client flows
+- **`clone URL [DIR]`:**
+  1. DIR defaults to the last URL path component (with `.git` stripped). A non-empty DIR gives `destination 'x' already exists and is not empty`.
+  2. `init`, then remote `origin`, then fetch.
+  3. Branch = `info.head` if that ref exists, else `main` if present, else the first in sorted order.
+  4. Create `refs/heads/<b>` = `origin/<b>`, set `branch.<b>.remote=origin` and `branch.<b>.merge=refs/heads/<b>`, point HEAD at it, and run `checkout_tree({}, T)` + write the index.
+  5. **Empty remote:** HEAD is `ref: refs/heads/<info.head short or main>` with the warning `warning: You appear to have cloned an empty repository.`
+  6. If clone fails, it deletes the directory it created.
+- **`fetch [REMOTE]`:**
+  1. `info_refs`, then fetch the pack and `unpack`.
+  2. Run `check_connectivity` for each want.
+  3. Only then set every `refs/remotes/<r>/<b>` (`expected=ANY`), and delete tracking refs whose branch is gone.
+  4. Output lines:
+     - `   a1b2c3d..e4f5a6b  main -> origin/main`
+     - ` + a1b2c3d...e4f5a6b main -> origin/main (forced update)`
+     - ` * [new branch]      feature -> origin/feature`
+     - ` - [deleted]         old -> origin/old`
+- **`pull [REMOTE [BRANCH]]`:**
+  1. `fetch`.
+  2. The upstream is `branch.<cur>.merge`, else the same branch name. The tracking ref must exist: `no upstream 'origin/x' (push with -u first)`.
+  3. `merge.merge(repo, "refs/remotes/<r>/<b>", label="<r>/<b>", message="Merge branch '<b>' of <url>")`.
+- **`push [-u] [--force] [--delete] [REMOTE [SRC[:DST]]]`:**
+  1. Default: the current branch to the same name. A detached HEAD needs `SRC:DST`.
+  2. Get a fresh `info_refs` and take `remote_old`.
+  3. If `remote_old == local`: `Everything up-to-date`.
+  4. **Local pre-check** (not authoritative): if `remote_old` is set and is missing locally or is not an ancestor of local, and there is no `--force`, raise `PushRejectedError` without uploading.
+  5. Send the pack with `old = remote_old`.
+  6. **On 200:** set `refs/remotes/<r>/<dst> = local`. With `-u`, set the upstream. Lines: `To <url>` then `   a1b2c3d..e4f5a6b  main -> main` (or ` * [new branch]      main -> main`).
+  7. **On rejection** (local or 409), the CLI prints this to stderr and exits 1:
+     ```
+     To <url>
+      ! [rejected]        main -> main (non-fast-forward)      (or (fetch first) / (stale info))
+     error: failed to push some refs to '<url>'
+     hint: Updates were rejected because the remote contains work that you do not have locally.
+     hint: Run 'minigit pull' first, then push again (pull first).
+     ```
+- **HTTP errors:**
+  - 401 → `AuthError("authentication failed for '<url>': check user/token (minigit login)")`.
+  - 403 → `PermissionDeniedError("permission denied: ...")`.
+  - A `URLError` → `RemoteError("could not connect to server at <url>: <reason>")`.
+  - Any other status → `RemoteError(body.error)`.
+
+### 7.6 Server CLI
+- `minigit serve --root R [--host 127.0.0.1] [--port 8765] [--ready-file F] [--quiet]`:
+  - `--root` must be an existing directory containing `server.json` (made by `minigit server init`), unless `--init` is given, which creates it. A mistyped path is an error, not a new empty root. `--port` must be 0 to 65535 (usage error otherwise).
+  - Binds, with `--port 0` meaning a free port.
+  - Prints `Serving minigit on http://HOST:PORT` (flushed) to stdout.
+  - Writes `HOST:PORT\n` atomically to F, then runs `serve_forever`.
+  - Request log lines go to stderr unless `--quiet`.
+  - SIGINT/SIGTERM shuts it down cleanly.
+- Admin commands run on the host and auto-init the root:
+  - `minigit server init R`
+  - `minigit server add-user R NAME [--reset]` prints the token alone on one line.
+  - `minigit server create-repo R NAME [--readers a,b|*] [--writers a,b|*] [--public] [--allow-force]` prints the URL path.
+  - `minigit server list R`
+
+---
+
+## 8. Modules, ownership, signatures
+
+Every file is owned by exactly one module. Dependency order: **M1 → M2 → {M3, M4} ; M1 → M5 ; {M2, M4, M5} → M6 ; all → M7**. M5 depends only on M1, so it can start right after M1.
+
+| Module | Files (all under `minigit/` unless noted) | Test file | Depends on |
+|---|---|---|---|
+| **M1 core** | `__init__.py errors.py util.py objects.py trees.py config.py refs.py repo.py graph.py revparse.py` | `tests/test_core.py` | stdlib |
+| **M2 worktree** | `index.py ignore.py worktree.py` | `tests/test_worktree.py` | M1 |
+| **M3 commands** | `diff.py status.py history.py ops.py` | `tests/test_commands.py` | M1, M2 |
+| **M4 merge** | `merge3.py merge.py` | `tests/test_merge.py` | M1, M2 |
+| **M5 server** | `pack.py auth.py server.py` | `tests/test_server.py` | M1 |
+| **M6 client** | `transport.py remote.py` | `tests/test_remote.py` | M1, M2, M4, M5 (pack; `server.make_server` in tests) |
+| **M7 cli + e2e** | `cli.py __main__.py`, `bin/minigit`, `bin/minigit.cmd`, `tests/__init__.py tests/helpers.py tests/test_e2e_local.py tests/test_e2e_multiuser.py`, `README.md` | the e2e files | all |
+
+Unit tests use `tempfile.TemporaryDirectory(ignore_cleanup_errors=True)` and do not import `tests/helpers.py`. Python 3.11's `rmtree` takes `onerror`, not `onexc`.
+
+### M1 core
+```python
+# __init__.py
+__version__ = "0.1.0"
+
+# errors.py
+class MinigitError(Exception):
+    exit_code: int = 1
+    def __init__(self, message: str, *, hint: str | None = None) -> None   # .message, .hint
+class UsageError(MinigitError): exit_code = 2
+class NotARepositoryError(MinigitError): ...
+class ObjectError(MinigitError):
+    def __init__(self, message: str, *, sha: str | None = None, hint: str | None = None) -> None
+class LockError(MinigitError): ...
+class RefUpdateError(MinigitError):
+    def __init__(self, message: str, *, ref: str, expected: object, actual: str | None, hint: str | None = None) -> None
+class RevisionError(MinigitError): ...
+class NothingToCommit(MinigitError): ...
+class CheckoutConflictError(MinigitError):
+    def __init__(self, message: str, *, paths: list[str], hint: str | None = None) -> None
+class RemoteError(MinigitError):
+    def __init__(self, message: str, *, status: int | None = None, code: str | None = None,
+                 payload: dict | None = None, hint: str | None = None) -> None
+class AuthError(RemoteError): ...
+class PermissionDeniedError(RemoteError): ...
+class PushRejectedError(RemoteError):     # .results: list[dict] (same shape as section 7.2 409 results), .url: str
+    def __init__(self, message: str, *, results: list[dict], url: str, **kw) -> None
+
+# util.py
+def sha1_hex(data: bytes) -> str
+def atomic_write(path: str, data: bytes) -> None            # tmp in same dir, fsync, replace_with_retry; makedirs parent
+def replace_with_retry(src: str, dst: str, attempts: int = 40, delay: float = 0.025) -> None
+def unlink_with_retry(path: str) -> None                     # missing file is fine
+class LockFile:                                              # see section 4
+    def __init__(self, path: str, timeout: float = 0.0) -> None
+    def __enter__(self) -> "LockFile"; def __exit__(self, *exc) -> None
+    def write(self, data: bytes) -> None
+    def commit(self) -> None
+    def rollback(self) -> None
+def is_binary(data: bytes) -> bool                           # NUL in first 8000 bytes
+def split_lines(data: bytes) -> list[bytes]                  # keepends on b"\n"; b"" -> []
+def validate_name(name: str) -> None                         # tree-entry rules, section 2; ObjectError
+def validate_rel_path(path: str) -> None                     # every component valid; no leading "/", no drive
+def now_with_tz() -> tuple[int, int]                         # (unix, tz offset seconds east, from time.localtime().tm_gmtoff)
+def format_tz(offset_seconds: int) -> str                    # 19800 -> "+0530"
+def parse_tz(s: str) -> int
+def format_date(ts: int, offset: int) -> str                 # "Tue Oct 20 09:05:03 2026 +0530"
+
+# objects.py
+EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+def hash_object(obj_type: str, data: bytes) -> str
+def encode_object(obj_type: str, data: bytes) -> bytes       # b"type size\0" + data (uncompressed)
+def decode_object(raw: bytes) -> tuple[str, bytes]           # validates header/size; ObjectError
+class ObjectStore:
+    def __init__(self, objects_dir: str) -> None
+    def has(self, sha: str) -> bool
+    def write(self, obj_type: str, data: bytes) -> str
+    def read(self, sha: str) -> tuple[str, bytes]            # ObjectError("object <sha> not found") / corrupt
+    def read_typed(self, sha: str, obj_type: str) -> bytes   # ObjectError on type mismatch
+    def read_raw(self, sha: str) -> bytes                    # stored zlib bytes
+    def resolve_prefix(self, prefix: str) -> list[str]       # all full shas starting with prefix (len >= 4)
+    def iter_all(self) -> Iterator[str]
+@dataclass(frozen=True)
+class TreeEntry: mode: str; name: str; sha: str
+def parse_tree(data: bytes) -> list[TreeEntry]               # validates names/modes
+def serialize_tree(entries: Iterable[TreeEntry]) -> bytes    # sorts (section 2), validates
+@dataclass(frozen=True)
+class Signature:
+    name: str; email: str; timestamp: int; tz_offset: int
+    def format(self) -> str                                  # "Name <email> 1700000000 +0530"
+    @classmethod
+    def parse(cls, s: str) -> "Signature"
+@dataclass(frozen=True)
+class Commit:
+    tree: str; parents: tuple[str, ...]; author: Signature; committer: Signature; message: str
+    @property
+    def subject(self) -> str                                 # first line of message
+def parse_commit(data: bytes) -> Commit
+def serialize_commit(c: Commit) -> bytes
+
+# trees.py
+Entry = tuple[str, str]; FlatTree = dict[str, Entry]
+def flatten_tree(store: ObjectStore, tree_sha: str | None) -> FlatTree   # None/EMPTY_TREE -> {}
+def build_tree(store: ObjectStore, flat: FlatTree) -> str                # writes subtrees; {} -> EMPTY_TREE
+def commit_tree_sha(store: ObjectStore, commit_sha: str) -> str
+def commit_flat(store: ObjectStore, commit_sha: str | None) -> FlatTree
+
+# config.py
+def global_config_path() -> str                              # MINIGIT_GLOBAL_CONFIG or ~/.minigitconfig
+class Config:
+    def __init__(self, local_path: str | None, global_path: str | None = None) -> None   # global_path None -> global_config_path()
+    def get(self, key: str, default: str | None = None) -> str | None
+    def get_bool(self, key: str, default: bool = False) -> bool
+    def set(self, key: str, value: str, scope: str = "local") -> None    # "local" | "global"; atomic rewrite
+    def unset(self, key: str, scope: str = "local") -> bool
+    def items(self, scope: str | None = None) -> list[tuple[str, str]]   # ("remote.origin.url", v); None = merged
+    def subsections(self, section: str) -> list[str]                     # "remote" -> ["origin"]
+    def remove_section(self, section: str, subsection: str | None, scope: str = "local") -> None
+
+# refs.py
+ANY: object
+def check_ref_name(name: str) -> None                        # RefUpdateError / MinigitError on bad name
+def is_hex_sha(s: str) -> bool                               # 40 lowercase hex
+def short_ref(name: str) -> str                              # refs/heads/x -> x ; refs/remotes/o/x -> o/x
+class RefStore:
+    def __init__(self, gitdir: str) -> None
+    def read_raw(self, name: str) -> str | None              # "ref: refs/heads/x" | sha | None
+    def resolve(self, name: str) -> str | None               # follows symrefs (depth <= 5); None = missing/unborn
+    def head_target(self) -> str | None                      # "refs/heads/main" or None if detached
+    def current_branch(self) -> str | None                   # "main" or None
+    def update(self, name: str, new: str | None, expected: object = ANY, timeout: float = 0.0) -> None
+    def update_head(self, new: str, expected: object = ANY) -> None
+    def set_symbolic_head(self, target_ref: str) -> None
+    def set_detached_head(self, sha: str) -> None
+    def list(self, prefix: str = "refs/") -> dict[str, str]  # full name -> sha, sorted
+    def read_special(self, name: str) -> str | None          # ORIG_HEAD / MERGE_HEAD (first line, stripped)
+    def write_special(self, name: str, value: str | None) -> None   # None removes
+
+# repo.py
+class Repository:
+    gitdir: str; worktree: str | None; bare: bool; objects: ObjectStore; refs: RefStore
+    @classmethod
+    def init(cls, path: str, *, bare: bool = False, initial_branch: str = "main") -> tuple["Repository", bool]  # (repo, reinitialized)
+    @classmethod
+    def discover(cls, start: str) -> "Repository"            # NotARepositoryError
+    @classmethod
+    def open(cls, path: str) -> "Repository"                 # worktree root (has .minigit) or bare gitdir
+    def gpath(self, *parts: str) -> str
+    @property
+    def config(self) -> Config                               # fresh Config(gitdir/config) each access
+    def relpath(self, user_path: str, cwd: str) -> str       # POSIX repo-relative; "" = root; MinigitError("'p' is outside repository")
+    def abspath(self, rel: str) -> str
+    def head_commit(self) -> str | None
+    def head_flat(self) -> FlatTree
+    def read_commit(self, sha: str) -> Commit
+    def identity(self) -> Signature                          # section 6 commit identity rules
+    def merge_head(self) -> str | None
+    def read_state(self, name: str) -> bytes | None          # MERGE_MSG etc.
+    def write_state(self, name: str, data: bytes) -> None
+    def remove_state(self, name: str) -> None
+    def require_worktree(self) -> str                        # MinigitError("this operation must be run in a work tree")
+
+# graph.py  (store-based so the server can use it)
+def parents(store: ObjectStore, sha: str) -> tuple[str, ...]
+def commit_time(store: ObjectStore, sha: str) -> int
+def ancestors(store: ObjectStore, tips: Iterable[str]) -> set[str]       # inclusive
+def is_ancestor(store: ObjectStore, anc: str, desc: str) -> bool        # anc == desc -> True
+def merge_bases(store: ObjectStore, a: str, b: str) -> list[str]
+def best_merge_base(store: ObjectStore, a: str, b: str) -> str | None
+def topo_walk(store: ObjectStore, starts: Iterable[str]) -> Iterator[tuple[str, Commit]]   # section 6 log order
+def ahead_behind(store: ObjectStore, local: str, upstream: str) -> tuple[int, int]
+
+# revparse.py
+def resolve_object(repo: Repository, spec: str) -> str       # any object, incl. rev:path
+def resolve_rev(repo: Repository, spec: str) -> str          # must be a commit
+def resolve_ref(repo: Repository, name: str) -> str | None   # "main" -> "refs/heads/main", "origin/x" -> "refs/remotes/origin/x"
+def resolve_local_branch(repo: Repository, name: str) -> str | None   # "refs/heads/<name>" if it exists
+def abbrev(sha: str, n: int = 7) -> str
+```
+**test_core:** hash fixtures, tree sort (`a-b < a.txt < a/ < a0`), bad names, commit round-trip, config round-trip, CAS (create/mismatch/delete, held lock → `LockError`, 16 threads racing `update(expected=cur)` with exactly one winner per round), ref name rules, revparse `~ ^ ^2` and abbrev ambiguity, merge_bases (linear, fork, criss-cross, unrelated), topo order with equal timestamps.
+
+### M2 worktree
+```python
+# index.py
+@dataclass
+class IndexEntry: path: str; mode: str; sha: str; size: int = 0; mtime_ns: int = 0; stage: int = 0
+class Index:
+    file_mtime_ns: int
+    @classmethod
+    def load(cls, path: str) -> "Index"                      # missing -> empty
+    def serialize(self) -> bytes
+    def get(self, path: str, stage: int = 0) -> IndexEntry | None
+    def put(self, entry: IndexEntry) -> None                 # stage 0 clears stages 1-3; stage>0 clears stage 0
+    def remove(self, path: str) -> bool                      # all stages
+    def entries(self) -> list[IndexEntry]                    # sorted (path, stage)
+    def stage0(self) -> dict[str, IndexEntry]
+    def unmerged(self) -> dict[str, dict[int, IndexEntry]]
+    def flat(self) -> FlatTree                               # stage 0 only
+    def paths(self) -> list[str]                             # all stages, unique, sorted
+    def is_racy(self, entry: IndexEntry) -> bool
+def index_path(repo: Repository) -> str
+def read_index(repo: Repository) -> Index
+@contextmanager
+def locked_index(repo: Repository) -> Iterator[Index]        # LockFile(index, 0); writes + commits on clean exit only
+
+# ignore.py
+class IgnoreMatcher:
+    def __init__(self, worktree: str, extra_patterns: Sequence[str] = ()) -> None
+    def is_ignored(self, rel_path: str, is_dir: bool = False) -> bool
+
+# worktree.py
+def scan_files(repo: Repository, ignore: IgnoreMatcher, under: str = "") -> dict[str, os.stat_result]   # non-ignored regular files
+def mode_from_stat(st: os.stat_result, previous: str | None) -> str
+def worktree_entry(repo: Repository, index: Index, rel: str, head_mode: str | None = None) -> Entry | None  # stat cache, else hash (no write)
+def worktree_flat(repo: Repository, index: Index, paths: Iterable[str]) -> FlatTree   # missing paths omitted
+def read_worktree_bytes(repo: Repository, rel: str) -> bytes
+def stage_file(repo: Repository, index: Index, rel: str) -> IndexEntry   # writes blob, puts stage-0 entry with stat
+def entry_with_stat(repo: Repository, rel: str, mode: str, sha: str) -> IndexEntry
+def write_file(repo: Repository, rel: str, mode: str, data: bytes) -> None   # makedirs; replaces a dir/file in the way only if caller checked
+def remove_file(repo: Repository, rel: str) -> None          # missing ok; prunes empty parent dirs up to worktree
+def checkout_tree(repo: Repository, index: Index, old: FlatTree, new: FlatTree, *, force: bool = False,
+                  operation: str = "checkout") -> None       # section 6; mutates index (caller writes it)
+def ensure_unmodified(repo: Repository, index: Index, expected: dict[str, Entry | None], operation: str) -> None
+    # CheckoutConflictError listing paths with W(p) != expected[p] ("...would be overwritten by <operation>:")
+```
+**test_worktree:** index round-trip, stage handling, corrupt trailer, racy rehash; ignore table (negation, anchored, dir-only, `**`, nested, tracked-but-ignored); `checkout_tree` (carries a non-conflicting edit, refuses a conflicting one, refuses an untracked file in the way, dir/file clash); `stage_file` on a Windows `sub\x`.
+
+### M3 commands (`ops.py` holds the porcelain logic and returns messages)
+```python
+# diff.py
+@dataclass
+class FileVersion: mode: str; sha: str; data: bytes
+def changed_paths(old: FlatTree, new: FlatTree, pathspecs: Sequence[str] = ()) -> list[str]
+def render_file_diff(path: str, old: FileVersion | None, new: FileVersion | None, context: int = 3) -> bytes
+def diff_flats(repo: Repository, old: FlatTree, new: FlatTree, *, new_from_worktree: bool = False,
+               pathspecs: Sequence[str] = ()) -> bytes
+def diff_command(repo: Repository, cwd: str, *, staged: bool, revs: Sequence[str], pathspecs: Sequence[str]) -> bytes
+
+# status.py
+@dataclass
+class StatusResult:
+    branch: str | None; head: str | None; detached: bool; unborn: bool
+    upstream: str | None; ahead: int; behind: int; merging: bool
+    entries: list[tuple[str, str]]                           # (XY, path); "??" untracked; sorted by path then XY
+    def is_clean(self) -> bool                               # no entries other than none
+def compute_status(repo: Repository) -> StatusResult
+def format_status_long(st: StatusResult) -> str
+def format_status_porcelain(st: StatusResult) -> str
+
+# history.py
+def decorations(repo: Repository) -> dict[str, list[str]]  # sha -> ["HEAD -> main", "origin/main"]
+def log_entries(repo: Repository, revs: Sequence[str] | None, max_count: int | None, all_refs: bool = False) -> list[tuple[str, Commit]]
+def format_log(repo: Repository, entries: list[tuple[str, Commit]], oneline: bool) -> str
+def show(repo: Repository, spec: str = "HEAD") -> bytes
+
+# ops.py
+def init(path: str, *, bare: bool = False, initial_branch: str = "main") -> str        # "Initialized empty minigit repository in <gitdir>" | "Reinitialized existing ..."
+def add(repo: Repository, pathspecs: Sequence[str], cwd: str, *, force: bool = False) -> list[str]   # staged/removed paths
+def rm(repo: Repository, pathspecs: Sequence[str], cwd: str, *, cached: bool = False, recursive: bool = False,
+       force: bool = False) -> list[str]                    # "rm 'p'" lines
+def commit(repo: Repository, messages: Sequence[str], *, all_: bool = False, allow_empty: bool = False) -> tuple[str, str]  # (sha, summary line)
+def create_commit(repo: Repository, tree: str, parents: Sequence[str], message: str) -> str  # writes object only (merge reuses)
+@dataclass
+class BranchInfo: name: str; sha: str; current: bool; remote: bool; subject: str
+def branch_list(repo: Repository, *, remotes: bool = False, all_: bool = False) -> list[BranchInfo]
+def format_branch_list(items: list[BranchInfo], verbose: bool) -> str
+def branch_create(repo: Repository, name: str, start: str | None = None) -> str     # sha
+def branch_delete(repo: Repository, name: str, *, force: bool = False) -> str       # "Deleted branch x (was abc1234)."
+def set_upstream(repo: Repository, branch: str, remote: str, merge_ref: str) -> None
+def get_upstream(repo: Repository, branch: str) -> tuple[str, str] | None           # (remote, "refs/heads/x")
+def switch(repo: Repository, target: str | None, *, create: str | None = None, start: str | None = None,
+           detach: bool = False) -> str                     # "Switched to branch 'x'" | "Switched to a new branch 'x'" | "HEAD is now at abc1234 subject"
+def reset(repo: Repository, rev: str = "HEAD", mode: str = "mixed") -> str         # hard: "HEAD is now at abc1234 subject"; else ""
+def reset_paths(repo: Repository, rev: str, pathspecs: Sequence[str], cwd: str) -> list[str]
+def restore(repo: Repository, pathspecs: Sequence[str], cwd: str, *, staged: bool = False,
+            worktree: bool | None = None, source: str | None = None) -> list[str]
+def config_cmd(repo: Repository | None, key: str | None, value: str | None, *, global_: bool = False,
+               list_: bool = False, unset: bool = False) -> str | None              # get -> value (MinigitError if missing)
+def cat_file(repo: Repository, mode: str, spec: str) -> bytes                        # mode "-p" | "-t" | "-s"
+def ls_files(repo: Repository, stage: bool = False) -> str
+def hash_object_cmd(repo: Repository | None, path: str, write: bool) -> str
+```
+**test_commands:** every status code, the four diff forms + hunk headers + no-newline + binary + CRLF preserved, commit (root, nothing-to-commit, missing identity, conflict refusal), log order and decorations, branch -d safety, switch (DWIM, detached), reset soft/mixed/hard (untracked kept), restore variants.
+
+### M4 merge
+```python
+# merge3.py
+@dataclass
+class Merge3Result: lines: list[bytes]; conflicts: int
+def merge_lines(base: list[bytes], ours: list[bytes], theirs: list[bytes], ours_label: str = "HEAD",
+                theirs_label: str = "theirs") -> Merge3Result
+def merge_blobs(base: bytes | None, ours: bytes, theirs: bytes, ours_label: str = "HEAD",
+                theirs_label: str = "theirs") -> tuple[bytes, bool]           # (content, clean)
+
+# merge.py
+@dataclass
+class TreeMergeResult:
+    merged: FlatTree                                    # stage-0 results (conflicted paths absent)
+    stages: dict[str, dict[int, Entry]]                 # path -> {1|2|3: entry}
+    worktree: dict[str, tuple[str, bytes]]              # conflicted path -> (mode, content to write)
+    messages: list[str]                                 # CONFLICT/warning lines
+def merge_trees(store: ObjectStore, base: FlatTree, ours: FlatTree, theirs: FlatTree,
+                ours_label: str, theirs_label: str) -> TreeMergeResult
+@dataclass
+class MergeOutcome:
+    kind: str                                           # "up-to-date" | "fast-forward" | "merged" | "conflict"
+    commit: str | None; old_head: str | None; conflicts: list[str]; messages: list[str]
+def merge(repo: Repository, rev: str, *, message: str | None = None, label: str | None = None,
+          no_ff: bool = False) -> MergeOutcome          # label: name in markers/messages (default: rev as typed)
+def merge_abort(repo: Repository) -> None
+def default_merge_message(repo: Repository, rev: str) -> str
+```
+`merge` uses `ops`? **No.** It must not import M3. It writes the commit itself with `objects.serialize_commit` and `repo.identity()`.
+**test_merge:** merge3 cases (one side, both same, conflict, add/add with empty base, no final newline, CRLF markers, adjacent edits); tree rules (modify/modify, modify/delete, add/add, mode-only, file/dir abort); merge FF, clean 3-way (2 parents), conflict → stages + markers + `MERGE_HEAD`, resolve via the index then commit, abort restores byte-for-byte while keeping an unrelated dirty file, safety refusal.
+
+### M5 server
+```python
+# pack.py
+MAGIC = b"MGPK"
+def closure(store: ObjectStore, tips: Iterable[str], seen: set[str] | None = None) -> set[str]   # returns newly visited; updates seen
+def objects_to_send(store: ObjectStore, tips: Iterable[str], exclude_tips: Iterable[str]) -> list[str]  # excludes not in store ignored
+def build_pack(store: ObjectStore, shas: Iterable[str]) -> bytes
+def pack_count(data: bytes) -> int
+def unpack(store: ObjectStore, data: bytes, max_object_size: int = 64 << 20) -> list[str]   # ObjectError on any defect
+def complete_commits(store: ObjectStore, ref_values: Iterable[str]) -> set[str]
+def check_connectivity(store: ObjectStore, tip: str, complete: set[str]) -> None           # ObjectError
+def fsck(repo: Repository) -> list[str]                  # problems; [] = healthy (hash check every object + ref connectivity)
+
+# auth.py
+def hash_token(token: str) -> str
+class ServerConfig:
+    def __init__(self, root: str) -> None                # loads ROOT/server.json (empty default if missing)
+    def authenticate(self, user: str, token: str) -> bool
+    def repo_exists(self, name: str) -> bool
+    def can_read(self, user: str | None, repo: str) -> bool
+    def can_write(self, user: str | None, repo: str) -> bool
+    def allow_force(self, repo: str) -> bool
+    def readable_repos(self, user: str | None) -> list[str]
+def server_init(root: str) -> None                       # idempotent; creates server.json + repos/
+def add_user(root: str, name: str, *, reset: bool = False) -> str     # returns token; exists w/o reset -> MinigitError
+def create_repo(root: str, name: str, *, readers: Sequence[str] = ("*",), writers: Sequence[str] = ("*",),
+                public: bool = False, allow_force: bool = False) -> str   # returns repo dir; exists -> MinigitError
+def list_server(root: str) -> str                        # human listing of users and repos
+def validate_repo_name(name: str) -> None
+def validate_user_name(name: str) -> None
+
+# server.py
+def make_server(root: str, host: str = "127.0.0.1", port: int = 0, *, max_push_bytes: int = 256 << 20,
+                verbose: bool = False) -> ThreadingHTTPServer   # .server_address gives bound port
+def info_refs(repo: Repository) -> dict
+def process_fetch(repo: Repository, body: bytes) -> tuple[int, bytes, str]   # (status, body, content-type)
+def process_push(root: str, repo_name: str, user: str, body: bytes, cfg: ServerConfig) -> tuple[int, dict]
+def serve(root: str, host: str, port: int, *, ready_file: str | None = None, max_push_bytes: int = 256 << 20,
+          verbose: bool = True, on_ready: Callable[[str], None] | None = None) -> int   # on_ready(url) is called after bind (the CLI prints the "Serving" line)
+```
+**test_server** (in-process, raw `urllib`): 401/403/404, the protocol header check, the `info/refs` shape, fetch with an unknown want → 400, a pack round-trip, sha mismatch / truncation / bad trailer → 422, a missing blob → 422 with the ref unchanged, stale → 409, non-ff → 409, force disabled → 409, and **8 threads behind a `Barrier` pushing distinct commits on the same base: exactly 1 ok, 7 stale, ref = winner, `fsck == []`**.
+
+### M6 client
+```python
+# transport.py
+def split_url(url: str) -> tuple[str, tuple[str, str] | None]    # (url without userinfo, (user, token)|None)
+def credentials_path() -> str
+def load_credentials(url: str) -> tuple[str, str] | None         # section 7.1 order (env, userinfo, file)
+def save_credentials(url: str, user: str, token: str) -> None
+@dataclass
+class RemoteRefs: head: str | None; refs: dict[str, str]
+class HttpRemote:
+    def __init__(self, url: str, timeout: float = 60.0) -> None   # strips userinfo, resolves credentials
+    url: str
+    def list_repos(self) -> list[str]
+    def info_refs(self) -> RemoteRefs
+    def fetch_pack(self, wants: Sequence[str], haves: Sequence[str]) -> bytes
+    def push(self, updates: Sequence[dict], pack: bytes, *, force: bool = False) -> dict   # 409 -> PushRejectedError
+
+# remote.py
+@dataclass
+class RefChange: ref: str; old: str | None; new: str | None; kind: str     # "new" | "updated" | "forced" | "deleted" | "up-to-date"
+def remote_add(repo: Repository, name: str, url: str) -> None
+def remote_remove(repo: Repository, name: str) -> None
+def remote_list(repo: Repository) -> dict[str, str]
+def remote_url(repo: Repository, name: str) -> str              # MinigitError("no remote 'x' configured")
+def clone(url: str, directory: str | None, cwd: str) -> tuple[Repository, list[str]]   # (repo, messages)
+def fetch(repo: Repository, remote: str = "origin") -> list[RefChange]
+def format_fetch(url: str, changes: list[RefChange]) -> str
+def pull(repo: Repository, remote: str | None = None, branch: str | None = None) -> tuple[list[RefChange], MergeOutcome]
+def push(repo: Repository, remote: str | None = None, refspec: str | None = None, *, set_upstream: bool = False,
+         force: bool = False, delete: bool = False) -> list[str]    # output lines; raises PushRejectedError
+def format_push_rejection(err: PushRejectedError, src: str, dst: str) -> str   # section 7.5 text (contains "[rejected]", "pull first")
+def login(url: str, user: str, token: str) -> None
+```
+**test_remote** (in-process `make_server`): clone empty and non-empty, push/fetch/pull round-trips, non-ff rejection text, a second fetch requesting nothing (no request sent), only missing objects sent (assert `pack_count`), credentials order, CRLF and binary bytes identical after clone.
+
+### M7 cli + e2e
+```python
+# cli.py
+def build_parser() -> argparse.ArgumentParser   # prog="minigit"; errors raise UsageError (exit 2)
+def main(argv: Sequence[str] | None = None) -> int
+# __main__.py: `import sys; from minigit.cli import main; sys.exit(main())`
+```
+- **Global flags:** `-C <dir>` (sets cwd), `--version`, `--help`, `<cmd> --help`.
+- **Commands** (the flags in section 6/7 are authoritative): init, config, add, rm, status (`--porcelain`, `-s` = porcelain), diff, commit, log, show, branch, switch, checkout, merge, reset, restore, remote (`add|remove|-v`), clone, fetch, pull, push, login, serve, server (`init|add-user|create-repo|list`), fsck, cat-file, ls-files, hash-object, rev-parse, help.
+- **Output:**
+  - Data goes to `sys.stdout.buffer` as UTF-8 bytes with `\n` newlines.
+  - Errors go to stderr as `error: <message>`, plus `hint: <hint>` when set. `PushRejectedError` prints `format_push_rejection`.
+  - Merge or pull conflicts print their messages to stdout and exit 1.
+  - An unexpected exception prints `fatal: internal error: <e>` and exits 1 (the traceback only with `MINIGIT_DEBUG=1`).
+- `bin/minigit` inserts its parent's parent into `sys.path` and calls `cli.main`. *(Integration)* It is an sh/Python polyglot (`#!/bin/sh`) that re-runs itself with `python3` on POSIX (many Linux systems have no `python`) and `python` on Windows. `bin/minigit.cmd` is `@python "%~dp0minigit" %*`. `pyproject.toml` optionally installs a `minigit` console script.
+- **`tests/helpers.py`:**
+  - `run(args, cwd, env=None, check=True)` runs `[sys.executable, "-m", "minigit", *args]` with `PYTHONPATH=<root>`, a 30 s timeout and captured bytes.
+  - `make_env(tmp, user=None, token=None)` sets the global config, credentials, identity and a fixed date.
+  - `ServerProcess(root)` starts `serve --port 0 --ready-file F --quiet`, polls F for up to 10 s, and exposes `.url`. On `__exit__` it runs `terminate`, `wait(5)`, then `kill`. The server always stops before the temp dir is removed.
+- **e2e_local:** init → add → status → commit → log → diff → rm → ignore → branching → merge conflict → resolve → abort → reset → restore → detached.
+- **e2e_multiuser** (live `ServerProcess`):
+  1. Alice and bob are added. Alice clones the empty repo, commits and runs `push -u`. Bob clones.
+  2. Both commit. Bob pushes. Alice's push exits 1 with `pull first`.
+  3. Alice pulls (merge commit) and pushes. Bob pulls (fast-forward). `rev-parse HEAD` is equal everywhere.
+  4. A same-line conflict through pull is resolved, then pushed.
+  5. A wrong token exits 1 with `authentication failed`. A read-only user exits 1 with `permission denied`.
+  6. 5 clones push concurrently from threads: exactly 1 exits 0, and `minigit -C <server repo> fsck` is clean.
