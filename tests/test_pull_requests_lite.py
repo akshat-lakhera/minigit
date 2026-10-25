@@ -1,22 +1,11 @@
-"""Acceptance tests for the planned feature "pull-requests-lite".
+"""Acceptance tests for the feature "pull-requests-lite".
 
 The contract is ``features/pull-requests-lite.md``. These tests drive the REAL CLI
 (``python -m minigit``) against a live ``minigit serve`` process and, for the API
 shape, talk HTTP to it with ``urllib``. They are self-contained (no imports from
-``minigit`` or ``tests/``), so they can be moved unchanged once the feature lands.
+``minigit`` or ``tests/``). Run them with::
 
-They are skipped until the feature exists. To run them while implementing, from
-``E:\\ideas\\minigit``::
-
-    set MINIGIT_RUN_FUTURE=1            (PowerShell: $env:MINIGIT_RUN_FUTURE = "1")
-    python -m unittest tests_future.test_pull_requests_lite -v
-
-Once green, move this file to ``tests_blackbox/`` (or ``tests/test_e2e_pull_requests.py``)
-and replace ``@SKIP`` on the test class with nothing.
-
-Against the code as it is today (feature missing) every test fails at its first
-``pr`` command or ``/pulls`` request; all setup steps (server, clone, push,
-branches) succeed, which is checked by running with MINIGIT_RUN_FUTURE=1.
+    python -m unittest tests.test_pull_requests_lite -v
 """
 from __future__ import annotations
 
@@ -40,13 +29,6 @@ PY = sys.executable
 CLI_TIMEOUT = 60
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 HEX7 = r"[0-9a-f]{7}"
-SKIP_REASON = "feature not implemented yet"
-
-if os.environ.get("MINIGIT_RUN_FUTURE") == "1":
-    def SKIP(cls):  # noqa: N802 - decorator alias
-        return cls
-else:
-    SKIP = unittest.skip(SKIP_REASON)
 
 
 # --------------------------------------------------------------------------
@@ -351,7 +333,6 @@ class _PullRequestBase(unittest.TestCase):
 # the acceptance tests
 # --------------------------------------------------------------------------
 
-@SKIP
 class PullRequestsLiteTests(_PullRequestBase):
 
     def test_1_open_list_show_diff_merge_flow(self):

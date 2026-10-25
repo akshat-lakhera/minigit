@@ -362,6 +362,9 @@ def branch_delete(repo: Repository, name: str, *, force: bool = False) -> str:
         raise MinigitError(f"branch '{name}' not found")
     if name == repo.refs.current_branch():
         raise MinigitError(f"cannot delete the branch '{name}' you are on")
+    if (repo.read_state("rebase/head-name") or b"").decode("utf-8", "replace").strip() == ref:
+        raise MinigitError(f"cannot delete the branch '{name}': it is being rebased",
+                           hint="finish the rebase first ('minigit rebase --continue' or '--abort')")
     if not force:
         merged = False
         head = repo.head_commit()

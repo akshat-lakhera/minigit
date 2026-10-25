@@ -2,8 +2,9 @@
 
 A git clone written from scratch in Python 3.11 with the standard library only, plus a multi-user HTTP
 server. It reads and writes git's own object format (blobs, trees, commits, SHA-1 ids, zlib loose objects,
-the binary index), has branches, three-way merges with conflict markers, blame, grep, cherry-pick and revert,
-and lets several people clone, push and pull the same repositories safely, with a read-only web view.
+the binary index), has branches, three-way merges with conflict markers, blame, grep, cherry-pick, revert,
+rebase and stash, and lets several people clone, push and pull the same repositories safely, with
+lightweight pull requests and a read-only web view.
 
 Every change was merged only with the full
 test suite green. `SPEC.md` is the contract all modules follow.
@@ -56,8 +57,22 @@ minigit serve --root srv --port 8080     # add --host 0.0.0.0 to listen on the n
 ```
 
 `create-repo` options: `--readers`, `--writers` (comma separated names or `*`), `--public` (anonymous
-reads), `--allow-force` (permit `push -f`). `server list srv` shows users and repositories;
-`add-user --reset` issues a new token.
+reads), `--allow-force` (permit `push -f`). `--readers ""` (or `--writers ""`) means nobody; only an omitted
+option defaults to `*`. `server list srv` shows users (with their token names) and repositories.
+
+Managing the server later (a running `minigit serve` picks every change up on the next request):
+
+```
+minigit server add-token srv alice laptop     # an extra, named token for alice (printed once)
+minigit server list-tokens srv alice          # names and creation times, never the secrets
+minigit server revoke-token srv alice laptop  # or: revoke-token srv alice --all
+minigit server perm srv project bob read      # bob: read only (none | read | write); omit the level to query
+minigit server set-repo srv project --public --allow-force
+minigit server remove-user srv bob            # also removes bob from every access list
+```
+
+`add-user --reset` replaces only the user's `default` token. A signed-in user without access to a repository gets
+`permission denied`. Details: `features/server-admin.md`.
 
 Alice and Bob each:
 
@@ -88,6 +103,31 @@ Real output of this flow is in `python demo.py`. Pushes are compare-and-swap on 
 two simultaneous pushes can never lose a commit; forced pushes need `--allow-force` on the repo. A branch is
 removed on the server with `minigit push --delete origin NAME`.
 
+### Pull requests
+
+A pull request asks the server to merge one of its branches into another. It lives on the server
+(`pulls.json` next to the bare repo), always uses the branch tips as they are on the server, and is merged
+there, under the same lock as pushes, as a real merge commit `Merge pull request #N from <head>`:
+
+```
+alice$ minigit switch -c feature && ... commit ... && minigit push -u origin feature
+alice$ minigit pr open --title "Add feature" -m "Adds f1 and f2."    # head: current branch, base: the remote's default
+Created pull request #1: Add feature (feature -> main)
+
+bob$ minigit pr list
+#1   open    feature -> main  Add feature  (alice)
+bob$ minigit pr show 1          # state, author, ahead/behind, Mergeable: clean | conflict (a.txt) | ..., commits
+bob$ minigit pr diff 1          # the changes since the branch point (three-dot diff)
+bob$ minigit pr merge 1
+Merged pull request #1 into main (9c4d2e1)
+bob$ minigit pull               # the merge commit is an ordinary commit for clients
+```
+
+A conflicting pull request is refused and nothing on the server changes; merge the base into the head
+locally, resolve, push the head and merge again. `pr close N` closes without merging. Reading pull
+requests needs read access to the repo; opening, merging and closing need write access. The same
+operations are available as JSON over HTTP under `/<repo>/pulls` (`features/pull-requests-lite.md`).
+
 ## Web UI
 
 `minigit serve` also serves a read-only, JavaScript-free site at `http://host:8080/-/`: repository list,
@@ -114,6 +154,8 @@ anonymously). Pass `serve --no-web` to turn it off.
 | `merge [--no-ff] [-m MSG] REV` / `merge --abort` | Three-way merge with conflict markers |
 | `cherry-pick [-n] [-x] [-m N] [--allow-empty] REV...` (`--continue`, `--abort`) | Apply the change of existing commits onto HEAD |
 | `revert [-n] [-m N] REV...` (`--continue`, `--abort`) | Record a commit that undoes a commit |
+| `stash [push] [-m MSG] [-u]` / `stash (pop \| apply \| drop \| show) [stash@{N}]` / `stash (list \| clear)` | Shelve local changes (with `-u` also untracked files) and reapply them later |
+| `rebase [--onto NEWBASE] [UPSTREAM [BRANCH]]` (`--continue`, `--skip`, `--abort`) | Replay a branch's commits on top of another commit (linear history) |
 | `reset [--soft \| --mixed \| --hard] [REV]` | Move HEAD, reset index / work tree |
 | `restore [--staged] [--worktree] [-s REV] PATH...` | Restore files from index or a commit |
 | `blame [-L START,END] [-s] [-e] [--porcelain] [REV] PATH` | Who last changed each line |
@@ -123,12 +165,21 @@ anonymously). Pass `serve --no-web` to turn it off.
 | `fetch [REMOTE]` | Download objects, update remote-tracking branches |
 | `pull [REMOTE [BRANCH]]` | Fetch and merge the upstream branch |
 | `push [-u] [-f] [--delete] [REMOTE [SRC[:DST]]]` | Upload a branch (or delete a remote branch) |
+| `pr open --title T [-m BODY]... [--head B] [--base B]` | Open a pull request on the server |
+| `pr list [--state open\|merged\|closed\|all]` / `pr show N` / `pr diff N` | List pull requests, show one, show its diff |
+| `pr merge N [-m MSG]` / `pr close N` | Merge a pull request on the server (always a merge commit) or close it; every `pr` command takes `--remote NAME` |
 | `login URL --user U --token T` | Store credentials for a server |
 | `serve --root DIR [--host H] [--port N] [--init] [--no-web] [--ready-file F] [--quiet] [--max-push-bytes N]` | Run the HTTP server (`--port 0` picks a free port and writes `host:port` to the ready file) |
 | `server init ROOT` | Create a server root |
-| `server add-user ROOT NAME [--reset]` | Add a user, print the token |
-| `server create-repo ROOT NAME [--readers L] [--writers L] [--public] [--allow-force]` | Create a bare repository |
-| `server list ROOT` | List users and repositories |
+| `server add-user ROOT NAME [--reset]` | Add a user, print the token (shown once); `--reset` replaces the default token |
+| `server remove-user ROOT NAME` | Delete a user, its tokens and its entries in all access lists |
+| `server add-token ROOT USER NAME` | Issue another named token for a user, print it |
+| `server list-tokens ROOT USER` | List a user's token names and creation times |
+| `server revoke-token ROOT USER (NAME \| --all)` | Revoke one token or all tokens of a user |
+| `server create-repo ROOT NAME [--readers L] [--writers L] [--public] [--allow-force]` | Create a bare repository (`--readers ""` = nobody) |
+| `server perm ROOT REPO USERS [read \| write \| none]` | Show or set the access of users (or `*`) to a repository |
+| `server set-repo ROOT REPO [--public \| --private] [--allow-force \| --no-allow-force]` | Change a repository's flags |
+| `server list ROOT` | List users (with token names) and repositories |
 | `cat-file (-p \| -t \| -s) OBJ` | Print an object's content, type or size |
 | `ls-files [-s]` | List files in the index |
 | `hash-object [-w] FILE` | Compute (and store) a blob id |
@@ -158,7 +209,7 @@ repo. Details and every edge case: `SPEC.md`.
 
 ## Limitations compared with real git
 
-- No rebase, stash, tags, submodules, hooks, worktrees or `.gitattributes`.
+- No interactive rebase, tags, submodules, hooks, worktrees or `.gitattributes`.
 - Loose objects only, no packfiles, no delta compression, no gc. Large histories and big binaries are slow and
   take disk. Clone/fetch transfer whole objects over the minigit HTTP protocol, not git's.
 - The transport is minigit's own HTTP protocol (token auth, no SSH, no TLS: put a reverse proxy in front for

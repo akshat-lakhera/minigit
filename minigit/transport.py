@@ -369,3 +369,41 @@ class HttpRemote:
 
         resp = self._request("POST", self.url + "/push", body, PUSH_CONTENT_TYPE, on_error=on_error)
         return self._json(resp, "push")
+
+    # -- pull requests (features/pull-requests-lite.md) ------------------
+    def _pull_payload(self, body: bytes, key: str, kind: type) -> object:
+        payload = self._json(body, "pull")
+        value = payload.get(key)
+        if not isinstance(value, kind):
+            raise RemoteError(f"malformed pull response from {self.url}")
+        return value
+
+    def list_pulls(self, state: str = "open") -> list[dict]:
+        query = urllib.parse.urlencode({"state": state})
+        pulls = self._pull_payload(self._request("GET", f"{self.url}/pulls?{query}"), "pulls", list)
+        if not all(isinstance(p, dict) for p in pulls):
+            raise RemoteError(f"malformed pull response from {self.url}")
+        return pulls
+
+    def open_pull(self, head: str, base: str, title: str, body: str = "") -> dict:
+        req = json.dumps({"head": head, "base": base, "title": title, "body": body}).encode("utf-8")
+        return self._pull_payload(self._request("POST", self.url + "/pulls", req, "application/json"),
+                                  "pull", dict)
+
+    def get_pull(self, number: int) -> dict:
+        return self._pull_payload(self._request("GET", self.url + "/pulls/%d" % number), "pull", dict)
+
+    def pull_diff(self, number: int) -> bytes:
+        return self._request("GET", self.url + "/pulls/%d/diff" % number)
+
+    def merge_pull(self, number: int, message: str | None = None) -> dict:
+        req = json.dumps({} if message is None else {"message": message}).encode("utf-8")
+        payload = self._json(self._request("POST", self.url + "/pulls/%d/merge" % number, req,
+                                           "application/json"), "pull")
+        if not isinstance(payload.get("pull"), dict):
+            raise RemoteError(f"malformed pull response from {self.url}")
+        return payload
+
+    def close_pull(self, number: int) -> dict:
+        return self._pull_payload(self._request("POST", self.url + "/pulls/%d/close" % number, b"{}",
+                                                "application/json"), "pull", dict)

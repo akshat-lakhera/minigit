@@ -18,7 +18,10 @@ from .util import atomic_write, now_with_tz, parse_tz, unlink_with_retry
 GITDIR_NAME = ".minigit"
 
 # In-progress operation -> its state file (features/cherry-pick-revert.md section 3.1).
-OPERATION_STATE_FILES = {"merge": "MERGE_HEAD", "cherry-pick": "CHERRY_PICK_HEAD", "revert": "REVERT_HEAD"}
+OPERATION_STATE_FILES = {"merge": "MERGE_HEAD", "cherry-pick": "CHERRY_PICK_HEAD", "revert": "REVERT_HEAD",
+                         "rebase": "REBASE_HEAD"}
+# A rebase is in progress while this directory exists, even between picks (features/rebase.md).
+REBASE_STATE_DIR = "rebase"
 
 
 def _is_bare_gitdir(path: str) -> bool:
@@ -152,6 +155,9 @@ class Repository:
             sha = self.refs.read_special(name)
             if sha is not None:
                 return kind, sha
+        if os.path.isdir(self.gpath(REBASE_STATE_DIR)):
+            orig = self.read_state(REBASE_STATE_DIR + "/orig-head") or b""
+            return "rebase", orig.decode("ascii", "replace").strip()
         return None
 
     def clear_operation_state(self) -> None:

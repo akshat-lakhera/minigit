@@ -1,13 +1,9 @@
 """Acceptance tests for ``minigit stash`` (design: ``features/stash.md``).
 
 Every test drives the real command line as a subprocess (``tests.helpers.run``)
-in a temporary directory. They pass once the feature is implemented; until then
-every class is skipped. Run them from the project root with::
+in a temporary directory. Run them from the project root with::
 
-    python -m unittest discover -s tests_future -t .
-
-When the feature lands, delete the ``@unittest.skip`` lines and move this file
-to ``tests/test_stash.py``.
+    python -m unittest tests.test_stash -v
 """
 from __future__ import annotations
 
@@ -18,7 +14,6 @@ import unittest
 
 from tests.helpers import ServerProcess, make_env, read, run, write
 
-NOT_IMPLEMENTED = "feature not implemented yet"
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 BASE_A = b"one\ntwo\nthree\n"
 BASE_B = b"bee\n"
@@ -109,7 +104,6 @@ class _StashCase(unittest.TestCase):
         return "\n".join(lines[lines.index("") + 1:]).rstrip("\n")
 
 
-@unittest.skip(NOT_IMPLEMENTED)
 class StashPushTests(_StashCase):
     def test_push_saves_tracked_changes_and_cleans_the_worktree(self):
         self.put("a.txt", b"one\nTWO\nthree\n")
@@ -246,7 +240,6 @@ class StashPushTests(_StashCase):
         self.assertIn("work tree", res.err)
 
 
-@unittest.skip(NOT_IMPLEMENTED)
 class StashApplyPopDropTests(_StashCase):
     def test_pop_restores_changes_and_drops_the_entry(self):
         self.put("a.txt", b"one\nTWO\nthree\n")
@@ -453,7 +446,6 @@ class StashApplyPopDropTests(_StashCase):
         self.assertEqual(self.get("bin.dat"), new_binary)
 
 
-@unittest.skip(NOT_IMPLEMENTED)
 class StashStorageTests(_StashCase):
     def test_entries_are_git_style_stash_commits(self):
         self.put("a.txt", b"tracked change\n")
@@ -492,7 +484,6 @@ class StashStorageTests(_StashCase):
         self.assertIn("corrupt", self.git_fail("stash", "list").err)
 
 
-@unittest.skip(NOT_IMPLEMENTED)
 class StashMultiUserTests(_StashCase):
     """The stash is local: it is never pushed, fetched or cloned."""
 

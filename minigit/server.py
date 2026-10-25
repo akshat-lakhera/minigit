@@ -8,6 +8,7 @@ Endpoints (every request needs ``X-Minigit-Protocol: 1``)::
     GET  /<repo>/info/refs    {"protocol", "head", "refs"} read
     POST /<repo>/fetch        JSON {want, have} -> pack    read
     POST /<repo>/push         MGPUSH1 frame -> JSON        write
+    *    /<repo>/pulls...     pull requests (minigit/pulls.py)
 """
 from __future__ import annotations
 
@@ -523,14 +524,16 @@ class MinigitHandler(BaseHTTPRequestHandler):
             return
 
         repo_name, rest = parts[0], parts[1:]
-        # A repository the caller may not read looks exactly like a missing one, so names of
-        # private repositories cannot be discovered: anonymous callers get 401, signed-in
-        # callers get 404.
-        if not cfg.repo_exists(repo_name) or not cfg.can_read(user, repo_name):
+        # Anonymous callers get 401 for a repository they may not read, whether it exists or not,
+        # so private names are not discovered anonymously. A signed-in caller gets 404 for a
+        # missing repository and 403 "permission denied" for one it may not read (server-admin
+        # feature: an admin must be able to tell "no access" from "no such repository").
+        if not cfg.repo_exists(repo_name) or (user is None and not cfg.can_read(user, repo_name)):
             if user is None:
                 raise HttpError(401, "unauthorized", f"authentication required to access '{repo_name}'",
                                 headers=[("WWW-Authenticate", 'Basic realm="minigit"')])
             raise HttpError(404, "not_found", f"repository '{repo_name}' not found")
+        self._require(cfg.can_read(user, repo_name), user, "read", repo_name)
 
         if rest == ["info", "refs"]:
             if method not in ("GET", "HEAD"):
@@ -553,6 +556,11 @@ class MinigitHandler(BaseHTTPRequestHandler):
             body = self._read_body()
             status, payload = process_push(root, repo_name, user or "-", body, cfg)
             self._send_json(status, payload)
+            return
+        if rest[:1] == ["pulls"]:
+            from minigit import pulls  # lazy, like the web UI: pull requests (features/pull-requests-lite.md)
+
+            pulls.handle(self, cfg, user, repo_name, rest[1:])
             return
         raise HttpError(404, "not_found", f"no such endpoint: {path}")
 

@@ -270,6 +270,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--no-ff", dest="no_ff", action="store_true", help="always create a merge commit")
     s.add_argument("rev", nargs="?", help="branch or revision to merge")
     _m("cherry").add_parser(sub)  # cherry-pick, revert (minigit/cherry.py)
+    _m("stash").add_parser(sub)  # stash (minigit/stash.py)
+    _m("pr").add_parser(sub)  # pr (minigit/pr.py)
+    _m("rebase").add_parser(sub)  # rebase (minigit/rebase.py)
 
     s = cmd("reset", "Reset HEAD, the index or files")
     g = s.add_mutually_exclusive_group()
@@ -328,23 +331,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--max-push-bytes", dest="max_push_bytes", type=int, default=256 << 20,
                    help=argparse.SUPPRESS)
 
-    s = cmd("server", "Administer a server root: init, add-user, create-repo, list")
+    s = cmd("server", "Administer a server root: users, tokens, repositories, permissions")
     ss = s.add_subparsers(dest="server_cmd", metavar="<subcommand>", parser_class=_Parser)
-    t = ss.add_parser("init", help="create the server root")
-    t.add_argument("root")
-    t = ss.add_parser("add-user", help="add a user and print the token")
-    t.add_argument("root")
-    t.add_argument("name")
-    t.add_argument("--reset", action="store_true", help="issue a new token for an existing user")
-    t = ss.add_parser("create-repo", help="create a bare repository")
-    t.add_argument("root")
-    t.add_argument("name")
-    t.add_argument("--readers", default="*", help="comma separated users or '*'")
-    t.add_argument("--writers", default="*", help="comma separated users or '*'")
-    t.add_argument("--public", action="store_true", help="allow anonymous reads")
-    t.add_argument("--allow-force", dest="allow_force", action="store_true", help="allow forced pushes")
-    t = ss.add_parser("list", help="list users and repositories")
-    t.add_argument("root")
+    _m("serveradmin").add_server_parsers(ss)
 
     # --- plumbing --------------------------------------------------------
     cmd("fsck", "Verify the object store and ref connectivity")
@@ -777,22 +766,7 @@ def _split_users(value: str | None) -> tuple[str, ...]:
 
 
 def cmd_server(ns, cwd):
-    auth = _m("auth")
-    if not ns.server_cmd:
-        raise _usage("server: a subcommand is required (init, add-user, create-repo, list)")
-    root = _abs(cwd, ns.root)
-    auth.server_init(root)
-    if ns.server_cmd == "init":
-        _say(f"Initialized minigit server root in {root}")
-    elif ns.server_cmd == "add-user":
-        _say(auth.add_user(root, ns.name, reset=ns.reset))
-    elif ns.server_cmd == "create-repo":
-        auth.create_repo(root, ns.name, readers=_split_users(ns.readers),
-                         writers=_split_users(ns.writers), public=ns.public,
-                         allow_force=ns.allow_force)
-        _say("/" + ns.name)
-    elif ns.server_cmd == "list":
-        _say(auth.list_server(root))
+    return _m("serveradmin").cmd_server(ns, cwd)
 
 
 def cmd_fsck(ns, cwd):
@@ -857,6 +831,9 @@ _COMMANDS = {
     "grep": lambda ns, cwd: _m("grep").cmd_grep(ns, cwd),
     "cherry-pick": lambda ns, cwd: _m("cherry").cmd_cherry_pick(ns, cwd),
     "revert": lambda ns, cwd: _m("cherry").cmd_revert(ns, cwd),
+    "stash": lambda ns, cwd: _m("stash").cmd_stash(ns, cwd),
+    "pr": lambda ns, cwd: _m("pr").cmd_pr(ns, cwd),
+    "rebase": lambda ns, cwd: _m("rebase").cmd_rebase(ns, cwd),
 }
 
 

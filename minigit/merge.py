@@ -353,6 +353,9 @@ def merge(repo: Repository, rev: str, *, message: str | None = None, label: str 
     repo.require_worktree()
     store = repo.objects
     op = repo.operation_in_progress()
+    if op is not None and op[0] == "rebase":
+        raise MinigitError("cannot merge: rebase in progress",
+                           hint="use 'minigit rebase --continue', '--skip' or '--abort'")
     if op is not None:
         raise MinigitError(f"you have not concluded your {op[0]} ({OPERATION_STATE_FILES[op[0]]} exists)",
                            hint=f"commit the result, or run 'minigit {op[0]} --abort'")

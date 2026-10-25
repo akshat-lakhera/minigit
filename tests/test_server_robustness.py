@@ -243,13 +243,15 @@ class TestCliCollab(unittest.TestCase):
         res = self.cli("clone", f"{self.srv.url}/proj", "anon", check=False, env=bad)
         self.assertIn("authentication failed", res.err)
 
-    def test_private_repo_looks_like_a_missing_one(self):
+    def test_private_repo_is_denied_not_missing(self):
         auth.add_user(self.root, "bob")
         auth.create_repo(self.root, "secret", readers=["bob"], writers=["bob"])
         a = self.cli("clone", f"{self.srv.url}/secret", "s1", check=False)
         b = self.cli("clone", f"{self.srv.url}/nothere", "s2", check=False)
         self.assertEqual(a.returncode, 1)
-        self.assertEqual(a.err.replace("secret", "X"), b.err.replace("nothere", "X"))
+        self.assertIn("permission denied", a.err)
+        self.assertEqual(b.returncode, 1)
+        self.assertIn("not found", b.err)
 
 
 class _CutProxy(threading.Thread):

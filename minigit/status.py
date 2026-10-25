@@ -46,6 +46,7 @@ class StatusResult:
     entries: list[tuple[str, str]] = field(default_factory=list)
     cherry_picking: str | None = None   # sha from CHERRY_PICK_HEAD
     reverting: str | None = None        # sha from REVERT_HEAD
+    rebasing: tuple[str | None, str] | None = None   # (branch or None if detached, onto sha) during a rebase
 
     def is_clean(self) -> bool:
         return not self.entries
@@ -130,8 +131,10 @@ def compute_status(repo) -> StatusResult:
                 continue  # a tracked file whose on-disk name differs only in case
             entries.append(("??", p))
     entries.sort(key=lambda e: (e[1], e[0]))
+    from minigit.rebase import status_info
+
     return StatusResult(branch, head, detached, unborn, upstream, ahead, behind, merging, entries,
-                        repo.cherry_pick_head(), repo.revert_head())
+                        repo.cherry_pick_head(), repo.revert_head(), status_info(repo))
 
 
 def _plural(n: int) -> str:
@@ -140,7 +143,9 @@ def _plural(n: int) -> str:
 
 def format_status_long(st: StatusResult) -> str:
     lines: list[str] = []
-    if st.detached:
+    if st.rebasing is not None:
+        lines.append(f"rebase in progress; onto {st.rebasing[1][:7]}")
+    elif st.detached:
         lines.append(f"HEAD detached at {(st.head or '')[:7]}")
     else:
         lines.append(f"On branch {st.branch}")
@@ -185,6 +190,14 @@ def format_status_long(st: StatusResult) -> str:
             lines.append(f'  (fix conflicts and run "minigit {action} --continue")' if unmerged
                          else f'  (all conflicts fixed: run "minigit {action} --continue")')
             lines.append(f'  (use "minigit {action} --abort" to cancel the {action} operation)')
+    if st.rebasing is not None:
+        rb_branch, rb_onto = st.rebasing
+        what = f"branch '{rb_branch}'" if rb_branch else "a detached HEAD"
+        lines.append(f"You are currently rebasing {what} on '{rb_onto[:7]}'.")
+        lines.append('  (fix conflicts and then run "minigit rebase --continue")' if unmerged
+                     else '  (all conflicts fixed: run "minigit rebase --continue")')
+        lines.append('  (use "minigit rebase --skip" to skip this patch)')
+        lines.append('  (use "minigit rebase --abort" to check out the original branch)')
 
     sections = [
         ("Changes to be committed:", staged),

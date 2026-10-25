@@ -3,7 +3,8 @@
 server.json handling, token auth and repo ACLs (SPEC.md section 7.1)::
 
     {"version": 1,
-     "users": {"alice": {"token_sha256": "<hex>"}},
+     "users": {"alice": {"token_sha256": "<hex>", "token_created": 1700000000,
+                         "tokens": {"ci": {"sha256": "<hex>", "created": 1700000000}}}},
      "repos": {"proj": {"readers": ["*"], "writers": ["*"], "public": false, "allow_force": false}}}
 """
 from __future__ import annotations
@@ -14,6 +15,7 @@ import json
 import os
 import re
 import secrets
+import time
 from typing import Callable, Sequence
 
 from minigit import errors, util
@@ -26,6 +28,9 @@ LOCK_TIMEOUT = 5.0
 
 _USER_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 _REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+_TOKEN_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+_HASH_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+DEFAULT_TOKEN = "default"  # the name under which the user's ``token_sha256`` is listed
 
 
 def hash_token(token: str) -> str:
@@ -37,6 +42,14 @@ def validate_user_name(name: str) -> None:
         raise errors.MinigitError(
             f"invalid user name '{name}'",
             hint="user names use letters, digits, '_', '.', '-' and are at most 64 characters",
+        )
+
+
+def validate_token_name(name: str) -> None:
+    if not isinstance(name, str) or not _TOKEN_NAME_RE.match(name):
+        raise errors.MinigitError(
+            f"invalid token name '{name}'",
+            hint="token names use letters, digits, '_', '.', '-' and are at most 64 characters",
         )
 
 
@@ -104,6 +117,37 @@ def _load(root: str) -> dict:
     return data
 
 
+def usable_hash(value: object) -> str | None:
+    """The lower-case hex digest in ``value``, or None when it is not a well-formed SHA-256 digest."""
+    if isinstance(value, str) and _HASH_RE.match(value):
+        return value.lower()
+    return None
+
+
+def user_tokens(record: object) -> list[tuple[str, str, int | None]]:
+    """The usable tokens of a user record as ``(name, sha256, created)``: the default token
+    (``token_sha256``) first, then the named ones by name. Malformed entries are skipped; ``created``
+    is None when unknown (records written before named tokens existed have no time)."""
+    out: list[tuple[str, str, int | None]] = []
+    if not isinstance(record, dict):
+        return out
+
+    def stamp(value: object) -> int | None:
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    digest = usable_hash(record.get("token_sha256"))
+    if digest is not None:
+        out.append((DEFAULT_TOKEN, digest, stamp(record.get("token_created"))))
+    named = record.get("tokens")
+    if isinstance(named, dict):
+        for name in sorted(k for k in named if isinstance(k, str)):
+            entry = named[name]
+            digest = usable_hash(entry.get("sha256")) if isinstance(entry, dict) else None
+            if digest is not None:
+                out.append((name, digest, stamp(entry.get("created"))))
+    return out
+
+
 def _dump(data: dict) -> bytes:
     return (json.dumps(data, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
@@ -132,13 +176,17 @@ class ServerConfig:
     def authenticate(self, user: str, token: str) -> bool:
         if not isinstance(user, str) or not isinstance(token, str):
             return False
-        record = self.users.get(user)
-        stored = record.get("token_sha256") if isinstance(record, dict) else None
-        if not isinstance(stored, str):
+        candidate = hash_token(token).encode("ascii")
+        stored = [h for _, h, _ in user_tokens(self.users.get(user))]
+        if not stored:
             # compare anyway so that unknown users cost the same as bad tokens
-            hmac.compare_digest(hash_token(token), hash_token(""))
+            hmac.compare_digest(candidate, hash_token("").encode("ascii"))
             return False
-        return hmac.compare_digest(hash_token(token), stored)
+        ok = False
+        for digest in stored:  # no early exit: every token is compared
+            if hmac.compare_digest(candidate, digest.encode("ascii")):
+                ok = True
+        return ok
 
     # -- repos -------------------------------------------------------------
     def _repo(self, name: str) -> dict | None:
@@ -201,7 +249,8 @@ def _new_token() -> str:
 
 
 def add_user(root: str, name: str, *, reset: bool = False) -> str:
-    """Create a user (or reset its token with ``reset``) and return the new token."""
+    """Create a user (or replace its default token with ``reset``) and return the new token.
+    Named tokens and any other fields of an existing record are kept."""
     validate_user_name(name)
     server_init(root)
     token = _new_token()
@@ -209,7 +258,11 @@ def add_user(root: str, name: str, *, reset: bool = False) -> str:
     def mutate(data: dict) -> None:
         if name in data["users"] and not reset:
             raise errors.MinigitError(f"user '{name}' already exists (use --reset to issue a new token)")
-        data["users"][name] = {"token_sha256": hash_token(token)}
+        record = data["users"].get(name)
+        if not isinstance(record, dict):
+            record = data["users"][name] = {}
+        record["token_sha256"] = hash_token(token)
+        record["token_created"] = int(time.time())
 
     _modify(root, mutate)
     return token
@@ -264,7 +317,8 @@ def list_server(root: str) -> str:
     lines = ["users:"]
     if cfg.users:
         for name in sorted(cfg.users):
-            lines.append(f"  {name}")
+            names = ",".join(t[0] for t in user_tokens(cfg.users[name])) or "-"
+            lines.append(f"  {name}  tokens={names}")
     else:
         lines.append("  (none)")
     lines.append("repos:")

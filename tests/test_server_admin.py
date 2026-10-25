@@ -10,14 +10,9 @@ temporary directories; the live tests also start ``minigit serve`` on a free
 localhost port and always stop it before the temporary directory goes. Nothing
 imports the library or ``tests/helpers.py``.
 
-Both classes are skipped (``unittest.skip("feature not implemented yet")``) until
-the feature is implemented. While implementing, set ``MINIGIT_RUN_FUTURE=1``
-(PowerShell: ``$env:MINIGIT_RUN_FUTURE = "1"``) and run from E:\\ideas\\minigit::
+Run from the repository root:
 
-    python -m unittest tests_future.test_server_admin -v
-
-Once everything passes, move the file to ``tests_blackbox/`` and replace ``SKIP``
-with a no-op (or delete the two ``@SKIP`` lines).
+    python -m unittest tests.test_server_admin -v
 """
 from __future__ import annotations
 
@@ -42,12 +37,6 @@ CLI_TIMEOUT = 60
 TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{20,64}$")
 ISO_RE = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
 REPO_KEYS = {"readers", "writers", "public", "allow_force"}
-SKIP_REASON = "feature not implemented yet"
-if os.environ.get("MINIGIT_RUN_FUTURE") == "1":
-    def SKIP(cls):  # run the tests while the feature is being implemented
-        return cls
-else:
-    SKIP = unittest.skip(SKIP_REASON)
 
 
 # --------------------------------------------------------------------------
@@ -186,7 +175,6 @@ class _AdminCase(unittest.TestCase):
 # offline admin CLI behaviour (no server needed)
 # ==========================================================================
 
-@SKIP
 class ServerAdminCliTests(_AdminCase):
 
     # -- tokens ------------------------------------------------------------
@@ -605,7 +593,6 @@ class _LiveServer:
             self._log = None
 
 
-@SKIP
 class ServerAdminLiveTests(_AdminCase):
 
     def setUp(self):

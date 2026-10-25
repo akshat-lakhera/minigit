@@ -111,6 +111,9 @@ def _conflicts_message(message: str, conflicts: list[str]) -> str:
 
 def _require_no_operation(repo: Repository) -> None:
     op = repo.operation_in_progress()
+    if op is not None and op[0] == "rebase":
+        raise MinigitError("rebase in progress; finish it first",
+                           hint="use 'minigit rebase --continue', '--skip' or '--abort'")
     if op is not None:
         kind = op[0]
         raise MinigitError(f"you have not concluded your {kind} ({_state_file(kind)} exists)",
@@ -256,7 +259,7 @@ def _apply(repo: Repository, *, action: str, source: str, subject: str, base: Fl
         outcome.conflicts = sorted(res.stages)
         repo.refs.write_special(_state_file(action), source)
         repo.write_state("MERGE_MSG", _conflicts_message(message, outcome.conflicts).encode("utf-8"))
-        verb = "apply" if action == "cherry-pick" else "revert"
+        verb = "revert" if action == "revert" else "apply"   # cherry-pick, rebase
         outcome.error = f"could not {verb} {source[:7]}... {subject}"
         outcome.hint = (f"after resolving the conflicts, mark them with 'minigit add <paths>', then run "
                         f"'minigit {action} --continue' (or 'minigit {action} --abort')")

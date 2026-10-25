@@ -515,12 +515,13 @@ class TestServerHttp(ServerTestCase):
 
     def test_private_repo_hidden_from_unauthorized_user(self):
         auth.create_repo(self.root, "secret", readers=["bob"], writers=["bob"])
-        # indistinguishable from a repository that does not exist (404 signed in, 401 anonymous)
+        # a signed-in user without access is told so (403, server-admin feature); a missing
+        # repository is 404; anonymous callers cannot tell the two apart (401 for both)
         status, _, body = self.get_json("/secret/info/refs", user="alice")
         status2, _, body2 = self.get_json("/missing/info/refs", user="alice")
-        self.assertEqual((status, body["code"]), (404, "not_found"))
-        self.assertEqual(status, status2)
-        self.assertEqual(body["error"].replace("secret", "X"), body2["error"].replace("missing", "X"))
+        self.assertEqual((status, body["code"]), (403, "forbidden"))
+        self.assertIn("permission denied", body["error"])
+        self.assertEqual((status2, body2["code"]), (404, "not_found"))
         a, _, _ = self.get_json("/secret/info/refs", user=None)
         b, _, _ = self.get_json("/missing/info/refs", user=None)
         self.assertEqual((a, b), (401, 401))

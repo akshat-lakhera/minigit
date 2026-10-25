@@ -54,6 +54,8 @@ def person(name):
 
 def main(tmp):
     srv = os.path.join(tmp, "srv")
+    # Keep the demo users' tokens out of the real ~/.minigit-credentials.json.
+    ENV["MINIGIT_CREDENTIALS"] = os.path.join(tmp, "credentials.json")
     ready = os.path.join(tmp, "ready.txt")
     proc = None
     try:
@@ -62,7 +64,7 @@ def main(tmp):
         tokens = {}
         for user in ("alice", "bob"):
             r = mg("server", "add-user", srv, user)
-            m = (r.stdout + " " + r.stderr).split()
+            m = r.stdout.split()  # the token is the only thing on stdout; stderr carries a note
             if not m:
                 raise SystemExit("demo failed: could not find a token in add-user output")
             tokens[user] = m[-1]

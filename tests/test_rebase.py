@@ -1,13 +1,9 @@
 """Acceptance tests for ``minigit rebase`` (design: features/rebase.md).
 
-They drive the real CLI (``python -m minigit``) in temporary repositories and
-pass once the feature is implemented. Until then every class is skipped.
+They drive the real CLI (``python -m minigit``) in temporary repositories.
 Run them from the project root with::
 
-    python -m unittest tests_future.test_rebase -v
-
-When the feature lands, delete the ``@unittest.skip`` lines and move this file
-to ``tests/test_e2e_rebase.py`` (see features/rebase.md, implementation plan).
+    python -m unittest tests.test_rebase -v
 """
 from __future__ import annotations
 
@@ -18,7 +14,6 @@ import unittest
 
 from tests.helpers import ServerProcess, make_env, read, run, write
 
-NOT_IMPLEMENTED = "feature not implemented yet"
 _ONELINE = re.compile(r"^[0-9a-f]{7}(?: \(.*?\))? (.*)$")
 
 
@@ -120,7 +115,6 @@ class _RebaseCase(unittest.TestCase):
 # clean rebases
 # ===========================================================================
 
-@unittest.skip(NOT_IMPLEMENTED)
 class RebaseCleanTests(_RebaseCase):
 
     def test_linear_rebase_replays_commits_on_top_of_upstream(self):
@@ -301,7 +295,6 @@ class RebaseCleanTests(_RebaseCase):
 # conflicts: stop, --continue, --skip, --abort
 # ===========================================================================
 
-@unittest.skip(NOT_IMPLEMENTED)
 class RebaseConflictTests(_RebaseCase):
 
     def test_conflict_stops_then_continue_finishes(self):
@@ -494,7 +487,6 @@ class RebaseConflictTests(_RebaseCase):
 # refusals and usage
 # ===========================================================================
 
-@unittest.skip(NOT_IMPLEMENTED)
 class RebaseRefusalTests(_RebaseCase):
 
     def test_refuses_unstaged_and_staged_changes(self):
@@ -563,7 +555,6 @@ class RebaseRefusalTests(_RebaseCase):
 # collaboration: fetch + rebase + push instead of a merge commit
 # ===========================================================================
 
-@unittest.skip(NOT_IMPLEMENTED)
 class RebaseCollaborationTests(unittest.TestCase):
 
     def setUp(self):

@@ -53,7 +53,7 @@ def _resolve_base(repo: Repository, base: str, spec: str) -> str:
         if sha is None:
             raise _unknown(spec)
         return sha
-    if base in ("ORIG_HEAD", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD"):
+    if base in ("ORIG_HEAD", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD"):
         sha = repo.refs.read_special(base)
         if sha is None or not is_hex_sha(sha):
             raise _unknown(spec)

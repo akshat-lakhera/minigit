@@ -4,9 +4,14 @@ A minimal pull-request flow on the minigit server: open a request from branch A 
 requests, view the diff, merge (or close) it. Everything lives on the server next to the bare repo; the
 client talks to it through new `/<repo>/pulls...` endpoints and a new `minigit pr` command.
 
-Status: **designed, not implemented.** Acceptance tests: `tests_future/test_pull_requests_lite.py`
-(7 tests, skipped unless `MINIGIT_RUN_FUTURE=1`; when green, move the file to `tests_blackbox/` and drop
-the `@SKIP`).
+Status: **implemented** (`minigit/pulls.py` server side, `minigit/pr.py` client side, `HttpRemote.*pull*`
+in `transport.py`). Acceptance tests: `tests/test_pull_requests_lite.py` (7 end-to-end tests, no longer
+skipped); in-process edge cases (unrelated histories, base moved during the merge, file/dir clash, lock
+timeouts, corrupt store, body limit) in `tests/test_pulls.py`. Implementation notes that differ from the
+text below: the HTTP routing lives in `pulls.handle()` (hooked from `server._handle` with a few lines,
+like the web UI) instead of a `_handle_pulls` method, `process_pull_merge` is in `pulls.py`, and the
+1 MiB JSON cap is checked from `Content-Length` before `_read_body()` (which is unchanged); `close` also
+takes the per-repo lock so a merge and a close of the same PR cannot interleave.
 
 Verified against the code on 2026-10-20 (server.py, transport.py, cli.py, merge.py, graph.py, diff.py,
 remote.py as integrated): with `MINIGIT_RUN_FUTURE=1` all 7 tests fail at their **first** `pr` command

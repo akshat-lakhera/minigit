@@ -284,6 +284,16 @@ def fsck(repo) -> list[str]:
                 tips["HEAD"] = head
     except errors.MinigitError as e:
         problems.append(f"HEAD: {_msg(e)}")
+    try:  # stash entries (.minigit/stash, features/stash.md) are tips too, though not refs
+        with open(repo.gpath("stash"), "rb") as f:
+            stash_lines = f.read().decode("ascii", "replace").splitlines()
+    except OSError:
+        stash_lines = []
+    for i, line in enumerate(stash_lines):
+        if len(line.strip()) == 40 and all(c in "0123456789abcdef" for c in line.strip()):
+            tips[f"stash@{{{i}}}"] = line.strip()
+        else:
+            problems.append(f"stash@{{{i}}}: .minigit/stash line {i + 1} is not a commit id")
     verified: set[str] = set()
     tree_memo: set[str] = set()
     for name, sha in sorted(tips.items()):

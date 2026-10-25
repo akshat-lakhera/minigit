@@ -16,13 +16,9 @@ From the original bug lists (`bugs_A..D.json`); everything else on those lists w
 Noticed while running `demo.py`:
 
 3. **Wording of the push rejection hint is redundant:** "Run 'minigit pull' first, then push again (pull first)."
-4. **`server create-repo` prints just `/project`**, which does not say what happened (and no clone URL).
-5. **`add-user` prints the bare token** with no label or hint that it is shown only once.
 6. **`tests_future/test_web_ui.py` is stale:** the web UI is built, so those tests should move to
    `tests_blackbox/` (and un-skip). Same for the cherry-pick/revert and blame/grep specs, and the
    `Status: designed, not implemented` lines in `features/web-ui.md`, `blame-grep.md`, `cherry-pick-revert.md`.
-7. `features/server-admin.md` is referenced by `tests_future/test_server_admin.py` but does not exist in
-   `features/`.
 
 ## Next features
 
@@ -31,10 +27,6 @@ Each has acceptance tests in `tests_future/` (run with `MINIGIT_RUN_FUTURE=1`); 
 
 | Feature | Tests | What it is |
 |---|---|---|
-| stash | `test_stash.py` (~28) | `stash push/pop/apply/drop/list`, `-m`, `--include-untracked`; git-style stash commits, local only |
-| rebase | `test_rebase.py` (~28) | `rebase [--onto]`, `--continue/--skip/--abort`; replay commits, drop already-upstream ones, linearize merges |
-| server-admin | `test_server_admin.py` (25) | `server remove-user`, `add-token`, `list-tokens`, `revoke-token`, `perm`, `set-repo`; several named tokens per user; `create-repo --readers ""` as an explicit empty list |
-| pull-requests-lite | `test_pull_requests_lite.py` (7), `features/pull-requests-lite.md` | `minigit pr open/list/show/diff/merge/close` backed by `/<repo>/pulls...` endpoints; merge commit created on the server under the repo lock |
 
 ## Further ideas
 

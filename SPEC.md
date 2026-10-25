@@ -408,9 +408,13 @@ Notation:
 ### 7.1 server.json and auth
 ```json
 {"version": 1,
- "users": {"alice": {"token_sha256": "<hex>"}},
+ "users": {"alice": {"token_sha256": "<hex>", "token_created": 1700000000,
+                     "tokens": {"ci": {"sha256": "<hex>", "created": 1700000000}}}},
  "repos": {"proj": {"readers": ["*"], "writers": ["*"], "public": false, "allow_force": false}}}
 ```
+- A user authenticates with the `default` token (`token_sha256`) or any named token in `tokens`; records that only
+  have `token_sha256` (older versions) are valid as they are. Malformed token entries are ignored. See
+  `features/server-admin.md`.
 - `"*"` means any authenticated user. `public: true` allows anonymous reads.
 - The file is reloaded on every request and written under `LockFile(server.json, timeout=5)` + `atomic_write`.
 - **Name rules:** user names match `^[A-Za-z0-9_.-]{1,64}$`. Repo names match `^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$` and must not contain `..`.
@@ -418,7 +422,7 @@ Notation:
 - **Transport auth:** `Authorization: Basic base64(user:token)`.
   - Missing or bad credentials: 401 with `WWW-Authenticate: Basic realm="minigit"`.
   - Authenticated user who may read the repo but not write to it: 403.
-  - Unknown repo, or a repo the caller may not read: the same response, so private repo names cannot be discovered. Anonymous callers get 401, signed-in callers get 404 `repository '<name>' not found`.
+  - Unknown repo, or a repo the caller may not read: anonymous callers get 401 for both, so private repo names cannot be discovered anonymously. A signed-in caller gets 404 `repository '<name>' not found` for an unknown repo and 403 `permission denied: user '<u>' may not read '<name>'` for one it may not read (changed by `server-admin`).
   - An empty ACL list (`--readers ""`) means nobody; it is never promoted to `*`.
 - **Client credential order:**
   1. `MINIGIT_USER` + `MINIGIT_TOKEN`.
