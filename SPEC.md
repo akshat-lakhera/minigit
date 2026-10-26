@@ -865,7 +865,7 @@ Unit tests use `tempfile.TemporaryDirectory(ignore_cleanup_errors=True)` and do 
 ### M1 core
 ```python
 # __init__.py
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # errors.py
 class MinigitError(Exception):
