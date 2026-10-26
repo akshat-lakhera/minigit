@@ -678,7 +678,11 @@ class AddTests(Base):
         self.write("ok.txt", "ok\n")
         self.mg("add", "ok.txt")
         self.mg("commit", "-m", "ok")
-        self.write("MINIGI~1", "alias of the gitdir on Windows\n")
+        try:
+            self.write("MINIGI~1", "alias of the gitdir on Windows\n")
+        except (PermissionError, IsADirectoryError):
+            # 8.3 short names are enabled on this volume: MINIGI~1 *is* the .minigit directory
+            self.skipTest("MINIGI~1 is the short name of .minigit on this file system")
         res = self.fail_mg("add", ".")
         self.assertTrue(res.err.startswith("error: "), str(res))
         self.assertNotIn("internal error", res.err)
