@@ -216,11 +216,16 @@ def patch_id(store, sha: str, cache: dict | None = None) -> str | None:
 
 
 def _commits_to_replay(store, head: str, upstream: str) -> list[str]:
-    """Non-merge commits reachable from ``head`` but not from ``upstream``, parents first."""
-    from .graph import ancestors, topo_walk
+    """Non-merge commits reachable from ``head`` but not from ``upstream``, parents first.
+
+    The order is git's (``git rev-list --reverse --topo-order --no-merges UPSTREAM..HEAD``): the merges
+    take part in the topological sort and are dropped afterwards, so below a merge the first-parent
+    lineage is replayed before the second-parent lineage, not the older commits before the newer ones.
+    """
+    from .graph import ancestors, topo_order
 
     excluded = ancestors(store, [upstream])
-    newest_first = [sha for sha, c in topo_walk(store, [head]) if sha not in excluded and len(c.parents) <= 1]
+    newest_first = [sha for sha, c in topo_order(store, [head], excluded) if len(c.parents) <= 1]
     return newest_first[::-1]
 
 
@@ -281,6 +286,18 @@ def _default_upstream(repo: Repository) -> tuple[str, str]:
         raise MinigitError(f"the upstream '{short_ref(up[0])}' of branch '{branch}' does not exist",
                            hint="run 'minigit fetch' first")
     return short_ref(up[0]), up[1]
+
+
+def check_preconditions(repo: Repository) -> None:
+    """The checks ``start`` makes before touching anything (features/rebase.md 1.3), for callers
+    that want to fail early with rebase's own messages: ``pull --rebase`` runs them before fetching."""
+    repo.require_worktree()
+    _refuse_operation(repo)
+    if repo.head_commit() is None:
+        current = repo.refs.current_branch() or "HEAD"
+        raise _m("errors").MinigitError(
+            f"cannot rebase: your current branch '{current}' does not have any commits yet")
+    _require_clean(repo)
 
 
 def start(repo: Repository, upstream: str | None, branch: str | None = None, *,

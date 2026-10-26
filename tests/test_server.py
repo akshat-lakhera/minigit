@@ -631,8 +631,8 @@ class TestServerHttp(ServerTestCase):
 
     def test_bad_ref_names_are_400(self):
         c = self.commit({"a": b"a"}, [], "c")
-        for ref in ("refs/tags/v1", "main", "refs/heads/a..b", "refs/heads/x.lock", "refs/heads/", "HEAD",
-                    "refs/heads/a b", "refs/heads/.hidden"):
+        for ref in ("refs/remotes/origin/main", "refs/notes/x", "main", "refs/heads/a..b", "refs/heads/x.lock",
+                    "refs/heads/", "HEAD", "refs/heads/a b", "refs/heads/.hidden", "refs/tags/a..b"):
             status, res = self.push([{"ref": ref, "old": None, "new": c}], self.pack_for([c]))
             self.assertEqual(status, 400, ref)
             self.assertEqual(res["code"], "bad_request")
@@ -869,6 +869,99 @@ class TestFetchPush(ServerTestCase):
         status, res = self.push([{"ref": "refs/heads/feature", "old": base, "new": None}], b"")
         self.assertEqual(status, 409)
         self.assertEqual(res["results"][0]["reason"], "stale")
+
+    def _annotated(self, target: str, name: str = "v1") -> str:
+        sig = objects.Signature("Tagger", "t@example.com", 1_700_000_060, 0)
+        tag = objects.Tag(target, self.local.read(target)[0], name, sig, f"release {name}\n")
+        return self.local.write("tag", objects.serialize_tag(tag))
+
+    def test_push_lightweight_and_annotated_tags(self):
+        base = self.push_initial()
+        c2 = self.commit({"a.txt": b"two\n"}, [base], "two")
+        # a lightweight tag of a commit the server already has: no pack needed
+        status, res = self.push([{"ref": "refs/tags/v0", "old": None, "new": base}], b"")
+        self.assertEqual(status, 200, res)
+        self.assertEqual(res["results"][0], {"ref": "refs/tags/v0", "status": "ok", "old": None, "new": base})
+        # an annotated tag of a new commit: the pack carries the tag object and the commit's closure
+        tag = self._annotated(c2)
+        data = self.pack_for([tag], [base])
+        self.assertEqual(pack.pack_count(data), 4)  # tag, commit, tree, blob
+        status, res = self.push([{"ref": "refs/tags/v1", "old": None, "new": tag}], data)
+        self.assertEqual(status, 200, res)
+        srv = self.server_repo()
+        self.assertEqual(srv.refs.resolve("refs/tags/v1"), tag)
+        self.assertEqual(srv.objects.read(tag)[0], "tag")
+        self.assertEqual(pack.fsck(srv), [])
+        # info/refs advertises the tag refs and the peeled commit of the annotated one
+        status, _, body = self.get_json("/proj/info/refs")
+        self.assertEqual(body["refs"], {"refs/heads/main": base, "refs/tags/v0": base, "refs/tags/v1": tag})
+        self.assertEqual(body["peeled"], {"refs/tags/v1": c2})
+        self.assertEqual(body["head"], "refs/heads/main")
+        # the tag object and the commit it names are fetchable wants (reachable through the tag)
+        status, headers, data = self.fetch([tag], [base])
+        self.assertEqual(status, 200)
+        self.assertEqual(pack.pack_count(data), 4)
+        status, _, data = self.fetch([c2], [base])
+        self.assertEqual(status, 200)
+        # the default branch is not moved by a tag push
+        self.assertEqual(srv.refs.head_target(), "refs/heads/main")
+        self.assertEqual(srv.refs.resolve("refs/heads/main"), base)
+        with open(os.path.join(self.root, "audit.log"), "rb") as fh:
+            audit = fh.read().decode().splitlines()
+        self.assertIn("refs/tags/v1", audit[-1])
+
+    def test_tag_push_rejections_and_delete(self):
+        base = self.push_initial()
+        c2 = self.commit({"a.txt": b"two\n"}, [base], "two")
+        status, _ = self.push([{"ref": "refs/tags/v1", "old": None, "new": base}], b"")
+        self.assertEqual(status, 200)
+        # moving an existing tag: tag-exists (not non-fast-forward, even though c2 descends from base)
+        status, res = self.push([{"ref": "refs/tags/v1", "old": base, "new": c2}], self.pack_for([c2], [base]))
+        self.assertEqual(status, 409)
+        self.assertEqual(res["results"][0]["reason"], "tag-exists")
+        self.assertEqual(res["results"][0]["message"],
+                         "tag 'v1' already exists on the remote (use --force to replace it)")
+        self.assertEqual(self.server_repo().refs.resolve("refs/tags/v1"), base)
+        # --force on a repo without allow_force: force-disabled
+        status, res = self.push([{"ref": "refs/tags/v1", "old": base, "new": c2}], b"", force=True)
+        self.assertEqual(status, 409)
+        self.assertEqual(res["results"][0]["reason"], "force-disabled")
+        # a stale old value is reported as stale
+        status, res = self.push([{"ref": "refs/tags/v1", "old": None, "new": c2}], b"")
+        self.assertEqual(status, 409)
+        self.assertEqual(res["results"][0]["reason"], "stale")
+        # a tag naming a tree, or a tag object whose commit is missing: 422
+        tree = objects.parse_commit(self.local.read_typed(base, "commit")).tree
+        status, res = self.push([{"ref": "refs/tags/t", "old": None, "new": tree}], b"")
+        self.assertEqual(status, 422)
+        sig = objects.Signature("T", "t@example.com", 1, 0)
+        dangling = self.local.write("tag", objects.serialize_tag(objects.Tag("f" * 40, "commit", "d", sig, "m\n")))
+        status, res = self.push([{"ref": "refs/tags/d", "old": None, "new": dangling}],
+                                pack.build_pack(self.local, [dangling]))
+        self.assertEqual(status, 422)
+        self.assertEqual(res["code"], "missing_objects")
+        # a tag clashing with an existing tag's path, and a branch that does not clash with a tag
+        status, res = self.push([{"ref": "refs/tags/v1/x", "old": None, "new": base}], b"")
+        self.assertEqual(status, 409)
+        self.assertEqual(res["results"][0]["reason"], "ref-clash")
+        status, res = self.push([{"ref": "refs/heads/v1", "old": None, "new": base}], b"")
+        self.assertEqual(status, 200, res)
+        # deletes are always allowed
+        status, res = self.push([{"ref": "refs/tags/v1", "old": base, "new": None}], b"")
+        self.assertEqual(status, 200, res)
+        self.assertIsNone(self.server_repo().refs.resolve("refs/tags/v1"))
+        self.assertEqual(pack.fsck(self.server_repo()), [])
+        # with allow_force, --force replaces a tag
+        auth.create_repo(self.root, "forceable", readers=["*"], writers=["alice"], allow_force=True)
+        status, _ = self.push([{"ref": "refs/heads/main", "old": None, "new": base}], self.pack_for([base]),
+                              repo="forceable")
+        self.assertEqual(status, 200)
+        status, _ = self.push([{"ref": "refs/tags/v1", "old": None, "new": base}], b"", repo="forceable")
+        self.assertEqual(status, 200)
+        status, res = self.push([{"ref": "refs/tags/v1", "old": base, "new": c2}], self.pack_for([c2], [base]),
+                                repo="forceable", force=True)
+        self.assertEqual(status, 200, res)
+        self.assertEqual(self.server_repo("forceable").refs.resolve("refs/tags/v1"), c2)
 
     def test_multi_update_is_all_or_nothing(self):
         base = self.push_initial()

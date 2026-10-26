@@ -94,6 +94,12 @@ class FakeRepo:
         self.worktree = os.path.dirname(gitdir)
         self.refs = FakeRefs(branch, remotes)
 
+    def relpath(self, user_path, cwd):
+        return user_path.replace(os.sep, "/").strip("/")
+
+    def head_flat(self):
+        return {}
+
 
 def mod(name: str, **attrs) -> types.ModuleType:
     m = types.ModuleType("minigit." + name)
@@ -235,7 +241,7 @@ class ParserTests(CliTestCase):
     def test_version(self):
         rc, out, _ = self.cli("--version")
         self.assertEqual(rc, 0)
-        self.assertIn("minigit 0.1.0", out)
+        self.assertIn("minigit 0.2.0", out)
 
     def test_help(self):
         rc, out, _ = self.cli("--help")
@@ -395,6 +401,22 @@ class RepoCommandTests(CliTestCase):
         self.assertEqual(rc, 1)
         self.assertEqual(err, "error: pathspec 'nope' did not match any files\n")
 
+    def test_add_all_and_update(self):
+        self.ok("add", "-A")
+        self.ops.add.assert_called_with(self.repo, [], self.cwd, force=False, all_=True)
+        self.ok("add", "--all", "sub")
+        self.ops.add.assert_called_with(self.repo, ["sub"], self.cwd, force=False, all_=True)
+        self.ok("add", "-u")
+        self.ops.add.assert_called_with(self.repo, [], self.cwd, force=False, update=True)
+        self.ok("add", "--update", "--", "sub")
+        self.ops.add.assert_called_with(self.repo, ["sub"], self.cwd, force=False, update=True)
+        rc, _, err = self.cli("add", "-A", "-u")
+        self.assertEqual(rc, 2)
+        self.assertIn("-A and -u cannot be used together", err)
+        out = self.ok("add", "--help")
+        self.assertIn("-A, --all", out)
+        self.assertIn("-u, --update", out)
+
     def test_rm(self):
         out = self.ok("rm", "--cached", "-r", "-f", "a.txt")
         self.ops.rm.assert_called_once_with(self.repo, ["a.txt"], self.cwd, cached=True,
@@ -452,6 +474,17 @@ class RepoCommandTests(CliTestCase):
         self.ops.commit.assert_called_once_with(self.repo, ["one", "two"], all_=True, allow_empty=True, stat=True)
         self.assertEqual(out, "[main 0123456] subject\n")
 
+    def test_commit_amend(self):
+        out = self.ok("commit", "--amend", "-m", "fixed")
+        self.ops.commit.assert_called_once_with(self.repo, ["fixed"], all_=False, allow_empty=False,
+                                                stat=True, amend=True)
+        self.assertEqual(out, "[main 0123456] subject\n")
+        self.assertIn("--amend", self.ok("commit", "--help"))
+
+    def test_cherry_pick_and_revert_help_mention_ranges(self):
+        for name in ("cherry-pick", "revert"):
+            self.assertIn("A..B", self.ok(name, "--help"))
+
     def test_commit_nothing_to_commit(self):
         self.ops.commit.side_effect = self.E.NothingToCommit("nothing to commit, working tree clean")
         rc, _, err = self.cli("commit", "-m", "x")
@@ -481,6 +514,67 @@ class RepoCommandTests(CliTestCase):
         self.ok("show", "HEAD:a.txt")
         self.history.show.assert_called_with(self.repo, "HEAD:a.txt")
 
+    def test_show_stat_and_each_parent(self):
+        self.ok("show", "--stat", "HEAD~1")
+        self.history.show.assert_called_with(self.repo, "HEAD~1", stat=True)
+        self.ok("show", "-m")
+        self.history.show.assert_called_with(self.repo, "HEAD", each_parent=True)
+        self.ok("show", "-m", "--stat", "main")
+        self.history.show.assert_called_with(self.repo, "main", stat=True, each_parent=True)
+
+    def test_diff_stat(self):
+        self.ok("diff", "--stat", "--", "a")
+        self.diff.diff_command.assert_called_with(self.repo, self.cwd, staged=False, revs=[], pathspecs=["a"],
+                                                  stat=True)
+        self.ok("diff", "--staged", "--stat")
+        self.diff.diff_command.assert_called_with(self.repo, self.cwd, staged=True, revs=[], pathspecs=[],
+                                                  stat=True)
+
+    def test_log_graph_stat_and_paths(self):
+        self.repo.relpath = lambda p, cwd: p
+        self.ok("log", "--graph", "--stat", "--", "a.txt", "d")
+        self.history.log_entries.assert_called_with(self.repo, None, None, all_refs=False, paths=["a.txt", "d"])
+        self.history.format_log.assert_called_with(self.repo, [("sha", "commit")], False, graph=True, stat=True,
+                                                   paths=["a.txt", "d"])
+        self.ok("log", "--oneline", "--graph", "main")
+        self.history.log_entries.assert_called_with(self.repo, ["main"], None, all_refs=False)
+        self.history.format_log.assert_called_with(self.repo, [("sha", "commit")], True, graph=True)
+        self.ok("log", "--stat", "-n", "2")
+        self.history.format_log.assert_called_with(self.repo, [("sha", "commit")], False, stat=True)
+
+    def test_log_paths_without_dashdash(self):
+        """git's rule: a non-revision that exists in the work tree or in HEAD is a path."""
+        self.touch("a.txt")
+        self.repo.relpath = lambda p, cwd: p.replace("\\", "/")
+        self.repo.head_flat = lambda: {"d/x.txt": ("100644", SHA)}
+        self.revparse.resolve_rev.side_effect = lambda repo, s: (
+            SHA if s in ("HEAD", "main") else (_ for _ in ()).throw(self.E.RevisionError("unknown revision")))
+        self.ok("log", "main", "a.txt")
+        self.history.log_entries.assert_called_with(self.repo, ["main"], None, all_refs=False, paths=["a.txt"])
+        self.ok("log", "d")  # only in HEAD
+        self.history.log_entries.assert_called_with(self.repo, None, None, all_refs=False, paths=["d"])
+        self.ok("log", "a.txt", "main")  # everything after the first path is a path
+        self.history.log_entries.assert_called_with(self.repo, None, None, all_refs=False, paths=["a.txt", "main"])
+        self.ok("log", "main")
+        self.history.log_entries.assert_called_with(self.repo, ["main"], None, all_refs=False)
+        self.ok("log", "nope")  # unknown names stay revisions for the library's error
+        self.history.log_entries.assert_called_with(self.repo, ["nope"], None, all_refs=False)
+        self.touch("main")
+        rc, _, err = self.cli("log", "main")
+        self.assertEqual(rc, 2)
+        self.assertIn("ambiguous argument 'main': both revision and filename", err)
+        self.assertIn("'--'", err)
+        self.ok("log", "main", "--", "main")
+        self.history.log_entries.assert_called_with(self.repo, ["main"], None, all_refs=False, paths=["main"])
+
+    def test_help_describes_the_stat_and_graph_flags(self):
+        for command, flags in (("diff", ["--stat"]), ("log", ["--graph", "--stat", "'--'"]),
+                               ("show", ["--stat", "-m"])):
+            rc, out, _ = self.cli(command, "--help")
+            self.assertEqual(rc, 0)
+            for flag in flags:
+                self.assertIn(flag, out, (command, flag))
+
 
 # ---------------------------------------------------------------------------
 # Branching
@@ -489,13 +583,50 @@ class RepoCommandTests(CliTestCase):
 class BranchCommandTests(CliTestCase):
     def test_branch_list(self):
         self.assertEqual(self.ok("branch"), "* main\n  feature\n")
-        self.ops.branch_list.assert_called_with(self.repo, remotes=False, all_=False)
+        self.ops.branch_list.assert_called_with(self.repo, remotes=False, all_=False, upstreams=False)
         self.ops.format_branch_list.assert_called_with(["items"], False)
         self.ok("branch", "-v", "-r")
-        self.ops.branch_list.assert_called_with(self.repo, remotes=True, all_=False)
+        self.ops.branch_list.assert_called_with(self.repo, remotes=True, all_=False, upstreams=False)
         self.ops.format_branch_list.assert_called_with(["items"], True)
         self.ok("branch", "-a")
-        self.ops.branch_list.assert_called_with(self.repo, remotes=False, all_=True)
+        self.ops.branch_list.assert_called_with(self.repo, remotes=False, all_=True, upstreams=False)
+
+    def test_branch_vv_asks_for_upstreams(self):
+        self.ok("branch", "-vv")
+        self.ops.branch_list.assert_called_with(self.repo, remotes=False, all_=False, upstreams=True)
+        self.ops.format_branch_list.assert_called_with(["items"], True)
+        self.ok("branch", "-v", "-v", "-a")
+        self.ops.branch_list.assert_called_with(self.repo, remotes=False, all_=True, upstreams=True)
+        self.ok("branch", "--verbose", "--verbose")
+        self.ops.branch_list.assert_called_with(self.repo, remotes=False, all_=False, upstreams=True)
+        self.assertIn("-vv", self.ok("branch", "--help"))
+
+    def test_branch_set_and_unset_upstream(self):
+        self.ops.set_upstream_to = Mock(return_value="branch 'main' set up to track 'origin/main'.")
+        self.ops.unset_upstream = Mock(return_value=None)
+        self.assertEqual(self.ok("branch", "-u", "origin/main"), "branch 'main' set up to track 'origin/main'.\n")
+        self.ops.set_upstream_to.assert_called_with(self.repo, "origin/main", None)
+        self.ok("branch", "--set-upstream-to=origin/main", "feature")
+        self.ops.set_upstream_to.assert_called_with(self.repo, "origin/main", "feature")
+        self.assertEqual(self.ok("branch", "--unset-upstream"), "")
+        self.ops.unset_upstream.assert_called_with(self.repo, None)
+        self.ok("branch", "--unset-upstream", "feature")
+        self.ops.unset_upstream.assert_called_with(self.repo, "feature")
+        self.ops.branch_create.assert_not_called()
+        self.ops.branch_delete.assert_not_called()
+        for args in (("branch", "-u", "origin/main", "--unset-upstream"),
+                     ("branch", "-u", "origin/main", "a", "b"),
+                     ("branch", "-d", "--unset-upstream", "f")):
+            rc, _, err = self.cli(*args)
+            self.assertEqual(rc, 2, args)
+            self.assertIn("branch:", err)
+        self.ops.unset_upstream.side_effect = self.E.MinigitError("branch 'main' has no upstream information")
+        rc, _, err = self.cli("branch", "--unset-upstream")
+        self.assertEqual(rc, 1)
+        self.assertIn("error: branch 'main' has no upstream information", err)
+        help_text = self.ok("branch", "--help")
+        self.assertIn("--set-upstream-to", help_text)
+        self.assertIn("--unset-upstream", help_text)
 
     def test_branch_create(self):
         self.assertEqual(self.ok("branch", "feature"), "")
@@ -726,6 +857,33 @@ class RemoteCommandTests(CliTestCase):
         self.ok("fetch")
         self.remote.fetch.assert_called_with(self.repo, "up")
 
+    def test_fetch_tags_option(self):
+        self.ops.get_upstream.return_value = None
+        self.ok("fetch", "--tags")
+        self.remote.fetch.assert_called_with(self.repo, "origin", all_tags=True)
+        self.ok("fetch", "--tags", "upstream")
+        self.remote.fetch.assert_called_with(self.repo, "upstream", all_tags=True)
+
+    def test_push_tags_option(self):
+        self.remote.push_tags = Mock(return_value=["To http://h:1/p", " * [new tag]         v1 -> v1"])
+        out = self.ok("push", "--tags")
+        self.remote.push_tags.assert_called_with(self.repo, None, force=False)
+        self.assertEqual(out, "To http://h:1/p\n * [new tag]         v1 -> v1\n")
+        self.ok("push", "--tags", "-f", "origin")
+        self.remote.push_tags.assert_called_with(self.repo, "origin", force=True)
+        self.remote.push.assert_not_called()
+        rc, _, err = self.cli("push", "--tags", "origin", "v1")
+        self.assertEqual(rc, 2)
+        self.assertIn("--tags takes only a remote name", err)
+        self.assertEqual(self.cli("push", "--tags", "--delete", "origin")[0], 2)
+
+    def test_tag_usage_errors_before_the_library_runs(self):
+        for args in (("tag", "-d"), ("tag", "a", "b", "c"), ("tag", "-l", "-m", "x"), ("tag", "-n", "v1")):
+            rc, _, err = self.cli(*args)
+            self.assertEqual(rc, 2, args)
+            self.assertIn("tag", err)
+        self.assertIn("List, create or delete tags", self.ok("tag", "--help"))
+
     def test_fetch_prune_option(self):
         # QA multiuser bug 13: 'fetch --prune' is accepted (fetch removes deleted origin/* refs anyway)
         self.ops.get_upstream.return_value = None
@@ -736,15 +894,45 @@ class RemoteCommandTests(CliTestCase):
 
     def test_pull_merged(self):
         out = self.ok("pull")
-        self.remote.pull.assert_called_with(self.repo, None, None, allow_unrelated=False)
+        self.remote.pull.assert_called_with(self.repo, None, None, allow_unrelated=False, rebase=False)
         self.remote.remote_url.assert_called_with(self.repo, "upstream")  # from get_upstream
         self.assertIn("main -> origin/main", out)
         self.assertIn("Merge made by the 'three-way' strategy.", out)
         self.ok("pull", "origin", "main")
-        self.remote.pull.assert_called_with(self.repo, "origin", "main", allow_unrelated=False)
+        self.remote.pull.assert_called_with(self.repo, "origin", "main", allow_unrelated=False, rebase=False)
         self.remote.remote_url.assert_called_with(self.repo, "origin")
         self.ok("pull", "--allow-unrelated-histories")
-        self.remote.pull.assert_called_with(self.repo, None, None, allow_unrelated=True)
+        self.remote.pull.assert_called_with(self.repo, None, None, allow_unrelated=True, rebase=False)
+
+    def test_pull_rebase_flags(self):
+        self.remote.pull.return_value = (["change"], Outcome("rebased", ["Successfully rebased and updated refs/heads/main."]))
+        out = self.ok("pull", "--rebase")
+        self.remote.pull.assert_called_with(self.repo, None, None, allow_unrelated=False, rebase=True)
+        self.assertIn("main -> origin/main", out)
+        self.assertIn("Successfully rebased and updated refs/heads/main.", out)
+        self.ok("pull", "origin", "--rebase", "main")          # options between the positionals, as in git
+        self.remote.pull.assert_called_with(self.repo, "origin", "main", allow_unrelated=False, rebase=True)
+        self.ok("pull", "--no-rebase")
+        self.remote.pull.assert_called_with(self.repo, None, None, allow_unrelated=False, rebase=False)
+        self.ok("pull", "--rebase", "--no-rebase")              # the last one wins
+        self.remote.pull.assert_called_with(self.repo, None, None, allow_unrelated=False, rebase=False)
+        # a conflict that stopped the rebase exits 1 with rebase's lines on stdout
+        self.remote.pull.return_value = (["c"], Outcome("conflict", [
+            "CONFLICT (content): Merge conflict in a.txt", "Could not apply 0123456... subject",
+            'hint: Resolve all conflicts manually, mark them as resolved with "minigit add <paths>"']))
+        rc, out, err = self.cli("pull", "--rebase")
+        self.assertEqual(rc, 1)
+        self.assertIn("Could not apply 0123456... subject", out)
+        self.assertEqual(err, "")
+        # a refusal before anything happened: rebase's own message, exit 1
+        self.remote.pull.side_effect = self.E.MinigitError("cannot rebase: you have unstaged changes")
+        rc, out, err = self.cli("pull", "--rebase")
+        self.assertEqual(rc, 1)
+        self.assertEqual(out, "")
+        self.assertIn("error: cannot rebase: you have unstaged changes", err)
+        help_text = self.ok("pull", "--help")
+        self.assertIn("--rebase", help_text)
+        self.assertIn("--no-rebase", help_text)
 
     def test_pull_default_remote_without_upstream(self):
         self.ops.get_upstream.return_value = None

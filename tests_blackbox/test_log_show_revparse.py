@@ -623,16 +623,100 @@ class TestShow(Base):
         ])
         self.assertIn(f"index 0000000..{BLOB_C[:7]}\n--- /dev/null\n+++ b/b.txt\n@@ -0,0 +1 @@\n+c\n", third)
 
-    def test_merge_commit_header_only(self):
+    def test_merge_commit_shows_the_diff_against_the_first_parent(self):
         S = self.S
-        res = run(["show", "HEAD~2"], self.repo, self.env)
-        self.assertEqual(res.out, (
+        header = (
             f"commit {S['M']}\n"
             f"Merge: {S['c3'][:7]} {S['cf'][:7]}\n"
             "Author: Test User <test@example.com>\n"
             "Date:   Tue Nov 14 22:18:20 2023 +0000\n"
             "\n"
-            "    merge feature\n"), str(res))
+            "    merge feature\n"
+            "\n"
+            f"(merge commit: showing the diff against the first parent {S['c3'][:7]})\n"
+            "\n")
+        feat = blob_sha(b"feat" + b"\n")
+        res = run(["show", "HEAD~2"], self.repo, self.env)
+        self.assertEqual(res.out, header + (
+            "diff --git a/f.txt b/f.txt\n"
+            "new file mode 100644\n"
+            f"index 0000000..{feat[:7]}\n"
+            "--- /dev/null\n"
+            "+++ b/f.txt\n"
+            "@@ -0,0 +1 @@\n"
+            "+feat\n"), str(res))
+        res = run(["show", "--stat", "HEAD~2"], self.repo, self.env)
+        self.assertEqual(res.out, header + " f.txt | 1 +\n 1 file changed, 1 insertion(+)\n", str(res))
+
+    def test_merge_commit_each_parent(self):
+        S = self.S
+        res = run(["show", "-m", "HEAD~2"], self.repo, self.env)
+        parts = res.out.split("\ncommit ")
+        self.assertEqual(len(parts), 2, str(res))
+        self.assertTrue(parts[0].startswith(f"commit {S['M']} (from {S['c3']})\nMerge: "), str(res))
+        self.assertIn("+++ b/f.txt\n", parts[0])
+        self.assertTrue(parts[1].startswith(f"{S['M']} (from {S['cf']})\nMerge: "), str(res))
+        self.assertIn("+++ b/b.txt\n", parts[1])
+        self.assertNotIn("(merge commit:", res.out)
+
+    def test_stat(self):
+        S = self.S
+        res = run(["show", "--stat", "HEAD~3"], self.repo, self.env)   # c3: b.txt, dir/sub/deep.txt, dir/top.txt
+        self.assertTrue(res.out.endswith(
+            "\n    third\n"
+            "\n"
+            " b.txt            | 1 +\n"
+            " dir/sub/deep.txt | 1 +\n"
+            " dir/top.txt      | 1 +\n"
+            " 3 files changed, 3 insertions(+)\n"), str(res))
+        res = run(["log", "--stat", "-n", "2"], self.repo, self.env)   # c6 then c5
+        self.assertIn(
+            "\n    sixth\n"
+            "\n"
+            " bin.dat  | Bin 8 -> 9 bytes\n"
+            " crlf.txt |   1 +\n"
+            " nonl.txt |   1 -\n"
+            " 3 files changed, 1 insertion(+), 1 deletion(-)\n"
+            "\n"
+            f"commit {S['c5']}\n", res.out, str(res))
+        self.assertTrue(res.out.endswith(
+            " bin.dat  | Bin 0 -> 8 bytes\n"
+            " crlf.txt |   2 ++\n"
+            " nonl.txt |   1 +\n"
+            " 3 files changed, 3 insertions(+)\n"), str(res))
+        self.assertEqual(run(["diff", "--stat", "HEAD~1", "HEAD"], self.repo, self.env).out,
+                         " bin.dat  | Bin 8 -> 9 bytes\n"
+                         " crlf.txt |   1 +\n"
+                         " nonl.txt |   1 -\n"
+                         " 3 files changed, 1 insertion(+), 1 deletion(-)\n")
+
+    def test_log_paths_and_graph(self):
+        S = self.S
+        res = run(["log", "--oneline", "--", "a.txt"], self.repo, self.env)
+        self.assertEqual(res.out, f"{S['c2'][:7]} second\n{S['c1'][:7]} first\n", str(res))
+        # a directory matches everything under it; the same without '--' because 'dir' is not a revision
+        for args in (["log", "--oneline", "--", "dir"], ["log", "--oneline", "dir"],
+                     ["log", "--oneline", "dir/"], ["log", "--oneline", "HEAD", "dir/sub"]):
+            with self.subTest(args=args):
+                self.assertEqual(run(args, self.repo, self.env).out, f"{S['c3'][:7]} third\n")
+        # the merge changed f.txt against its first parent, so it counts for f.txt
+        res = run(["log", "--oneline", "--", "f.txt"], self.repo, self.env)
+        self.assertEqual(res.out, f"{S['M'][:7]} merge feature\n{S['cf'][:7]} (feature) feat commit\n", str(res))
+        self.assertEqual(run(["log", "--oneline", "-n", "1", "feature", "--", "f.txt"], self.repo, self.env).out,
+                         f"{S['cf'][:7]} (feature) feat commit\n")
+        res = run(["log", "--graph", "--oneline"], self.repo, self.env)
+        self.assertEqual(res.out, (
+            f"* {S['c6'][:7]} (HEAD -> main) sixth\n"
+            f"* {S['c5'][:7]} fifth\n"
+            f"*   {S['M'][:7]} merge feature\n"
+            "|\\  \n"
+            f"* | {S['c3'][:7]} third\n"
+            f"| * {S['cf'][:7]} (feature) feat commit\n"
+            "|/  \n"
+            f"* {S['c2'][:7]} second\n"
+            f"* {S['c1'][:7]} first\n"), str(res))
+        res = run(["log", "--graph", "--oneline", "--", "f.txt"], self.repo, self.env)
+        self.assertEqual(res.out, f"* {S['M'][:7]} merge feature\n* {S['cf'][:7]} (feature) feat commit\n", str(res))
 
     def test_blob_bytes_are_raw(self):
         S = self.S

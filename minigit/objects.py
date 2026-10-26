@@ -1,13 +1,15 @@
 """minigit.objects -- owner: M1 core. See SPEC.md section 8 for the public API.
 
 Git-identical loose objects: ``sha1(b"<type> <len>\\0" + content)``, stored
-zlib-compressed under ``objects/ab/<38 hex>``. Blob, tree and commit only.
+zlib-compressed under ``objects/ab/<38 hex>``. Blob, tree, commit and
+(annotated) tag.
 """
 
 from __future__ import annotations
 
 import os
 import random
+import re
 import zlib
 from dataclasses import dataclass
 from typing import Iterable, Iterator
@@ -17,17 +19,17 @@ from .util import _O_BINARY, _write_all, format_tz, parse_tz, replace_with_retry
 
 EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
-OBJECT_TYPES = ("blob", "tree", "commit")
+OBJECT_TYPES = ("blob", "tree", "commit", "tag")
 TREE_MODES = ("100644", "100755", "40000")
 
 # Largest object (header + content) the store will write or read. Both sides
 # use the same limit, so anything that was stored can always be read back.
 MAX_OBJECT_SIZE = 256 << 20
-_HEX = frozenset("0123456789abcdef")
+_HEX_RE = re.compile(r"[0-9a-f]+\Z")
 
 
 def _is_hex(s: str) -> bool:
-    return bool(s) and all(c in _HEX for c in s)
+    return _HEX_RE.match(s) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -89,11 +91,28 @@ def _inflate(raw: bytes, cap: int = MAX_OBJECT_SIZE) -> bytes:
 
 
 class ObjectStore:
+    """Loose objects under ``objects_dir``.
+
+    Objects are immutable and content-addressed, so a store keeps per-process caches of the
+    parsed commits and trees it has read and of the type of every object it has seen; they are
+    bounded by ``CACHE_LIMIT`` entries each (cleared, not evicted, when full). Blobs are never cached.
+    """
+
+    CACHE_LIMIT = 20000
+
     def __init__(self, objects_dir: str) -> None:
         self.dir = objects_dir
+        self._commits: dict[str, Commit] = {}
+        self._trees: dict[str, list[TreeEntry]] = {}
+        self._types: dict[str, str] = {}
 
     def path(self, sha: str) -> str:
         return os.path.join(self.dir, sha[:2], sha[2:])
+
+    def _remember(self, cache: dict, sha: str, value) -> None:
+        if len(cache) >= self.CACHE_LIMIT:
+            cache.clear()
+        cache[sha] = value
 
     def has(self, sha: str) -> bool:
         if len(sha) != 40 or not _is_hex(sha):
@@ -103,6 +122,8 @@ class ObjectStore:
     def write(self, obj_type: str, data: bytes) -> str:
         if obj_type == "tree":
             parse_tree(data)  # refuse malformed trees (duplicate or unsorted names)
+        elif obj_type == "tag":
+            parse_tag(data)
         encoded = encode_object(obj_type, data)
         if len(encoded) > MAX_OBJECT_SIZE:
             raise ObjectError(
@@ -161,6 +182,7 @@ class ObjectStore:
             raise ObjectError("object %s is corrupt: %s" % (sha, e.message), sha=sha) from None
         if sha1_hex(full) != sha:
             raise ObjectError("object %s is corrupt: hash mismatch" % sha, sha=sha)
+        self._remember(self._types, sha, obj_type)
         return obj_type, content
 
     def read_typed(self, sha: str, obj_type: str) -> bytes:
@@ -168,6 +190,82 @@ class ObjectStore:
         if actual != obj_type:
             raise ObjectError("object %s is a %s, not a %s" % (sha, actual, obj_type), sha=sha)
         return content
+
+    def object_type(self, sha: str) -> str:
+        """The stored type of ``sha``, from the cache or by inflating only the header (no hash check)."""
+        t = self._types.get(sha)
+        if t is not None:
+            return t
+        raw = self.read_raw(sha)
+        d = zlib.decompressobj()
+        try:
+            head = d.decompress(raw, 64)
+        except zlib.error as e:
+            raise ObjectError("object %s is corrupt: %s" % (sha, e), sha=sha) from None
+        nul = head.find(b"\0")
+        sp = head.find(b" ")
+        if nul < 0 or sp < 0 or sp > nul:
+            raise ObjectError("object %s is corrupt: bad header" % sha, sha=sha)
+        try:
+            t = head[:sp].decode("ascii")
+        except UnicodeDecodeError:
+            raise ObjectError("object %s is corrupt: bad header" % sha, sha=sha) from None
+        if t not in OBJECT_TYPES:
+            raise ObjectError("object %s is corrupt: unknown type '%s'" % (sha, t), sha=sha)
+        self._remember(self._types, sha, t)
+        return t
+
+    def commit(self, sha: str, data: bytes | None = None) -> Commit:
+        """The parsed commit ``sha`` (cached). ``data`` is its content when the caller already read it."""
+        c = self._commits.get(sha)
+        if c is None:
+            if data is None:
+                data = self.read_typed(sha, "commit")
+            c = parse_commit(data)
+            self._remember(self._commits, sha, c)
+        return c
+
+    def tree(self, sha: str, data: bytes | None = None) -> list[TreeEntry]:
+        """The parsed tree ``sha`` (cached). ``data`` is its content when the caller already read it."""
+        t = self._trees.get(sha)
+        if t is None:
+            if data is None:
+                data = self.read_typed(sha, "tree")
+            t = parse_tree(data)
+            self._remember(self._trees, sha, t)
+        return t
+
+    def load(self, sha: str) -> tuple[str, "Commit | list[TreeEntry] | bytes"]:
+        """``(type, parsed)``: a ``Commit``, a tree's entries or a blob's bytes, through the caches."""
+        c = self._commits.get(sha)
+        if c is not None:
+            return "commit", c
+        t = self._trees.get(sha)
+        if t is not None:
+            return "tree", t
+        obj_type, data = self.read(sha)
+        if obj_type == "commit":
+            return obj_type, self.commit(sha, data)
+        if obj_type == "tree":
+            return obj_type, self.tree(sha, data)
+        return obj_type, data
+
+    def temp_files(self) -> list[str]:
+        """Paths of the ``objects/xx/tmp-*`` files a dying writer left behind, sorted."""
+        out: list[str] = []
+        try:
+            dirs = os.listdir(self.dir)
+        except OSError:
+            return out
+        for d in dirs:
+            if len(d) != 2 or not _is_hex(d):
+                continue
+            try:
+                names = os.listdir(os.path.join(self.dir, d))
+            except OSError:
+                continue
+            out.extend(os.path.join(self.dir, d, n) for n in names if n.startswith("tmp-"))
+        return sorted(out)
 
     def resolve_prefix(self, prefix: str) -> list[str]:
         prefix = prefix.lower()
@@ -394,3 +492,99 @@ def serialize_commit(c: Commit) -> bytes:
         message += "\n"
     text = "\n".join(lines) + "\n\n" + message
     return text.encode("utf-8", "surrogateescape")
+
+
+# ---------------------------------------------------------------------------
+# tags (annotated)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Tag:
+    """An annotated tag object: ``object``/``type`` name the tagged object, ``tag`` is the tag name."""
+
+    object: str
+    type: str
+    tag: str
+    tagger: Signature | None
+    message: str
+
+    @property
+    def subject(self) -> str:
+        return self.message.split("\n", 1)[0]
+
+
+def parse_tag(data: bytes) -> Tag:
+    text = data.decode("utf-8", "surrogateescape")
+    obj: str | None = None
+    obj_type: str | None = None
+    name: str | None = None
+    tagger: Signature | None = None
+    pos = 0
+    while True:
+        nl = text.find("\n", pos)
+        if nl < 0:
+            line = text[pos:]
+            pos = len(text)
+            if line == "":
+                break
+        else:
+            line = text[pos:nl]
+            pos = nl + 1
+        if line == "":
+            break
+        if " " not in line:
+            raise ObjectError("corrupt tag: bad header line %r" % line)
+        key, value = line.split(" ", 1)
+        if key == "object":
+            if obj is not None:
+                raise ObjectError("corrupt tag: duplicate object")
+            _check_sha(value)
+            obj = value
+        elif key == "type":
+            if value not in OBJECT_TYPES:
+                raise ObjectError("corrupt tag: unknown object type '%s'" % value)
+            obj_type = value
+        elif key == "tag":
+            name = value
+        elif key == "tagger":
+            tagger = Signature.parse(value)
+        else:
+            continue  # unknown headers are tolerated and dropped
+    if obj is None:
+        raise ObjectError("corrupt tag: missing object")
+    if obj_type is None:
+        raise ObjectError("corrupt tag: missing type")
+    if name is None:
+        raise ObjectError("corrupt tag: missing tag name")
+    return Tag(obj, obj_type, name, tagger, text[pos:])
+
+
+def serialize_tag(t: Tag) -> bytes:
+    _check_sha(t.object)
+    if t.type not in OBJECT_TYPES:
+        raise ObjectError("unknown object type '%s' in tag" % t.type)
+    lines = ["object %s" % t.object, "type %s" % t.type, "tag %s" % t.tag.replace("\n", " ")]
+    if t.tagger is not None:
+        lines.append("tagger %s" % t.tagger.format())
+    message = t.message
+    if message and not message.endswith("\n"):
+        message += "\n"
+    text = "\n".join(lines) + "\n\n" + message
+    return text.encode("utf-8", "surrogateescape")
+
+
+MAX_TAG_DEPTH = 16
+
+
+def peel(store: ObjectStore, sha: str) -> tuple[str, str]:
+    """``(type, sha)`` of the first non-tag object reached from ``sha``, following tag chains.
+
+    Raises ``ObjectError`` for a missing object or a chain longer than ``MAX_TAG_DEPTH``.
+    """
+    for _ in range(MAX_TAG_DEPTH):
+        obj_type, data = store.read(sha)
+        if obj_type != "tag":
+            return obj_type, sha
+        sha = parse_tag(data).object
+    raise ObjectError("tag chain too long at %s" % sha, sha=sha)

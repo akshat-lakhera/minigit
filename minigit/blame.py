@@ -14,7 +14,6 @@ from difflib import SequenceMatcher
 from typing import Sequence
 
 from .errors import MinigitError, RevisionError, UsageError
-from .objects import parse_tree
 from .revparse import resolve_rev
 from .trees import commit_tree_sha
 from .util import format_tz, is_binary, now_with_tz, split_lines
@@ -96,30 +95,38 @@ def select_lines(spec: str | None, total: int, path: str) -> range:
 # ---------------------------------------------------------------------------
 
 class _Walker:
+    """Reads for one blame run. Commits and trees come from the store's caches; the path's blob per
+    commit, the split lines per blob and the difflib result per (parent blob, child blob) pair are
+    remembered here, so every object is read once however often the walk comes back to it."""
+
     def __init__(self, repo, path: str) -> None:
         self.repo = repo
         self.store = repo.objects
         self.parts = path.split("/")
         self._trees: dict[str, dict[str, tuple[str, str]]] = {}
-        self._commits: dict = {}
+        self._entries: dict[str, str | None] = {}
         self._lines: dict[str, list[bytes]] = {}
+        self._blocks: dict[tuple[str, str | None], list] = {}
 
     def commit(self, sha: str):
-        c = self._commits.get(sha)
-        if c is None:
-            c = self._commits[sha] = self.repo.read_commit(sha)
-        return c
+        return self.store.commit(sha)
 
     def _tree(self, sha: str) -> dict[str, tuple[str, str]]:
         t = self._trees.get(sha)
         if t is None:
-            t = {e.name: (e.mode, e.sha)
-                 for e in parse_tree(self.store.read_typed(sha, "tree"))}
+            t = {e.name: (e.mode, e.sha) for e in self.store.tree(sha)}
             self._trees[sha] = t
         return t
 
     def entry_at(self, commit_sha: str) -> str | None:
         """Blob sha of the path in the commit, or None (absent, or not a file)."""
+        if commit_sha in self._entries:
+            return self._entries[commit_sha]
+        found = self._lookup(commit_sha)
+        self._entries[commit_sha] = found
+        return found
+
+    def _lookup(self, commit_sha: str) -> str | None:
         cur = commit_tree_sha(self.store, commit_sha)
         for i, name in enumerate(self.parts):
             ent = self._tree(cur).get(name)
@@ -143,6 +150,22 @@ class _Walker:
         if ls is None:
             ls = self._lines[key] = split_lines(data)
         return ls
+
+    def blob_lines(self, sha: str) -> list[bytes]:
+        """The lines of blob ``sha``; the blob is read only the first time."""
+        ls = self._lines.get("blob:" + sha)
+        if ls is None:
+            ls = self._lines["blob:" + sha] = split_lines(self.blob(sha))
+        return ls
+
+    def matching_blocks(self, p_blob: str, cur_blob: str | None, lines_p: list[bytes], lines_c: list[bytes]):
+        """``SequenceMatcher(lines_p, lines_c).get_matching_blocks()``, once per blob pair."""
+        key = (p_blob, cur_blob)
+        blocks = self._blocks.get(key)
+        if blocks is None:
+            blocks = SequenceMatcher(None, lines_p, lines_c, autojunk=False).get_matching_blocks()
+            self._blocks[key] = blocks
+        return blocks
 
 
 def _require_file(w: _Walker, sha: str, path: str, label: str) -> str:
@@ -205,7 +228,7 @@ def blame(repo, path: str, rev: str | None = None, line_range: str | None = None
         else:
             parents = w.commit(key).parents
             cur_blob = w.entry_at(key)
-            data_c = w.blob(cur_blob) if cur_blob is not None else b""
+            data_c = None if cur_blob is not None else b""   # a blob's bytes are not needed, its lines are
         if not parents:
             assign(key, lines, True)
             continue
@@ -223,10 +246,9 @@ def blame(repo, path: str, rev: str | None = None, line_range: str | None = None
                 lines = {}
             else:
                 if lines_c is None:
-                    lines_c = w.lines_of(_WORKTREE if cur_blob is None else "blob:" + cur_blob, data_c)
-                lines_p = w.lines_of("blob:" + p_blob, w.blob(p_blob))
-                sm = SequenceMatcher(None, lines_p, lines_c, autojunk=False)
-                for i, j, n in sm.get_matching_blocks():
+                    lines_c = w.blob_lines(cur_blob) if cur_blob is not None else w.lines_of(_WORKTREE, data_c)
+                lines_p = w.blob_lines(p_blob)
+                for i, j, n in w.matching_blocks(p_blob, cur_blob, lines_p, lines_c):
                     for k in range(n):
                         got = lines.pop(j + k, None)
                         if got is not None:

@@ -138,7 +138,7 @@ def _version_string() -> str:
     try:
         return "minigit " + str(importlib.import_module("minigit").__version__)
     except Exception:  # pragma: no cover - the package always has a version
-        return "minigit 0.1.0"
+        return "minigit 0.2.0"
 
 
 def _add_blame_parser(sub) -> None:
@@ -206,6 +206,12 @@ def build_parser() -> argparse.ArgumentParser:
     # --- working tree ----------------------------------------------------
     s = cmd("add", "Add file contents to the index")
     s.add_argument("-f", "--force", action="store_true", help="allow adding ignored files")
+    s.add_argument("-A", "--all", dest="all_", action="store_true",
+                   help="stage every change in the whole work tree (new, modified and deleted files), "
+                        "from the repository root whatever the current directory")
+    s.add_argument("-u", "--update", action="store_true",
+                   help="stage modified and deleted tracked files only, never new ones "
+                        "(the whole tree, or the tracked files under the given pathspecs)")
     s.add_argument("pathspecs", nargs="*", metavar="pathspec", help="files, directories or '.'")
 
     s = cmd("rm", "Remove files from the working tree and the index")
@@ -223,6 +229,8 @@ def build_parser() -> argparse.ArgumentParser:
     s = cmd("diff", "Show changes between the working tree, the index and commits")
     s.add_argument("--staged", "--cached", dest="staged", action="store_true",
                    help="compare the index with HEAD, or with <rev> if one is given")
+    s.add_argument("--stat", action="store_true",
+                   help="print a diffstat (one ' path | N +-' line per file and a summary) instead of the patch")
     s.add_argument("args", nargs="*", metavar="rev|a..b|path",
                    help="zero, one or two revisions, then '--' and paths; "
                         "for unmerged paths, the working file (with conflict markers) "
@@ -234,27 +242,48 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("-a", "--all", dest="all_", action="store_true",
                    help="stage modified and deleted tracked files first")
     s.add_argument("--allow-empty", action="store_true", help="allow a commit with no changes")
+    s.add_argument("--amend", action="store_true",
+                   help="replace the HEAD commit: same parents, the index as tree, the original author; "
+                        "-m replaces the message, else it is kept (the old commit goes to ORIG_HEAD)")
 
     s = cmd("log", "Show the commit history")
     s.add_argument("--oneline", action="store_true", help="one line per commit")
     s.add_argument("-n", "--max-count", dest="max_count", type=int, default=None, metavar="N",
                    help="limit the number of commits")
     s.add_argument("--all", dest="all_", action="store_true", help="start from every ref")
-    s.add_argument("revs", nargs="*", metavar="rev", help="starting points (default: HEAD)")
+    s.add_argument("--graph", action="store_true",
+                   help="draw the history as an ASCII graph on the left ('*' commits, '|' lanes)")
+    s.add_argument("--stat", action="store_true",
+                   help="append each commit's diffstat (against its first parent; nothing for merges)")
+    s.add_argument("revs", nargs="*", metavar="rev|path",
+                   help="starting points (default: HEAD), then '--' and paths: only commits that change "
+                        "one of the paths (a directory matches everything under it); a path that is also "
+                        "a revision must be given after '--'")
 
     s = cmd("show", "Show a commit, blob or tree")
-    s.add_argument("spec", nargs="?", default="HEAD", help="revision, or rev:path (default: HEAD)")
+    s.add_argument("--stat", action="store_true", help="print a diffstat instead of the patch")
+    s.add_argument("-m", dest="each_parent", action="store_true",
+                   help="for a merge commit, show the diff against each parent in turn")
+    s.add_argument("spec", nargs="?", default="HEAD",
+                   help="revision, or rev:path (default: HEAD); a merge commit is diffed against its "
+                        "first parent, after a line that says so")
     _add_blame_parser(sub)
     _add_grep_parser(sub)
 
     # --- branching -------------------------------------------------------
-    s = cmd("branch", "List, create or delete branches")
-    s.add_argument("-v", "--verbose", action="store_true", help="show sha and subject")
+    s = cmd("branch", "List, create or delete branches, or set a branch's upstream")
+    s.add_argument("-v", "--verbose", action="count", default=0,
+                   help="show sha and subject; -vv also shows the upstream and ahead/behind counts "
+                        "([origin/main: ahead 2, behind 1], [origin/main: gone])")
     s.add_argument("-r", "--remotes", action="store_true", help="list remote-tracking branches")
     s.add_argument("-a", "--all", dest="all_", action="store_true", help="list local and remote branches")
     s.add_argument("-d", "--delete", action="store_true", help="delete a fully merged branch")
     s.add_argument("-D", dest="force_delete", action="store_true", help="delete a branch, even if unmerged")
-    s.add_argument("name", nargs="?", help="branch to create or delete")
+    s.add_argument("-u", "--set-upstream-to", dest="set_upstream_to", metavar="REMOTE/BRANCH",
+                   help="make BRANCH (default: the current branch) track REMOTE/BRANCH")
+    s.add_argument("--unset-upstream", dest="unset_upstream", action="store_true",
+                   help="forget the upstream of BRANCH (default: the current branch)")
+    s.add_argument("name", nargs="?", help="branch to create or delete, or whose upstream to change")
     s.add_argument("start", nargs="?", help="start point for a new branch (default: HEAD)")
 
     s = cmd("switch", "Switch branches")
@@ -277,6 +306,8 @@ def build_parser() -> argparse.ArgumentParser:
     _m("stash").add_parser(sub)  # stash (minigit/stash.py)
     _m("pr").add_parser(sub)  # pr (minigit/pr.py)
     _m("rebase").add_parser(sub)  # rebase (minigit/rebase.py)
+    _m("tags").add_parser(sub)  # tag (minigit/tags.py)
+    _m("gc").add_parser(sub)  # gc (minigit/gc.py)
 
     s = cmd("reset", "Reset HEAD, the index or files")
     g = s.add_mutually_exclusive_group()
@@ -304,22 +335,32 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--prune", action="store_true",
                    help="delete remote-tracking branches that no longer exist on the server "
                         "(fetch always does this; the option is accepted for git compatibility)")
+    s.add_argument("--tags", dest="all_tags", action="store_true",
+                   help="fetch every tag, not only the tags of commits being fetched")
     s.add_argument("remote", nargs="?", help="remote name (default: origin)")
 
-    s = cmd("pull", "Fetch and merge the upstream branch")
+    s = cmd("pull", "Fetch and merge (or, with --rebase, rebase onto) the upstream branch")
+    s.add_argument("--rebase", dest="rebase", action="store_true",
+                   help="rebase the current branch onto the fetched branch instead of merging "
+                        "(a conflict stops like 'minigit rebase' does: --continue, --skip or --abort it)")
+    s.add_argument("--no-rebase", dest="rebase", action="store_false", default=False,
+                   help="merge (the default)")
     s.add_argument("--allow-unrelated-histories", dest="allow_unrelated", action="store_true",
                    help="merge even if the histories share no commit")
+    s.__class__ = _IntermixedParser  # options may come before, between or after the positionals
     s.add_argument("remote", nargs="?", help="remote name")
     s.add_argument("branch", nargs="?", help="remote branch")
 
-    s = cmd("push", "Upload the current branch to a remote")
+    s = cmd("push", "Upload the current branch (or a tag) to a remote")
     s.add_argument("-u", "--set-upstream", dest="set_upstream", action="store_true",
                    help="remember the upstream for pull")
-    s.add_argument("-f", "--force", action="store_true", help="allow a non-fast-forward update")
-    s.add_argument("--delete", action="store_true", help="delete the remote branch")
+    s.add_argument("-f", "--force", action="store_true",
+                   help="allow a non-fast-forward update (or replace a tag on the remote)")
+    s.add_argument("--delete", action="store_true", help="delete the remote branch or tag")
+    s.add_argument("--tags", dest="all_tags", action="store_true", help="push every local tag")
     s.__class__ = _IntermixedParser  # options may come before, between or after the positionals
     s.add_argument("remote", nargs="?", help="remote name")
-    s.add_argument("refspec", nargs="?", metavar="SRC[:DST]", help="branch to push")
+    s.add_argument("refspec", nargs="?", metavar="SRC[:DST]", help="branch or tag to push")
 
     s = cmd("login", "Store credentials for a server")
     s.add_argument("url", help="http://host:port[/repo]")
@@ -489,10 +530,17 @@ def cmd_config(ns, cwd):
 
 def cmd_add(ns, cwd):
     specs = list(ns.pathspecs) + list(ns.after)
-    if not specs:
+    if ns.all_ and ns.update:
+        raise _usage("add: -A and -u cannot be used together")
+    if not specs and not (ns.all_ or ns.update):
         raise _usage("nothing specified, nothing added",
-                     hint="use 'minigit add <pathspec>...' or 'minigit add .'")
-    _m("ops").add(_repo(cwd), specs, cwd, force=ns.force)
+                     hint="use 'minigit add <pathspec>...', 'minigit add .' or 'minigit add -A'")
+    extra = {}
+    if ns.all_:
+        extra["all_"] = True
+    if ns.update:
+        extra["update"] = True
+    _m("ops").add(_repo(cwd), specs, cwd, force=ns.force, **extra)
 
 
 def cmd_rm(ns, cwd):
@@ -527,13 +575,53 @@ def cmd_diff(ns, cwd):
         raise _usage("diff: at most two revisions (or 'a..b') are allowed")
     if ns.staged and len(revs) > 1:
         raise _usage("diff: --staged takes at most one revision")
-    _out(_m("diff").diff_command(repo, cwd, staged=ns.staged, revs=revs, pathspecs=paths))
+    extra = {"stat": True} if ns.stat else {}
+    _out(_m("diff").diff_command(repo, cwd, staged=ns.staged, revs=revs, pathspecs=paths, **extra))
 
 
 def cmd_commit(ns, cwd):
+    extra = {"amend": True} if ns.amend else {}
     _sha, summary = _m("ops").commit(_repo(cwd), list(ns.messages), all_=ns.all_,
-                                     allow_empty=ns.allow_empty, stat=True)
+                                     allow_empty=ns.allow_empty, stat=True, **extra)
     _say(summary)
+
+
+def _path_in_head(repo, cwd: str, path: str) -> bool:
+    """Does ``path`` (relative to ``cwd``) name a file or directory in the HEAD tree?"""
+    try:
+        rel = repo.relpath(path, cwd) if repo.worktree is not None else path.replace("\\", "/").strip("/")
+        flat = repo.head_flat()
+    except _E("MinigitError"):
+        return False
+    return rel == "" or rel in flat or any(p.startswith(rel + "/") for p in flat)
+
+
+def _split_log_args(repo, cwd: str, args: list[str]) -> tuple[list[str], list[str]]:
+    """git's rule for ``log`` arguments without '--': a name that is not a revision but exists in
+    the work tree or in HEAD is a path (and so is everything after it); a name that is both a
+    revision and a path must be disambiguated with '--'."""
+    revs: list[str] = []
+    paths: list[str] = []
+    for a in args:
+        if paths:
+            paths.append(a)
+            continue
+        is_rev = _is_rev(repo, a)
+        is_path = _path_exists(cwd, a) or _path_in_head(repo, cwd, a)
+        if is_rev and is_path:
+            raise _usage(f"log: ambiguous argument '{a}': both revision and filename",
+                         hint="use '--' to separate paths from revisions: minigit log [rev...] -- path...")
+        if is_path:
+            paths.append(a)
+        else:
+            revs.append(a)  # unknown names stay revisions so the library reports "unknown revision"
+    return revs, paths
+
+
+def _rel_paths(repo, cwd: str, paths: list[str]) -> list[str]:
+    if repo.worktree is None:
+        return [p.replace("\\", "/").strip("/") for p in paths]
+    return [repo.relpath(p, cwd) for p in paths]
 
 
 def cmd_log(ns, cwd):
@@ -541,18 +629,49 @@ def cmd_log(ns, cwd):
     repo = _repo(cwd)
     if ns.max_count is not None and ns.max_count < 0:
         raise _usage("log: -n must not be negative")
-    entries = history.log_entries(repo, list(ns.revs) or None, ns.max_count, all_refs=ns.all_)
-    _say(history.format_log(repo, entries, ns.oneline))
+    if ns.dashdash:
+        revs, paths = list(ns.revs), list(ns.after)
+    else:
+        revs, paths = _split_log_args(repo, cwd, list(ns.revs))
+    rel = _rel_paths(repo, cwd, paths)
+    extra = {"paths": rel} if rel else {}
+    entries = history.log_entries(repo, revs or None, ns.max_count, all_refs=ns.all_, **extra)
+    fmt = {}
+    if ns.graph:
+        fmt["graph"] = True
+        if rel:
+            fmt["paths"] = rel
+    if ns.stat:
+        fmt["stat"] = True
+    _say(history.format_log(repo, entries, ns.oneline, **fmt))
 
 
 def cmd_show(ns, cwd):
-    _out(_m("history").show(_repo(cwd), ns.spec or "HEAD"))
+    extra = {}
+    if ns.stat:
+        extra["stat"] = True
+    if ns.each_parent:
+        extra["each_parent"] = True
+    _out(_m("history").show(_repo(cwd), ns.spec or "HEAD", **extra))
 
 
 def cmd_branch(ns, cwd):
     ops = _m("ops")
     repo = _repo(cwd)
-    if ns.delete or ns.force_delete:
+    if ns.set_upstream_to is not None or ns.unset_upstream:
+        if ns.set_upstream_to is not None and ns.unset_upstream:
+            raise _usage("branch: -u/--set-upstream-to and --unset-upstream cannot be combined")
+        if ns.delete or ns.force_delete:
+            raise _usage("branch: -d/-D cannot be combined with -u/--unset-upstream")
+        names = [n for n in (ns.name, ns.start) if n is not None] + list(ns.after)
+        if len(names) > 1:
+            raise _usage("branch: too many arguments (expected [BRANCH])")
+        branch = names[0] if names else None
+        if ns.unset_upstream:
+            ops.unset_upstream(repo, branch)
+        else:
+            _say(ops.set_upstream_to(repo, ns.set_upstream_to, branch))
+    elif ns.delete or ns.force_delete:
         names = [n for n in (ns.name, ns.start) if n is not None] + list(ns.after)
         if not names:
             raise _usage("branch: a branch name is required with -d/-D")
@@ -567,8 +686,8 @@ def cmd_branch(ns, cwd):
     else:
         if ns.dashdash:
             raise _usage("branch: a branch name is required after '--'")
-        items = ops.branch_list(repo, remotes=ns.remotes, all_=ns.all_)
-        _say(ops.format_branch_list(items, ns.verbose))
+        items = ops.branch_list(repo, remotes=ns.remotes, all_=ns.all_, upstreams=ns.verbose >= 2)
+        _say(ops.format_branch_list(items, bool(ns.verbose)))
 
 
 def cmd_switch(ns, cwd):
@@ -706,7 +825,10 @@ def cmd_fetch(ns, cwd):
     remote = _m("remote")
     repo = _repo(cwd)
     name = ns.remote or _default_remote(repo)
-    changes = remote.fetch(repo, name)
+    if ns.all_tags:
+        changes = remote.fetch(repo, name, all_tags=True)
+    else:
+        changes = remote.fetch(repo, name)
     _say(remote.format_fetch(remote.remote_url(repo, name), changes))
 
 
@@ -714,7 +836,12 @@ def cmd_pull(ns, cwd):
     remote = _m("remote")
     repo = _repo(cwd)
     name = ns.remote or _default_remote(repo)
-    changes, outcome = remote.pull(repo, ns.remote, ns.branch, allow_unrelated=ns.allow_unrelated)
+    try:
+        changes, outcome = remote.pull(repo, ns.remote, ns.branch, allow_unrelated=ns.allow_unrelated,
+                                       rebase=ns.rebase)
+    except _E("MinigitError") as e:
+        _say("\n".join(getattr(e, "lines", [])))   # what a stopped rebase did before the refusal
+        raise
     _say(remote.format_fetch(remote.remote_url(repo, name), changes))
     _say("\n".join(outcome.messages))
     return 1 if outcome.kind == "conflict" else 0
@@ -724,8 +851,13 @@ def cmd_push(ns, cwd):
     remote = _m("remote")
     repo = _repo(cwd)
     try:
-        lines = remote.push(repo, ns.remote, ns.refspec, set_upstream=ns.set_upstream,
-                            force=ns.force, delete=ns.delete)
+        if ns.all_tags:
+            if ns.refspec or ns.delete or ns.set_upstream:
+                raise _usage("push --tags takes only a remote name")
+            lines = remote.push_tags(repo, ns.remote, force=ns.force)
+        else:
+            lines = remote.push(repo, ns.remote, ns.refspec, set_upstream=ns.set_upstream,
+                                force=ns.force, delete=ns.delete)
     except _E("PushRejectedError") as e:
         src, dst = _push_names(repo, ns.refspec)
         # push() attaches the names it resolved (e.g. the branch behind HEAD:dst).
@@ -782,7 +914,8 @@ def cmd_fsck(ns, cwd):
     problems = _m("pack").fsck(_repo(cwd))
     if problems:
         _say("\n".join(problems))
-        return 1
+        if any(not p.startswith("warning: ") for p in problems):
+            return 1
     return 0
 
 
@@ -843,6 +976,8 @@ _COMMANDS = {
     "stash": lambda ns, cwd: _m("stash").cmd_stash(ns, cwd),
     "pr": lambda ns, cwd: _m("pr").cmd_pr(ns, cwd),
     "rebase": lambda ns, cwd: _m("rebase").cmd_rebase(ns, cwd),
+    "tag": lambda ns, cwd: _m("tags").cmd_tag(ns, cwd),
+    "gc": lambda ns, cwd: _m("gc").cmd_gc(ns, cwd),
 }
 
 
@@ -851,8 +986,8 @@ _COMMANDS = {
 # ---------------------------------------------------------------------------
 
 # Commands whose handlers read ns.after / ns.dashdash; every other command rejects '--'.
-_TAKES_PATHS_AFTER_DASHDASH = frozenset({"add", "rm", "diff", "checkout", "reset", "restore", "branch",
-                                        "blame", "grep"})
+_TAKES_PATHS_AFTER_DASHDASH = frozenset({"add", "rm", "diff", "log", "checkout", "reset", "restore", "branch",
+                                        "blame", "grep", "tag"})
 
 
 def _split_dashdash(argv: list[str]) -> tuple[list[str], list[str], bool]:

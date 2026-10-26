@@ -294,6 +294,72 @@ class SequenceTests(CherryCase):
         self.assertEqual(self.head(), start)
         self.assertEqual(sorted(read_index(self.repo).flat()), ["f.txt", "one.txt", "other.txt", "three.txt"])
 
+    def test_ranges_expand_oldest_first(self):
+        c1, c2, c3 = self.feat_commits()
+        start = self.head()
+        expand = lambda revs: cherry.expand_revs(self.repo, revs, "cherry-pick")  # noqa: E731
+        self.assertEqual(expand(["main..feat"]), [c1, c2, c3])
+        self.assertEqual(expand(["..feat"]), [c1, c2, c3])            # an empty side is HEAD
+        self.assertEqual(expand(["feat~1..feat"]), [c3])
+        self.assertEqual(expand(["feat~1^..feat"]), [c2, c3])         # A^..B includes A
+        self.assertEqual(expand([c1, "feat~1..feat", "main"]), [c1, c3, start])   # mixed, in order
+        self.assertEqual(expand([c1, "feat..main"]), [c1])                        # an empty range adds nothing
+        out = cherry.start(self.repo, "cherry-pick", ["main..feat"], mainline=None, no_commit=False)
+        self.assertEqual([o.kind for o in out], ["committed"] * 3)
+        msgs, sha = [], self.head()
+        while sha != start:
+            c = self.repo.read_commit(sha)
+            msgs.append(c.message.strip())
+            sha = c.parents[0]
+        self.assertEqual(msgs, ["three", "two", "one"])
+        self.assertEqual(self.repo.refs.read_special("ORIG_HEAD"), start)
+
+    def test_revert_range_undoes_oldest_first(self):
+        self.feat_commits()
+        cherry.start(self.repo, "cherry-pick", ["main..feat"], mainline=None, no_commit=False)
+        top = self.head()
+        out = cherry.start(self.repo, "revert", ["HEAD~2..HEAD"], mainline=None, no_commit=False)
+        self.assertEqual([o.summary.split("] ", 1)[1] for o in out], ['Revert "two"', 'Revert "three"'])
+        self.assertEqual(self.repo.read_commit(self.head()).parents[0], out[0].commit)
+        self.assertEqual(self.repo.read_commit(out[0].commit).parents, (top,))
+        self.assertEqual(sorted(self.repo.head_flat()), ["f.txt", "one.txt", "other.txt"])
+
+    def test_range_with_a_merge_needs_mainline(self):
+        from minigit import merge
+        c1, c2, c3 = self.feat_commits()
+        self.on_branch("side", c3)
+        side = self.commit("side", {"side.txt": b"s\n"})
+        ops.switch(self.repo, "feat")
+        merge.merge(self.repo, "side", no_ff=True, message="merge side")
+        merged = self.head()
+        ops.switch(self.repo, "main")
+        start = self.head()
+        # the merge is in the range: refused only then, with git's wording, and nothing is applied
+        with self.assertRaises(MinigitError) as cm:
+            cherry.start(self.repo, "cherry-pick", ["main..feat"], mainline=None, no_commit=False)
+        self.assertEqual(cm.exception.message, f"commit {merged[:7]} is a merge but no -m option was given.")
+        self.assertEqual(self.head(), start)
+        # a range without the merge needs no -m
+        out = cherry.start(self.repo, "cherry-pick", [f"{c1}..{c3}"], mainline=None, no_commit=False)
+        self.assertEqual([o.summary.split("] ", 1)[1] for o in out], ["two", "three"])
+        # -m N picks the merge against its parent N
+        out = cherry.start(self.repo, "cherry-pick", [f"{side}..feat"], mainline=1, no_commit=False)
+        self.assertEqual([o.source for o in out], [merged])
+        self.assertIn("side.txt", self.repo.head_flat())
+
+    def test_empty_bad_and_symmetric_ranges_apply_nothing(self):
+        self.feat_commits()
+        start = self.head()
+        with self.assertRaises(MinigitError) as cm:
+            cherry.start(self.repo, "cherry-pick", ["feat..feat"], mainline=None, no_commit=False)
+        self.assertEqual(cm.exception.message, "empty commit set passed")
+        with self.assertRaisesRegex(MinigitError, "unknown revision 'nope'"):
+            cherry.start(self.repo, "cherry-pick", ["nope..feat"], mainline=None, no_commit=False)
+        with self.assertRaises(UsageError):
+            cherry.start(self.repo, "cherry-pick", ["main...feat"], mainline=None, no_commit=False)
+        self.assertEqual(self.head(), start)
+        self.assertIsNone(self.repo.refs.read_special("ORIG_HEAD"))
+
     def test_conflict_in_the_middle_then_continue_finishes_the_rest(self):
         c1, c2, c3 = self.feat_commits()
         self.commit("main edits f", {"f.txt": b"a\nb\nMAIN\n"})

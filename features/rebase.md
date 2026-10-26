@@ -33,12 +33,21 @@ minigit rebase --abort
 - `<branch>`: switch to `<branch>` first (a local branch, or any revision for a detached HEAD), as git does.
 - `--continue`, `--skip`, `--abort` are mutually exclusive and take no other argument (usage error, exit 2).
   Without a rebase in progress they fail with `error: no rebase in progress` (exit 1).
+- `minigit pull --rebase [<remote> [<branch>]]` fetches and then runs this rebase onto the tracking branch
+  instead of merging (`--no-rebase`, the default, merges). The preconditions of 1.3 are checked before the
+  fetch; `Already up to date.` when the tracking branch is already reachable from HEAD; otherwise the
+  messages of 1.2 and 1.4 apply, and a stopped rebase is finished with `rebase --continue`, `--skip` or
+  `--abort` (SPEC 7.5).
 
 ### 1.2 Which commits, in which order
 
 1. `todo` = the commits reachable from the branch tip but not from `<upstream>`, **merge commits left
-   out**, parents before children (reverse of the topological log order). Leaving merges out linearizes the
-   history: the commits of both sides of a merge are replayed one after the other.
+   out**, parents before children, in git's order (`git rev-list --reverse --topo-order --no-merges`,
+   `graph.topo_order`): the merges take part in the topological sort and are dropped afterwards, so below a
+   merge the first-parent lineage is replayed before the second-parent lineage whatever the commit dates say
+   (committer-date order, which `log` uses, would interleave them). Leaving merges out linearizes the
+   history: the commits of both sides of a merge are replayed one after the other, and with the same author,
+   message and committer date the replayed commits get the ids git produces.
 2. **Up to date**: when `todo` already forms a straight line starting at the new base and ending at the
    branch tip, nothing would change: `Current branch <name> is up to date.` (`HEAD` when detached), exit 0,
    nothing touched.
@@ -146,7 +155,8 @@ Plus `.minigit/REBASE_HEAD` (the commit a conflict stopped on; listed in `OPERAT
 ## 3. Modules
 
 - `minigit/rebase.py`: `add_parser`, `cmd_rebase` (CLI), `start`, `continue_`, `skip`, `abort`,
-  `status_info`, `patch_id`, the replay loop.
+  `status_info`, `patch_id`, `check_preconditions` (the 1.3 checks for `pull --rebase`), the replay loop;
+  `minigit/remote.py`: `pull(..., rebase=True)` calls `check_preconditions` before the fetch and `start` after it.
 - `minigit/sequencer.py`: `_apply` is reused with `action="rebase"` (conflict state file `REBASE_HEAD`,
   `could not apply` wording); `_require_no_operation` refuses with `REBASE_IN_PROGRESS`.
 - `minigit/repo.py`: `"rebase": "REBASE_HEAD"` in `OPERATION_STATE_FILES`; `operation_in_progress()`
@@ -160,7 +170,7 @@ Plus `.minigit/REBASE_HEAD` (the commit a conflict stopped on; listed in `OPERAT
 ## 4. Limitations
 
 - No interactive rebase (`-i`), `--exec`, `--autosquash`, `--keep-base`, `--root`, `--rebase-merges`,
-  `--fork-point`, `--reapply-cherry-picks`, `--empty=...` or `pull --rebase`.
+  `--fork-point`, `--reapply-cherry-picks` or `--empty=...`; `pull --rebase` has no `--rebase=merges|interactive`.
 - Merge commits are always dropped (history is linearized).
 - The already-upstream check uses minigit's own patch id (whitespace-insensitive, line-number-insensitive),
   which can differ from git's on unusual diffs.

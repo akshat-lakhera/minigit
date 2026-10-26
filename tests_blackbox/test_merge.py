@@ -639,14 +639,16 @@ class ThreeWayCleanTests(MergeCase):
         self.assertIn(base[:7], r.run("log", "--oneline").out)
         self.assertIn(f1[:7], r.run("log", "--oneline").out)
 
-    def test_clean_merge_result_passes_fsck_and_show_prints_header_only(self):
+    def test_clean_merge_result_passes_fsck_and_show_diffs_against_the_first_parent(self):
         r = self.repo
         _, ours, theirs = self.diverge(ours=OURS, theirs=BASE, theirs_extra={"t.txt": b"t\n"})
         r.run("merge", "feat")
         self.assertEqual(r.run("fsck").out.strip(), "")
         show = r.run("show", "HEAD").out
         self.assertIn(f"Merge: {ours[:7]} {theirs[:7]}", show)
-        self.assertNotIn("diff --git", show, "a merge commit shows the header only")
+        # superseded: a merge is shown against its first parent after a line saying so (SPEC "show")
+        self.assertIn(f"(merge commit: showing the diff against the first parent {ours[:7]})", show)
+        self.assertIn("diff --git a/t.txt b/t.txt", show)
 
 
 # ---------------------------------------------------------------------------

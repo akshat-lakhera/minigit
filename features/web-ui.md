@@ -19,6 +19,7 @@ loads nothing from outside the server. It has these pages:
 | Repository list | `/-/` |
 | Repository summary | `/-/<repo>/` |
 | Branches | `/-/<repo>/branches` |
+| Tags (added with `features/tags.md`) | `/-/<repo>/tags` |
 | Commit log (paged) | `/-/<repo>/log?rev=R&n=N&skip=S` |
 | One commit with its diff | `/-/<repo>/commit/<rev>` |
 | File browser: directory | `/-/<repo>/tree?rev=R&path=P` |
@@ -364,6 +365,7 @@ Routing inside `handle_request` (with `rest = parts[1:]`):
 |---|---|
 | `[]` | summary |
 | `["branches"]` | branches |
+| `["tags"]` | tags (`view_tags`, `list_tags`; added with `features/tags.md`) |
 | `["log"]` | log |
 | `["commit", *r]` with `r` not empty | commit (rev `"/".join(r)`) |
 | `["tree"]` | tree |

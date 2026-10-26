@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "minigit"
-version = "0.1.0"
+version = "0.2.0"
 description = "A small but really working git clone with a multi-user HTTP server (standard library only)"
 readme = "README.md"
 requires-python = ">=3.11"

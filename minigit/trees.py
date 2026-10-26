@@ -7,7 +7,7 @@ Conversion between stored tree objects and the ``FlatTree`` (``{"a/b.txt":
 from __future__ import annotations
 
 from .errors import ObjectError
-from .objects import EMPTY_TREE, ObjectStore, TreeEntry, parse_commit, parse_tree, serialize_tree
+from .objects import EMPTY_TREE, ObjectStore, TreeEntry, serialize_tree
 
 Entry = tuple[str, str]
 FlatTree = dict[str, Entry]
@@ -21,7 +21,7 @@ def flatten_tree(store: ObjectStore, tree_sha: str | None) -> FlatTree:
     stack: list[tuple[str, str]] = [(tree_sha, "")]
     while stack:
         sha, prefix = stack.pop()
-        for e in parse_tree(store.read_typed(sha, "tree")):
+        for e in store.tree(sha):
             path = prefix + e.name
             if e.mode == "40000":
                 stack.append((e.sha, path + "/"))
@@ -72,7 +72,7 @@ def build_tree(store: ObjectStore, flat: FlatTree) -> str:
 
 
 def commit_tree_sha(store: ObjectStore, commit_sha: str) -> str:
-    return parse_commit(store.read_typed(commit_sha, "commit")).tree
+    return store.commit(commit_sha).tree
 
 
 def commit_flat(store: ObjectStore, commit_sha: str | None) -> FlatTree:

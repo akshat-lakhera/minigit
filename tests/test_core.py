@@ -99,7 +99,7 @@ def make_commit(store: ObjectStore, tree: str, parents, ts: int, msg: str = "m",
 
 class ErrorsTest(unittest.TestCase):
     def test_version(self):
-        self.assertEqual(__version__, "0.1.0")
+        self.assertEqual(__version__, "0.2.0")
 
     def test_hierarchy_and_attrs(self):
         e = MinigitError("boom", hint="try again")
@@ -269,7 +269,8 @@ class ObjectsTest(TempDirCase):
             with self.assertRaises(ObjectError, msg=repr(bad)):
                 decode_object(bad)
         with self.assertRaises(ObjectError):
-            encode_object("tag", b"")
+            encode_object("note", b"")
+        self.assertEqual(encode_object("tag", b"x"), b"tag 1\0x")
 
     def test_store_round_trip(self):
         sha = self.store.write("blob", b"hello\n")
@@ -588,7 +589,8 @@ class RefNameTest(unittest.TestCase):
         self.assertEqual(short_ref("refs/heads/x"), "x")
         self.assertEqual(short_ref("refs/heads/feat/x"), "feat/x")
         self.assertEqual(short_ref("refs/remotes/origin/x"), "origin/x")
-        self.assertEqual(short_ref("refs/tags/v1"), "tags/v1")
+        self.assertEqual(short_ref("refs/tags/v1"), "v1")
+        self.assertEqual(short_ref("refs/notes/x"), "notes/x")
         self.assertEqual(short_ref("HEAD"), "HEAD")
 
 
@@ -1025,6 +1027,32 @@ class GraphTest(TempDirCase):
         order = [c.subject for _, c in graph.topo_walk(self.store, [right, merge])]
         self.assertEqual(order, ["merge", "left", "right", "base"])
         self.assertEqual(list(graph.topo_walk(self.store, [])), [])
+
+    def test_topo_order_is_gits_stack_order(self):
+        base = self.c([], 1, "base")
+        left = self.c([base], 3, "left")
+        right = self.c([base], 2, "right")
+        merge = self.c([left, right], 4, "merge")
+
+        def order(starts, excluded=frozenset()):
+            return [c.subject for _, c in graph.topo_order(self.store, starts, excluded)]
+
+        # the second-parent lineage comes first, whatever the dates (topo_walk: merge, left, right, base)
+        self.assertEqual(order([merge]), ["merge", "right", "left", "base"])
+        l2 = self.c([left], 5, "l2")
+        m2 = self.c([l2, right], 6, "m2")
+        self.assertEqual(order([m2]), ["m2", "right", "l2", "left", "base"])
+        # excluded commits are left out and not walked through (callers pass an ancestor-closed set)
+        self.assertEqual(order([m2], {right, base}), ["m2", "l2", "left"])
+        self.assertEqual(order([m2], {base}), ["m2", "right", "l2", "left"])
+        self.assertEqual(order([m2], {m2}), [])
+        # several tips: newest committer time first, each tip's lineage before the next tip
+        r2 = self.c([base], 9, "r2")
+        self.assertEqual(order([left, r2]), ["r2", "left", "base"])
+        self.assertEqual(order([r2, left, left]), ["r2", "left", "base"])
+        # a tip reachable from another tip is not a tip
+        self.assertEqual(order([left, l2]), ["l2", "left", "base"])
+        self.assertEqual(graph.topo_order(self.store, []), [])
 
 
 # ---------------------------------------------------------------------------

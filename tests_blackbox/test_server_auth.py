@@ -788,7 +788,7 @@ class HttpAuthTests(_LiveServerBase):
             "update not object": push_frame({"protocol": 1, "updates": ["refs/heads/main"]}),
             "missing ref": push_frame({"protocol": 1, "updates": [{"old": None, "new": sha}]}),
             "ref not string": push_frame({"protocol": 1, "updates": [{**valid, "ref": 7}]}),
-            "tag ref": push_frame({"protocol": 1, "updates": [{**valid, "ref": "refs/tags/v1"}]}),
+            "notes ref": push_frame({"protocol": 1, "updates": [{**valid, "ref": "refs/notes/v1"}]}),
             "remote ref": push_frame({"protocol": 1, "updates": [{**valid, "ref": "refs/remotes/origin/main"}]}),
             "HEAD": push_frame({"protocol": 1, "updates": [{**valid, "ref": "HEAD"}]}),
             "bare branch name": push_frame({"protocol": 1, "updates": [{**valid, "ref": "main"}]}),

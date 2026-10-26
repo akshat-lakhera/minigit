@@ -1,0 +1,38 @@
+name: Tests
+
+# Runs the white-box suite (tests/) and the black-box suite (tests_blackbox/) on Windows and
+# Linux. The two suites run as separate jobs so a failure in one is easy to spot.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    name: ${{ matrix.suite }} on ${{ matrix.os }} (py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.11", "3.12"]
+        suite: [tests, tests_blackbox]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Run ${{ matrix.suite }}
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m unittest discover -s ${{ matrix.suite }} -t . 2>&1 | tail -60
+
+      - name: Demo (system test)
+        if: matrix.suite == 'tests'
+        shell: bash
+        run: python demo.py

@@ -78,8 +78,22 @@ class RepoCase(unittest.TestCase):
     def porcelain(self) -> str:
         return status.format_status_porcelain(status.compute_status(self.repo))
 
-    def diff(self, *revs, staged=False, paths=()):
-        return diffmod.diff_command(self.repo, self.wt, staged=staged, revs=list(revs), pathspecs=list(paths))
+    def diff(self, *revs, staged=False, paths=(), **kw):
+        return diffmod.diff_command(self.repo, self.wt, staged=staged, revs=list(revs), pathspecs=list(paths), **kw)
+
+    def merge(self, branch: str, msg: str, *, no_ff: bool = False) -> str:
+        """Merge ``branch`` into the current branch with the next clock tick; returns the new HEAD."""
+        from minigit import merge as mergemod
+        self.clock += 60
+        os.environ["MINIGIT_AUTHOR_DATE"] = f"{self.clock} +0000"
+        outcome = mergemod.merge(self.repo, branch, message=msg, no_ff=no_ff)
+        self.assertIn(outcome.kind, ("merged", "fast-forward"))
+        return self.repo.head_commit()
+
+    def date(self, sha: str) -> str:
+        from minigit.util import format_date
+        c = self.repo.read_commit(sha)
+        return format_date(c.author.timestamp, c.author.tz_offset)
 
 
 # =========================================================================== init / add / rm
@@ -111,6 +125,47 @@ class InitAddRmTests(RepoCase):
         self.write("sub/b.txt", "b\n")
         got = ops.add(self.repo, ["b.txt"], os.path.join(self.wt, "sub"))
         self.assertEqual(got, ["sub/b.txt"])
+
+    def test_add_all_stages_the_whole_tree_from_any_directory(self):
+        self.commit_file("a.txt", "a\n")
+        self.commit_file("sub/b.txt", "b\n")
+        self.write("a.txt", "a2\n")
+        os.unlink(os.path.join(self.wt, "sub", "b.txt"))
+        self.write("new.txt", "n\n")
+        self.write("sub/deep/c.txt", "c\n")
+        # -A with no pathspec covers the root, whatever cwd is (here: a subdirectory)
+        got = ops.add(self.repo, [], os.path.join(self.wt, "sub"), all_=True)
+        self.assertEqual(got, ["a.txt", "new.txt", "sub/b.txt", "sub/deep/c.txt"])
+        self.assertEqual(sorted(read_index(self.repo).paths()), ["a.txt", "new.txt", "sub/deep/c.txt"])
+        self.assertEqual(self.porcelain(), "M  a.txt\nA  new.txt\nD  sub/b.txt\nA  sub/deep/c.txt\n")
+        # a second -A has nothing left to do
+        self.assertEqual(ops.add(self.repo, [], self.wt, all_=True), [])
+
+    def test_add_update_stages_tracked_files_only(self):
+        self.commit_file("a.txt", "a\n")
+        self.commit_file("sub/b.txt", "b\n")
+        self.commit_file("sub/c.txt", "c\n")
+        self.write("a.txt", "a2\n")
+        self.write("sub/c.txt", "c2\n")
+        os.unlink(os.path.join(self.wt, "sub", "b.txt"))
+        self.write("new.txt", "n\n")
+        self.write("sub/new.txt", "n\n")
+        # with a pathspec: only the tracked files under it
+        self.assertEqual(ops.add(self.repo, ["sub"], self.wt, update=True), ["sub/b.txt", "sub/c.txt"])
+        self.assertEqual(self.porcelain(), " M a.txt\n?? new.txt\nD  sub/b.txt\nM  sub/c.txt\n?? sub/new.txt\n")
+        # without: the whole tree, new files are still never staged
+        self.assertEqual(ops.add(self.repo, [], os.path.join(self.wt, "sub"), update=True), ["a.txt"])
+        self.assertEqual(self.porcelain(), "M  a.txt\n?? new.txt\nD  sub/b.txt\nM  sub/c.txt\n?? sub/new.txt\n")
+        self.assertEqual(sorted(read_index(self.repo).paths()), ["a.txt", "sub/c.txt"])
+        # an untracked file or an unknown name is not a match for -u
+        for spec in ("new.txt", "nope"):
+            with self.assertRaises(MinigitError) as cm:
+                ops.add(self.repo, [spec], self.wt, update=True)
+            self.assertEqual(cm.exception.message, f"pathspec '{spec}' did not match any files")
+        with self.assertRaises(UsageError):
+            ops.add(self.repo, [], self.wt, all_=True, update=True)
+        with self.assertRaises(UsageError):
+            ops.add(self.repo, [], self.wt)
 
     def test_add_removes_missing_tracked(self):
         self.commit_file("gone.txt", "x\n")
@@ -313,6 +368,31 @@ class StatusTests(RepoCase):
         self.write("keep.txt", "k")
         self.assertEqual(self.porcelain(), "?? .minigitignore\n?? keep.txt\n")
 
+    def test_upstream_gone(self):
+        self.commit_file("a.txt", "1\n")
+        ops.set_upstream(self.repo, "main", "origin", "refs/heads/main")   # no refs/remotes/origin/main
+        st = status.compute_status(self.repo)
+        self.assertEqual((st.upstream, st.upstream_gone, st.ahead, st.behind), ("origin/main", True, 0, 0))
+        self.assertEqual(status.format_status_long(st),
+                         "On branch main\n"
+                         "Your branch is based on 'origin/main', but the upstream is gone.\n"
+                         '  (use "minigit branch --unset-upstream" to fixup)\n'
+                         "\nnothing to commit, working tree clean\n")
+        self.write("b.txt", "b")
+        st = status.compute_status(self.repo)
+        self.assertEqual(status.format_status_porcelain(st), "?? b.txt\n")   # porcelain: entries only
+        self.assertIn("but the upstream is gone.\n", status.format_status_long(st))
+        ops.unset_upstream(self.repo)
+        st = status.compute_status(self.repo)
+        self.assertEqual((st.upstream, st.upstream_gone), (None, False))
+        self.assertNotIn("upstream", status.format_status_long(st))
+        # an unborn branch whose upstream is gone says so too, after "No commits yet"
+        ops.switch(self.repo, None, create="orphan")
+        ops.set_upstream(self.repo, "orphan", "origin", "refs/heads/orphan")
+        self.repo.refs.update("refs/heads/orphan", None, expected=self.repo.head_commit())
+        text = status.format_status_long(status.compute_status(self.repo))
+        self.assertIn("No commits yet\nYour branch is based on 'origin/orphan', but the upstream is gone.\n", text)
+
     def test_detached_and_upstream(self):
         c1 = self.commit_file("a.txt", "1\n")
         c2 = self.commit_file("a.txt", "2\n")
@@ -431,6 +511,75 @@ class DiffTests(RepoCase):
         self.commit_file("img.bin", b"\0\1\2\3")
         self.write("img.bin", b"\0\1\2\4")
         self.assertIn(b"Binary files a/img.bin and b/img.bin differ\n", self.diff())
+
+
+    def test_diffstat_format(self):
+        from minigit.diff import FileStat, format_diffstat, format_shortstat
+        self.assertEqual(format_diffstat([]), "")
+        self.assertEqual(format_diffstat([FileStat("a.txt", 1, 0)]),
+                         " a.txt | 1 +\n 1 file changed, 1 insertion(+)\n")
+        self.assertEqual(format_diffstat([FileStat("a.txt", 0, 1)]),
+                         " a.txt | 1 -\n 1 file changed, 1 deletion(-)\n")
+        # the name column is padded to the longest name, counts are right-aligned
+        self.assertEqual(format_diffstat([FileStat("a.txt", 2, 3), FileStat("dir/long.txt", 10, 0)]),
+                         " a.txt        |  5 ++---\n"
+                         " dir/long.txt | 10 ++++++++++\n"
+                         " 2 files changed, 12 insertions(+), 3 deletions(-)\n")
+        # the bar is scaled so the line fits in 80 columns (git's rules)
+        big = format_diffstat([FileStat("big.txt", 200, 100)])
+        self.assertEqual(big, " big.txt | 300 " + "+" * 42 + "-" * 22 + "\n"
+                              " 1 file changed, 200 insertions(+), 100 deletions(-)\n")
+        self.assertTrue(all(len(line) < 80 for line in big.splitlines()))
+        # binary files: sizes instead of a bar, and the counts line up with "Bin"
+        self.assertEqual(format_diffstat([FileStat("a.txt", 1, 0), FileStat("img.bin", 5, 3, binary=True)]),
+                         " a.txt   |   1 +\n"
+                         " img.bin | Bin 3 -> 5 bytes\n"
+                         " 2 files changed, 1 insertion(+)\n")
+        self.assertEqual(format_diffstat([FileStat("e", 0, 0)]),
+                         " e | 0\n 1 file changed, 0 insertions(+), 0 deletions(-)\n")
+        # a too-long name is cut at a directory boundary
+        long_name = "d" * 100 + "/f.txt"
+        self.assertEqual(format_diffstat([FileStat(long_name, 1, 0)]).splitlines()[0],
+                         " .../f.txt" + " " * 63 + " | 1 +")
+        # summary singular/plural and omitted zero parts
+        self.assertEqual(format_shortstat(1, 1, 1), " 1 file changed, 1 insertion(+), 1 deletion(-)")
+        self.assertEqual(format_shortstat(2, 0, 0), " 2 files changed, 0 insertions(+), 0 deletions(-)")
+        self.assertEqual(format_shortstat(1, 0, 2), " 1 file changed, 2 deletions(-)")
+        self.assertEqual(format_shortstat(3, 4, 0), " 3 files changed, 4 insertions(+)")
+
+    def test_diffstat_rename_label(self):
+        from minigit.diff import _rename_name
+        self.assertEqual(_rename_name("a.txt", "b.txt"), "a.txt => b.txt")
+        self.assertEqual(_rename_name("dir/a.txt", "dir/b.txt"), "dir/{a.txt => b.txt}")
+        self.assertEqual(_rename_name("a/x.txt", "b/x.txt"), "{a => b}/x.txt")
+        self.assertEqual(_rename_name("x", "dir/x"), "x => dir/x")
+        self.assertEqual(_rename_name("a/b/c", "a/c"), "a/{b => }/c")
+
+    def test_diff_stat_forms(self):
+        self.commit_file("a.txt", "1\n", "one")
+        self.write("a.txt", "1\n2\n")
+        self.write("b.bin", b"\0\1")
+        self.add("b.bin")
+        self.assertEqual(self.diff(stat=True).decode(), " a.txt | 1 +\n 1 file changed, 1 insertion(+)\n")
+        self.assertEqual(self.diff(staged=True, stat=True).decode(),
+                         " b.bin | Bin 0 -> 2 bytes\n 1 file changed, 0 insertions(+), 0 deletions(-)\n")
+        both = (" a.txt |   1 +\n b.bin | Bin 0 -> 2 bytes\n 2 files changed, 1 insertion(+)\n")
+        self.assertEqual(self.diff("HEAD", stat=True).decode(), both)
+        self.add("a.txt")
+        self.commit("two")
+        self.assertEqual(self.diff("HEAD~1", "HEAD", stat=True).decode(), both)
+        self.assertEqual(self.diff("HEAD~1", "HEAD", stat=True, paths=["a.txt"]).decode(),
+                         " a.txt | 1 +\n 1 file changed, 1 insertion(+)\n")
+        self.assertEqual(self.diff(stat=True), b"")
+        # an exact rename is one file with no lines, shown at its new path
+        ops.rm(self.repo, ["a.txt"], self.wt)
+        self.write("c.txt", "1\n2\n")
+        self.add("c.txt")
+        self.assertEqual(self.diff(staged=True, stat=True).decode(),
+                         " a.txt => c.txt | 0\n 1 file changed, 0 insertions(+), 0 deletions(-)\n")
+        # the commit summary line comes from the same counting
+        _sha, summary = ops.commit(self.repo, ["three"], stat=True)
+        self.assertTrue(summary.endswith("\n 1 file changed, 0 insertions(+), 0 deletions(-)"), summary)
 
 
 # =========================================================================== commit
@@ -585,6 +734,91 @@ class CommitTests(RepoCase):
         self.assertEqual(self.repo.refs.resolve("HEAD"), sha)
         self.assertEqual(self.repo.refs.resolve("refs/heads/main"), c1)
 
+    # --- commit --amend -----------------------------------------------------
+    def amend(self, *messages: str, **kw) -> tuple[str, str]:
+        self.clock += 60
+        os.environ["MINIGIT_AUTHOR_DATE"] = f"{self.clock} +0000"
+        return ops.commit(self.repo, list(messages), amend=True, stat=True, **kw)
+
+    def test_amend_replaces_head_keeping_parents_and_author(self):
+        c1 = self.commit_file("a.txt", "a\n", "one")
+        c2 = self.commit_file("b.txt", "b\n", "two")
+        old = self.repo.read_commit(c2)
+        self.write("c.txt", "c\n")
+        self.add("c.txt")
+        sha, summary = self.amend("two, fixed", "body")
+        self.assertNotEqual(sha, c2)
+        self.assertEqual(summary, f"[main {sha[:7]}] two, fixed\n 2 files changed, 2 insertions(+)")
+        new = self.repo.read_commit(sha)
+        self.assertEqual(new.parents, (c1,))
+        self.assertEqual(new.message, "two, fixed\n\nbody\n")
+        self.assertEqual(new.author, old.author)                       # name, email and date kept
+        self.assertEqual(new.committer.timestamp, self.clock)          # the committer is new
+        self.assertEqual(sorted(self.repo.head_flat()), ["a.txt", "b.txt", "c.txt"])
+        self.assertEqual(self.repo.head_commit(), sha)
+        self.assertEqual(self.repo.refs.read_special("ORIG_HEAD"), c2)
+        self.assertEqual(self.porcelain(), "")
+
+    def test_amend_without_message_keeps_it_and_needs_no_change(self):
+        c1 = self.commit_file("a.txt", "a\n", "one")
+        sha, summary = self.amend()      # nothing changed: allowed without --allow-empty, as in git
+        self.assertNotEqual(sha, c1)
+        self.assertEqual(self.repo.read_commit(sha).message, "one\n")
+        self.assertEqual(self.repo.read_commit(sha).parents, ())
+        self.assertEqual(summary, f"[main {sha[:7]}] one\n 1 file changed, 1 insertion(+)")
+        self.assertEqual(self.repo.refs.read_special("ORIG_HEAD"), c1)
+
+    def test_amend_with_all_restages_tracked_files(self):
+        self.commit_file("a.txt", "a\n", "one")
+        self.commit_file("b.txt", "b\n", "two")
+        self.write("a.txt", "a2\n")
+        os.unlink(os.path.join(self.wt, "b.txt"))
+        self.write("new.txt", "n\n")
+        sha, _ = self.amend(all_=True)
+        flat = self.repo.head_flat()
+        self.assertEqual(sorted(flat), ["a.txt"])
+        self.assertEqual(flat["a.txt"][1], hash_object("blob", b"a2\n"))
+        self.assertEqual(self.repo.read_commit(sha).message, "two\n")
+        self.assertEqual(self.porcelain(), "?? new.txt\n")
+
+    def test_amend_detached_head(self):
+        c1 = self.commit_file("a.txt", "a\n", "one")
+        c2 = self.commit_file("a.txt", "b\n", "two")
+        ops.switch(self.repo, c2, detach=True)
+        sha, summary = self.amend("two again")
+        self.assertEqual(summary, f"[detached HEAD {sha[:7]}] two again\n 1 file changed, 1 insertion(+), 1 deletion(-)")
+        self.assertEqual(self.repo.refs.resolve("HEAD"), sha)
+        self.assertEqual(self.repo.refs.resolve("refs/heads/main"), c2)
+        self.assertEqual(self.repo.read_commit(sha).parents, (c1,))
+
+    def test_amend_refusals(self):
+        with self.assertRaises(MinigitError) as cm:
+            ops.commit(self.repo, ["x"], amend=True)
+        self.assertEqual(cm.exception.message, "you have nothing to amend")
+        c1 = self.commit_file("a.txt", "a\n", "one")
+        c2 = self.commit_file("a.txt", "b\n", "two")
+        for kind, state in (("merge", "MERGE_HEAD"), ("cherry-pick", "CHERRY_PICK_HEAD"), ("revert", "REVERT_HEAD")):
+            self.repo.refs.write_special(state, c1)
+            with self.assertRaises(MinigitError) as cm:
+                ops.commit(self.repo, ["x"], amend=True)
+            self.assertEqual(cm.exception.message, f"you cannot amend during a {kind}")
+            self.repo.refs.write_special(state, None)
+        os.makedirs(self.repo.gpath("rebase"))
+        with self.assertRaises(MinigitError) as cm:
+            ops.commit(self.repo, ["x"], amend=True)
+        self.assertEqual(cm.exception.message, "you cannot amend during a rebase")
+        os.rmdir(self.repo.gpath("rebase"))
+        blob = hash_object("blob", b"x\n")
+        with locked_index(self.repo) as index:
+            index.remove("a.txt")
+            for stage in (1, 2, 3):
+                index.put(IndexEntry(path="a.txt", mode="100644", sha=blob, size=0, mtime_ns=0, stage=stage))
+        with self.assertRaises(MinigitError) as cm:
+            ops.commit(self.repo, ["x"], amend=True)
+        self.assertEqual(cm.exception.message, "cannot commit: unresolved conflicts in: a.txt")
+        self.assertEqual(self.repo.head_commit(), c2)   # nothing was written by any refusal
+        self.assertIsNone(self.repo.refs.read_special("ORIG_HEAD"))
+
 
 # =========================================================================== log / show
 
@@ -705,11 +939,166 @@ class HistoryTests(RepoCase):
         self.write("f.txt", "resolved\n")
         self.add("f.txt")
         m = self.commit("merge")
+        first = self.repo.read_commit(m).parents[0]
         out = history.show(self.repo, m).decode()
         self.assertIn("Merge: ", out)
-        self.assertIn("diff --git a/f.txt b/f.txt\n", out)
+        self.assertIn(f"\n    merge\n\n(merge commit: showing the diff against the first parent {first[:7]})\n"
+                      "\ndiff --git a/f.txt b/f.txt\n", out)
         self.assertIn("-main\n+resolved\n", out)
-        self.assertNotIn("s.txt", out)  # taken cleanly from a parent: not part of the combined diff
+        self.assertIn("diff --git a/s.txt b/s.txt\n", out)  # new since the first parent
+
+    def _merge_history(self) -> tuple[str, str, str, str]:
+        """``c1 <- c2`` on main, ``c1 <- s1`` on side, merged into main: ``(c1, c2, s1, m)``."""
+        c1 = self.commit_file("a.txt", "1\n", "one")
+        ops.branch_create(self.repo, "side", c1)
+        c2 = self.commit_file("a.txt", "2\n", "two")
+        ops.switch(self.repo, "side")
+        s1 = self.commit_file("s.txt", "s\n", "s1")
+        ops.switch(self.repo, "main")
+        m = self.merge("side", "merge")
+        self.assertEqual(self.repo.read_commit(m).parents, (c2, s1))
+        return c1, c2, s1, m
+
+    def test_show_merge_commit_diffs_against_the_first_parent(self):
+        c1, c2, s1, m = self._merge_history()
+        out = history.show(self.repo, m).decode()
+        self.assertTrue(out.startswith(f"commit {m} (HEAD -> main)\nMerge: {c2[:7]} {s1[:7]}\n"))
+        self.assertIn(f"\n    merge\n\n(merge commit: showing the diff against the first parent {c2[:7]})\n\n"
+                      "diff --git a/s.txt b/s.txt\nnew file mode 100644\n", out)
+        self.assertIn("+s\n", out)
+        self.assertNotIn("a.txt", out)  # unchanged against the first parent
+        stat = history.show(self.repo, m, stat=True).decode()
+        self.assertTrue(stat.endswith(
+            f"(merge commit: showing the diff against the first parent {c2[:7]})\n\n"
+            " s.txt | 1 +\n 1 file changed, 1 insertion(+)\n"), stat)
+        # -m: the diff against each parent in turn, each under the full header
+        each = history.show(self.repo, m, each_parent=True).decode()
+        first, second = each.split(f"\n\ncommit {m} (from {s1}) (HEAD -> main)\n")
+        self.assertTrue(first.startswith(f"commit {m} (from {c2}) (HEAD -> main)\nMerge: {c2[:7]} {s1[:7]}\n"))
+        self.assertIn("\n    merge\n\ndiff --git a/s.txt b/s.txt\n", first)
+        self.assertNotIn("a.txt", first)
+        self.assertTrue(second.startswith(f"Merge: {c2[:7]} {s1[:7]}\nAuthor: "))
+        self.assertIn("\n    merge\n\ndiff --git a/a.txt b/a.txt\n", second)
+        self.assertIn("-1\n+2\n", second)
+        self.assertNotIn("s.txt", second)
+        self.assertNotIn("(merge commit:", each)
+        # -m and --stat on an ordinary commit change nothing but the body
+        self.assertEqual(history.show(self.repo, c2, each_parent=True), history.show(self.repo, c2))
+        self.assertTrue(history.show(self.repo, c2, stat=True).decode().endswith(
+            "\n    two\n\n a.txt | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n"))
+
+    def test_log_paths(self):
+        def shas(entries):
+            return [s for s, _ in entries]
+
+        c1 = self.commit_file("a.txt", "1\n", "one")
+        c2 = self.commit_file("d/x.txt", "x\n", "two")
+        c3 = self.commit_file("a.txt", "2\n", "three")
+        c4 = self.commit_file("d/y.txt", "y\n", "four")
+        log = lambda paths, **kw: shas(history.log_entries(self.repo, None, kw.pop("n", None), paths=paths, **kw))
+        self.assertEqual(log(["a.txt"]), [c3, c1])
+        self.assertEqual(log(["d"]), [c4, c2])            # a directory matches everything under it
+        self.assertEqual(log(["d/"]), [c4, c2])
+        self.assertEqual(log(["d/x.txt"]), [c2])
+        self.assertEqual(log(["a.txt"], n=1), [c3])
+        self.assertEqual(log(["nope"]), [])
+        self.assertEqual(log(["a.txt", "d/y.txt"]), [c4, c3, c1])
+        self.assertEqual(log([""]), [c4, c3, c2, c1])     # the root: every commit that changes anything
+        self.assertEqual(log(["a.txt/x"]), [])            # a file is not a directory
+        # a merge counts when its tree differs from its *first* parent's tree at the path
+        ops.branch_create(self.repo, "side", c1)
+        ops.switch(self.repo, "side")
+        s1 = self.commit_file("s.txt", "s\n", "side")
+        ops.switch(self.repo, "main")
+        m = self.merge("side", "merge")
+        self.assertEqual(log(["s.txt"]), [m, s1])
+        self.assertEqual(log(["a.txt"]), [c3, c1])
+        self.assertEqual(shas(history.log_entries(self.repo, ["side"], None, paths=["s.txt"])), [s1])
+        self.assertEqual(shas(history.log_entries(self.repo, None, None, all_refs=True, paths=["a.txt"])), [c3, c1])
+
+    def _graph(self, oneline: bool, **kw) -> str:
+        entries = history.log_entries(self.repo, None, None, **{k: v for k, v in kw.items() if k == "paths"})
+        return history.format_log(self.repo, entries, oneline, graph=True, **kw)
+
+    def test_graph_linear(self):
+        c1 = self.commit_file("a.txt", "1\n", "one")
+        c2 = self.commit_file("a.txt", "2\n", "two")
+        c3 = self.commit_file("a.txt", "3\n", "three")
+        self.assertEqual(self._graph(True),
+                         f"* {c3[:7]} (HEAD -> main) three\n* {c2[:7]} two\n* {c1[:7]} one\n")
+        author = "Author: Test User <test@example.com>"
+        self.assertEqual(self._graph(False), (
+            f"* commit {c3} (HEAD -> main)\n| {author}\n| Date:   {self.date(c3)}\n| \n|     three\n| \n"
+            f"* commit {c2}\n| {author}\n| Date:   {self.date(c2)}\n| \n|     two\n| \n"
+            f"* commit {c1}\n  {author}\n  Date:   {self.date(c1)}\n  \n      one\n"))
+
+    def test_graph_one_merge(self):
+        c1, c2, s1, m = self._merge_history()
+        self.assertEqual(self._graph(True), (
+            f"*   {m[:7]} (HEAD -> main) merge\n"
+            "|\\  \n"
+            f"| * {s1[:7]} (side) s1\n"
+            f"* | {c2[:7]} two\n"
+            "|/  \n"
+            f"* {c1[:7]} one\n"))
+        author = "Author: Test User <test@example.com>"
+        self.assertEqual(self._graph(False), (
+            f"*   commit {m} (HEAD -> main)\n"
+            f"|\\  Merge: {c2[:7]} {s1[:7]}\n"
+            f"| | {author}\n| | Date:   {self.date(m)}\n| | \n| |     merge\n| | \n"
+            f"| * commit {s1} (side)\n"
+            f"| | {author}\n| | Date:   {self.date(s1)}\n| | \n| |     s1\n| | \n"
+            f"* | commit {c2}\n"
+            f"|/  {author}\n|   Date:   {self.date(c2)}\n|   \n|       two\n| \n"
+            f"* commit {c1}\n"
+            f"  {author}\n  Date:   {self.date(c1)}\n  \n      one\n"))
+        # -n keeps the lanes leaving the picture, as git does
+        one = history.format_log(self.repo, history.log_entries(self.repo, None, 1), True, graph=True)
+        self.assertEqual(one, f"*   {m[:7]} (HEAD -> main) merge\n|\\  \n")
+
+    def test_graph_two_branches_merged_in_turn(self):
+        c1 = self.commit_file("c.txt", "1\n", "c1")
+        ops.branch_create(self.repo, "a", c1)
+        ops.branch_create(self.repo, "b", c1)
+        ops.switch(self.repo, "a")
+        a1 = self.commit_file("a.txt", "a\n", "a1")
+        ops.switch(self.repo, "b")
+        b1 = self.commit_file("b.txt", "b\n", "b1")
+        ops.switch(self.repo, "main")
+        ma = self.merge("a", "MA", no_ff=True)
+        mb = self.merge("b", "MB", no_ff=True)
+        self.assertEqual(self._graph(True), (
+            f"*   {mb[:7]} (HEAD -> main) MB\n"
+            "|\\  \n"
+            f"* \\   {ma[:7]} MA\n"
+            "|\\ \\  \n"
+            f"| | * {b1[:7]} (b) b1\n"
+            "| |/  \n"
+            "|/|   \n"
+            f"| * {a1[:7]} (a) a1\n"
+            "|/  \n"
+            f"* {c1[:7]} c1\n"))
+        # with a path filter the graph joins the shown commits
+        self.assertEqual(self._graph(True, paths=["b.txt"]), (
+            f"* {mb[:7]} (HEAD -> main) MB\n"
+            f"* {b1[:7]} (b) b1\n"))
+
+    def test_log_stat(self):
+        c1 = self.commit_file("a.txt", "1\n", "one")
+        c2 = self.commit_file("a.txt", "1\n2\n", "two")
+        text = history.format_log(self.repo, history.log_entries(self.repo, None, None), False, stat=True)
+        self.assertIn(f"\n    two\n\n a.txt | 1 +\n 1 file changed, 1 insertion(+)\n\ncommit {c1}\n", text)
+        self.assertTrue(text.endswith("\n    one\n\n a.txt | 1 +\n 1 file changed, 1 insertion(+)\n"))
+        # a merge gets no stat block (git shows no diff for merges in log); --graph prefixes the block
+        ops.branch_create(self.repo, "side", c1)
+        ops.switch(self.repo, "side")
+        self.commit_file("s.txt", "s\n", "s1")
+        ops.switch(self.repo, "main")
+        m = self.merge("side", "merge")
+        text = history.format_log(self.repo, history.log_entries(self.repo, None, None), False, stat=True, graph=True)
+        self.assertIn(f"*   commit {m} (HEAD -> main)\n", text)
+        self.assertIn("| |     merge\n| | \n| * commit ", text)
+        self.assertIn("| |     s1\n| | \n| |  s.txt | 1 +\n| |  1 file changed, 1 insertion(+)\n| | \n", text)
 
     def test_topo_order_beats_timestamps(self):
         c1 = self.commit_file("a.txt", "1\n", "one")
@@ -752,6 +1141,92 @@ class HistoryTests(RepoCase):
 # =========================================================================== branch
 
 class BranchTests(RepoCase):
+    def test_list_with_upstreams(self):
+        # -vv: [origin/main], ahead, behind, both, gone, and no column without an upstream
+        c1 = self.commit_file("a.txt", "1\n", "one")
+        c2 = self.commit_file("a.txt", "2\n", "two")
+        ops.branch_create(self.repo, "feature", c1)
+        ops.branch_create(self.repo, "plain", c1)
+        ops.set_upstream(self.repo, "main", "origin", "refs/heads/main")
+        ops.set_upstream(self.repo, "feature", "origin", "refs/heads/feature")
+        self.repo.refs.update("refs/remotes/origin/main", c2)
+        self.repo.refs.update("refs/remotes/origin/feature", c1)
+
+        def listing():
+            return ops.format_branch_list(ops.branch_list(self.repo, upstreams=True), True)
+
+        self.assertEqual(listing(), f"  feature {c1[:7]} [origin/feature] one\n"
+                                    f"* main    {c2[:7]} [origin/main] two\n"
+                                    f"  plain   {c1[:7]} one\n")
+        # -v without upstreams prints no column at all
+        self.assertEqual(ops.format_branch_list(ops.branch_list(self.repo), True),
+                         f"  feature {c1[:7]} one\n* main    {c2[:7]} two\n  plain   {c1[:7]} one\n")
+        self.repo.refs.update("refs/remotes/origin/main", c1)
+        self.assertIn(f"* main    {c2[:7]} [origin/main: ahead 1] two\n", listing())
+        self.repo.refs.update("refs/remotes/origin/feature", c2)
+        self.assertIn(f"  feature {c1[:7]} [origin/feature: behind 1] one\n", listing())
+        ops.switch(self.repo, "feature")
+        c3 = self.commit_file("b.txt", "3\n", "three")
+        self.assertIn(f"* feature {c3[:7]} [origin/feature: ahead 1, behind 1] three\n", listing())
+        items = ops.branch_list(self.repo, upstreams=True)
+        feature = next(i for i in items if i.name == "feature")
+        self.assertEqual((feature.upstream, feature.ahead, feature.behind, feature.gone), ("origin/feature", 1, 1, False))
+        self.assertIsNone(next(i for i in items if i.name == "plain").upstream)
+        # the tracking ref disappeared (fetch pruned it): gone
+        self.repo.refs.update("refs/remotes/origin/feature", None)
+        self.assertIn(f"* feature {c3[:7]} [origin/feature: gone] three\n", listing())
+        gone = next(i for i in ops.branch_list(self.repo, upstreams=True) if i.name == "feature")
+        self.assertTrue(gone.gone)
+        self.assertEqual(gone.tracking(), "[origin/feature: gone]")
+        # a local upstream (remote ".") shows the branch name
+        ops.set_upstream(self.repo, "plain", ".", "refs/heads/main")
+        self.assertIn(f"  plain   {c1[:7]} [main: behind 1] one\n", listing())
+        # remote branches never get the column, and the detached HEAD line neither
+        ops.switch(self.repo, c3, detach=True)
+        text = ops.format_branch_list(ops.branch_list(self.repo, all_=True, upstreams=True), True)
+        self.assertTrue(text.startswith(f"* (HEAD detached at {c3[:7]}) {c3[:7]} three\n"), text)
+        self.assertIn(f"  remotes/origin/main        {c1[:7]} one\n", text)
+
+    def test_set_and_unset_upstream(self):
+        c1 = self.commit_file("a.txt", "1\n", "one")
+        ops.branch_create(self.repo, "feature")
+        with self.assertRaises(MinigitError) as cm:
+            ops.set_upstream_to(self.repo, "origin/main")
+        self.assertEqual(cm.exception.message, "the requested upstream branch 'origin/main' does not exist")
+        self.assertIsNone(ops.get_upstream(self.repo, "main"))
+        self.repo.refs.update("refs/remotes/origin/main", c1)
+        self.assertEqual(ops.set_upstream_to(self.repo, "origin/main"), "branch 'main' set up to track 'origin/main'.")
+        self.assertEqual(ops.get_upstream(self.repo, "main"), ("origin", "refs/heads/main"))
+        # an explicit branch, the full ref spelling, and a remote whose name contains a slash
+        self.assertEqual(ops.set_upstream_to(self.repo, "refs/remotes/origin/main", "feature"),
+                         "branch 'feature' set up to track 'origin/main'.")
+        self.assertEqual(ops.get_upstream(self.repo, "feature"), ("origin", "refs/heads/main"))
+        self.repo.config.set("remote.up/stream.url", "http://h:1/p")
+        self.repo.refs.update("refs/remotes/up/stream/dev", c1)
+        ops.set_upstream_to(self.repo, "up/stream/dev", "feature")
+        self.assertEqual(ops.get_upstream(self.repo, "feature"), ("up/stream", "refs/heads/dev"))
+        # a local branch as upstream
+        self.assertEqual(ops.set_upstream_to(self.repo, "main", "feature"), "branch 'feature' set up to track 'main'.")
+        self.assertEqual(ops.get_upstream(self.repo, "feature"), (".", "refs/heads/main"))
+        with self.assertRaises(MinigitError) as cm:
+            ops.set_upstream_to(self.repo, "origin/main", "nosuch")
+        self.assertEqual(cm.exception.message, "branch 'nosuch' not found")
+        # unset: the keys and the empty section go away; a second time is an error
+        ops.unset_upstream(self.repo)
+        self.assertIsNone(ops.get_upstream(self.repo, "main"))
+        self.assertNotIn("[branch \"main\"]", self.read(".minigit/config").decode())
+        with self.assertRaises(MinigitError) as cm:
+            ops.unset_upstream(self.repo, "main")
+        self.assertEqual(cm.exception.message, "branch 'main' has no upstream information")
+        ops.unset_upstream(self.repo, "feature")
+        self.assertIsNone(ops.get_upstream(self.repo, "feature"))
+        # detached HEAD: no default branch
+        ops.switch(self.repo, c1, detach=True)
+        for call in (lambda: ops.unset_upstream(self.repo), lambda: ops.set_upstream_to(self.repo, "origin/main")):
+            with self.assertRaises(MinigitError) as cm:
+                call()
+            self.assertEqual(cm.exception.message, "HEAD does not point to a branch")
+
     def test_list_create_delete(self):
         c1 = self.commit_file("a.txt", "1\n", "one")
         self.assertEqual(ops.branch_create(self.repo, "feature"), c1)
@@ -1317,7 +1792,7 @@ class CliSemanticsTests(unittest.TestCase):
         self.assertEqual(self.mg("log", "--oneline", "-2").out.count("\n"), 2)
 
     def test_unknown_option_prints_the_subcommand_usage(self):
-        for args, prog in ((["commit", "--amend", "-m", "x"], "minigit commit"),
+        for args, prog in ((["commit", "--signoff", "-m", "x"], "minigit commit"),
                            (["reset", "-q"], "minigit reset"),
                            (["rev-parse", "--abbrev-ref", "HEAD"], "minigit rev-parse")):
             with self.subTest(args=args):

@@ -44,7 +44,12 @@ MSG_STALE = "remote ref changed since you last fetched (expected {expected}, fou
 MSG_FORCE_DISABLED = ("non-fast-forward update refused: force pushes are disabled for this repository; "
                       "run 'minigit pull' first, then push again")
 MSG_CLASH = "cannot create '{ref}': it clashes with the existing branch '{other}'"
+MSG_TAG_CLASH = "cannot create '{ref}': it clashes with the existing tag '{other}'"
 MSG_DELETE_DEFAULT = "refusing to delete the default branch '{ref}'"
+MSG_TAG_EXISTS = "tag '{name}' already exists on the remote (use --force to replace it)"
+
+HEADS = "refs/heads/"
+TAGS = "refs/tags/"
 
 _locks_guard = threading.Lock()
 _repo_locks: dict[str, threading.Lock] = {}
@@ -97,11 +102,23 @@ def open_repo(root: str, name: str) -> Repository:
 
 
 def info_refs(repo: Repository) -> dict:
-    return {
-        "protocol": PROTOCOL,
-        "head": repo.refs.head_target(),
-        "refs": dict(repo.refs.list("refs/")),
-    }
+    refs = dict(repo.refs.list("refs/"))
+    # "peeled": for every annotated tag, the commit it names (git's "^{}" lines), so a client
+    # can decide which tags to fetch before it has the tag objects.
+    peeled: dict[str, str] = {}
+    for name, sha in refs.items():
+        if not name.startswith(TAGS):
+            continue
+        try:
+            obj_type, target = pack.objects.peel(repo.objects, sha)
+        except errors.MinigitError:
+            continue
+        if target != sha and obj_type == "commit":
+            peeled[name] = target
+    out = {"protocol": PROTOCOL, "head": repo.refs.head_target(), "refs": refs}
+    if peeled:
+        out["peeled"] = peeled
+    return out
 
 
 def _hex_list(value: object, what: str) -> list[str]:
@@ -139,7 +156,8 @@ def process_fetch(repo: Repository, body: bytes) -> tuple[int, bytes, str]:
         haves = _hex_list(req.get("have"), "have")
         store = repo.objects
         if wants:
-            reachable = pack.complete_commits(store, _server_ref_values(repo))
+            values = _server_ref_values(repo)
+            reachable = pack.complete_commits(store, values) | pack.peel_tips(store, values)[1]
             for sha in wants:
                 if sha not in reachable:
                     raise HttpError(400, "bad_want", f"want {sha} is not reachable from any ref on the server")
@@ -194,8 +212,8 @@ def _parse_updates(req: dict) -> tuple[list[dict], bool]:
             refs_mod.check_ref_name(ref)
         except errors.MinigitError as e:
             raise HttpError(400, "bad_request", f"bad ref name: {_msg(e)}")
-        if not ref.startswith("refs/heads/"):
-            raise HttpError(400, "bad_request", f"only branches can be pushed, not '{ref}'")
+        if not ref.startswith(HEADS) and not ref.startswith(TAGS):
+            raise HttpError(400, "bad_request", f"only branches and tags can be pushed, not '{ref}'")
         if ref in seen:
             raise HttpError(400, "bad_request", f"duplicate update for '{ref}'")
         seen.add(ref)
@@ -261,22 +279,33 @@ def _evaluate(repo: Repository, updates: list[dict], force: bool, allow_force: b
     head_target = repo.refs.head_target()
     results: list[dict] = []
     rejected = False
-    existing = list(repo.refs.list("refs/heads/"))
+    existing_heads = list(repo.refs.list(HEADS))
+    existing_tags = list(repo.refs.list(TAGS))
     for upd in updates:
         ref, old, new = upd["ref"], upd["old"], upd["new"]
+        is_tag = ref.startswith(TAGS)
         cur = repo.refs.resolve(ref)
         upd["cur"] = cur
         reason = message = None
-        clash = _find_clash(ref, existing) if new is not None else None
+        clash = _find_clash(ref, existing_tags if is_tag else existing_heads) if new is not None else None
         unstorable = _unstorable(ref) if new is not None else None
         if unstorable is not None:
             reason, message = "invalid-ref-name", unstorable
         elif clash is not None:
-            reason, message = "ref-clash", MSG_CLASH.format(ref=ref, other=clash)
+            reason = "ref-clash"
+            message = (MSG_TAG_CLASH if is_tag else MSG_CLASH).format(ref=ref, other=clash)
         elif cur != old:
             reason = "stale"
             message = MSG_STALE.format(expected=old or "(none)", found=cur or "(none)")
-        elif new is not None and cur is not None and not graph.is_ancestor(store, cur, new):
+        elif is_tag and new is not None and cur is not None and cur != new:
+            # a tag is immutable: replacing it needs --force and a repo that allows it
+            if force and allow_force:
+                pass
+            elif force:
+                reason, message = "force-disabled", MSG_FORCE_DISABLED
+            else:
+                reason, message = "tag-exists", MSG_TAG_EXISTS.format(name=ref[len(TAGS):])
+        elif not is_tag and new is not None and cur is not None and not graph.is_ancestor(store, cur, new):
             if force and allow_force:
                 pass
             elif force:
@@ -321,7 +350,8 @@ def _apply(repo: Repository, updates: list[dict]) -> None:
         raise
     head_target = repo.refs.head_target()
     if head_target is not None and repo.refs.resolve("HEAD") is None:
-        created = [u["ref"] for u in updates if u["old"] is None and u["new"] is not None]
+        created = [u["ref"] for u in updates
+                   if u["old"] is None and u["new"] is not None and u["ref"].startswith(HEADS)]
         if created:
             target = head_target if head_target in created else created[0]
             if target != head_target:
@@ -352,7 +382,8 @@ def process_push(root: str, repo_name: str, user: str, body: bytes, cfg: ServerC
             if not store.has(new):
                 raise HttpError(422, "missing_objects", f"missing object {new}")
             try:
-                if store.read(new)[0] != "commit":
+                # a branch names a commit; a tag names a commit directly or through tag objects
+                if pack.objects.peel(store, new)[0] != "commit":
                     raise HttpError(422, "bad_pack", f"object {new} is not a commit")
                 if complete is None:
                     complete = pack.complete_commits(store, _server_ref_values(repo))

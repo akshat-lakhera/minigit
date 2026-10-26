@@ -31,8 +31,13 @@ minigit revert --abort
 ```
 
 - `<rev>` is any SPEC section 5 revision (`feat`, `abc1234`, `HEAD~2`, `origin/x`, `MERGE_HEAD`, ...).
-  Several revisions may be given and are applied in order (`cherry-pick A B C`); `A..B` ranges are
-  refused with a usage error. A conflict stops the sequence: `--continue` commits the resolution and
+  Several revisions may be given and are applied in order (`cherry-pick A B C`). `A..B` is a range:
+  the commits reachable from `B` but not from `A`, applied oldest first (`A^..B` includes `A`; an
+  empty side means `HEAD`); ranges and single revisions mix in one command (`sequencer.expand_revs`).
+  An empty result is `error: empty commit set passed`; a merge commit inside a range needs `-m N`
+  like a single one (`error: commit abc1234 is a merge but no -m option was given.`), and the error
+  only appears when the range really holds a merge. `A...B` is a usage error. A conflict stops the
+  sequence: `--continue` commits the resolution and
   goes on with the rest, `--abort` rewinds to the commit HEAD was on before the first pick (also when
   the conflict is on the last commit). `-n` picks may be stacked on each other.
 - `-n/--no-commit`: apply the change to the index and working tree and stop; no commit, no state file
@@ -244,6 +249,9 @@ def cherry_pick_message(commit: Commit, sha: str, record_origin: bool) -> str
 def revert_message(commit: Commit, sha: str) -> str                  # 'Revert "subject"\n\nThis reverts commit <sha>.\n'
 def parent_for(repo: Repository, sha: str, commit: Commit, mainline: int | None, action: str) -> str | None
     # the base/parent commit sha per 1.5 step 5; None for a root commit
+def expand_revs(repo: Repository, revs: list[str], action: str) -> list[str]
+    # single revisions and A..B ranges (graph.ancestors / topo_walk, oldest first) to full shas, in the order given;
+    # an empty result is MinigitError("empty commit set passed"), A...B a UsageError
 def cherry_pick(repo: Repository, rev: str, *, mainline: int | None = None, no_commit: bool = False,
                 record_origin: bool = False, allow_empty: bool = False) -> PickOutcome
 def revert(repo: Repository, rev: str, *, mainline: int | None = None, no_commit: bool = False) -> PickOutcome
@@ -368,7 +376,7 @@ command list; extend it.
 | bare repo | `this operation must be run in a work tree` (*unit*) |
 | unicode paths, CRLF content | inherited from merge3/merge; no new code touches bytes |
 
-Non-goals (say so in `--help`/README): ranges and several commits, `--skip`, `--edit`, `-s/--signoff`,
+Non-goals (say so in `--help`/README): `A...B` symmetric differences, `--skip`, `--edit`, `-s/--signoff`,
 `--strategy`, `rerere`, picking into a dirty index, `git revert` of merges with the
 "reversing changes made to" message suffix.
 

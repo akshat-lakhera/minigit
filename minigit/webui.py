@@ -2,8 +2,8 @@
 
 A read-only web view of the repositories ``minigit serve`` hosts, under the
 URL prefix ``/-/`` (features/web-ui.md). Pages: repository list, summary,
-branches, paged log, one commit with its diff, and a file browser (tree, blob,
-raw). Access follows the protocol's ACLs exactly; nothing here writes.
+branches, tags, paged log, one commit with its diff, and a file browser (tree,
+blob, raw). Access follows the protocol's ACLs exactly; nothing here writes.
 
 ``server.MinigitHandler`` imports this module lazily and calls ``handle(handler)``,
 which returns a ``WebResponse`` for web requests (and the browser redirect of
@@ -23,7 +23,7 @@ from itertools import islice
 from typing import Sequence
 from urllib.parse import parse_qsl, quote, unquote, urlsplit
 
-from minigit import diff as diff_mod, graph, history, refs as refs_mod, util
+from minigit import diff as diff_mod, graph, history, objects, refs as refs_mod, util
 from minigit.auth import ServerConfig, repo_dir, validate_repo_name
 from minigit.errors import MinigitError, NotARepositoryError, RevisionError
 from minigit.objects import Commit, ObjectStore, TreeEntry, parse_tree
@@ -84,6 +84,16 @@ class BranchRow:
     sha: str
     commit: Commit
     default: bool
+
+
+@dataclass
+class TagRow:
+    name: str
+    sha: str                # the ref's value (the tag object for an annotated tag)
+    commit_sha: str | None  # the commit the tag names, None when it names none
+    commit: Commit | None
+    annotated: bool
+    message: str            # first line of the tag message ("" for a lightweight tag)
 
 
 @dataclass
@@ -199,6 +209,26 @@ def list_branches(repo: Repository) -> list[BranchRow]:
     for name, sha in repo.refs.list("refs/heads/").items():
         short = refs_mod.short_ref(name)
         rows.append(BranchRow(short, sha, repo.read_commit(sha), short == default))
+    rows.sort(key=lambda r: r.name)
+    return rows
+
+
+def list_tags(repo: Repository) -> list[TagRow]:
+    """Every ``refs/tags/*`` ref, sorted by name, with the commit it names (annotated tags peeled)."""
+    rows: list[TagRow] = []
+    for name, sha in repo.refs.list("refs/tags/").items():
+        short = refs_mod.short_ref(name)
+        annotated, message, commit_sha, commit = False, "", None, None
+        try:
+            obj_type, data = repo.objects.read(sha)
+            if obj_type == "tag":
+                annotated, message = True, objects.parse_tag(data).subject
+            peeled_type, peeled = objects.peel(repo.objects, sha)
+            if peeled_type == "commit":
+                commit_sha, commit = peeled, repo.read_commit(peeled)
+        except MinigitError:
+            pass  # a dangling tag is still listed
+        rows.append(TagRow(short, sha, commit_sha, commit, annotated, message))
     rows.sort(key=lambda r: r.name)
     return rows
 
@@ -354,7 +384,8 @@ def render_page(title: str, body_html: str, *, user: str | None, repo: str | Non
     if repo is not None:
         crumbs += " / " + _a(href(repo, ""), repo)
         nav = ('<span class="nav">' + _a(href(repo, ""), "Summary") + _a(href(repo, "tree", rev=label), "Files")
-               + _a(href(repo, "log", rev=label), "Log") + _a(href(repo, "branches"), "Branches") + "</span>")
+               + _a(href(repo, "log", rev=label), "Log") + _a(href(repo, "branches"), "Branches")
+               + _a(href(repo, "tags"), "Tags") + "</span>")
     who = (f"signed in as <b>{esc(user)}</b>" if user is not None
            else _a("/-/?login=1", "log in"))
     page = (
@@ -464,10 +495,12 @@ def view_summary(ctx: RepoContext) -> WebResponse:
         return render_page(ctx.name, body, user=ctx.user, repo=ctx.name)
     label, sha = tip
     branches = len(repo.refs.list("refs/heads/"))
+    tags = len(repo.refs.list("refs/tags/"))
     entries, more = log_page(repo, sha, SUMMARY_COMMITS, 0)
     body = (f"<h1>{esc(ctx.name)}</h1><p>Default branch: <b>{esc(label)}</b></p>" + _clone_line(ctx)
             + f"<p>{branches} branch{'es' if branches != 1 else ''} "
-            f"({_a(href(ctx.name, 'branches'), 'show')})</p>"
+            f"({_a(href(ctx.name, 'branches'), 'show')}), "
+            f"{tags} tag{'s' if tags != 1 else ''} ({_a(href(ctx.name, 'tags'), 'show')})</p>"
             f"<h2>Recent commits</h2>" + _log_rows(ctx, entries, history.decorations(repo)))
     if more:
         body += f"<p>{_a(href(ctx.name, 'log', rev=label), 'Full log')}</p>"
@@ -492,6 +525,30 @@ def view_branches(ctx: RepoContext) -> WebResponse:
         body = ("<h1>Branches</h1><table><tr><th>Branch</th><th>Tip</th><th>Subject</th><th>Author</th>"
                 "<th>Date</th><th></th></tr>" + "".join(cells) + "</table>")
     return render_page(f"{ctx.name} branches", body, user=ctx.user, repo=ctx.name, label=label)
+
+
+def view_tags(ctx: RepoContext) -> WebResponse:
+    rows = list_tags(ctx.repo)
+    label = default_branch(ctx.repo)
+    if not rows:
+        body = "<h1>Tags</h1><p>No tags yet.</p>"
+    else:
+        cells = []
+        for row in rows:
+            kind = '<span class="tag">annotated</span>' if row.annotated else ""
+            if row.commit_sha is not None and row.commit is not None:
+                name = _a(href(ctx.name, "log", rev=row.name), row.name)
+                commit = _a(commit_href(ctx.name, row.commit_sha), row.commit_sha[:7])
+                subject = esc(row.message or row.commit.subject)
+                author, date = esc(row.commit.author.name), esc(_date(row.commit))
+                files = _a(href(ctx.name, "tree", rev=row.name), "files")
+            else:  # names no commit (dangling or not a commit): shown, not linked
+                name, commit, subject, author, date, files = esc(row.name), esc(row.sha[:7]), "", "", "", ""
+            cells.append(f"<tr><td>{name}{kind}</td><td class=\"sha\">{commit}</td><td>{subject}</td>"
+                         f"<td>{author}</td><td class=\"mute\">{date}</td><td>{files}</td></tr>")
+        body = ("<h1>Tags</h1><table><tr><th>Tag</th><th>Commit</th><th>Subject</th><th>Author</th>"
+                "<th>Date</th><th></th></tr>" + "".join(cells) + "</table>")
+    return render_page(f"{ctx.name} tags", body, user=ctx.user, repo=ctx.name, label=label)
 
 
 def view_log(ctx: RepoContext, params: dict[str, str]) -> WebResponse:
@@ -689,6 +746,8 @@ def handle_request(root: str, cfg: ServerConfig, user: str | None, parts: list[s
             return view_summary(ctx)
         if rest == ["branches"]:
             return view_branches(ctx)
+        if rest == ["tags"]:
+            return view_tags(ctx)
         if rest == ["log"]:
             return view_log(ctx, params)
         if rest[0] == "commit" and len(rest) > 1:

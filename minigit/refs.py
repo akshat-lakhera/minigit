@@ -78,10 +78,13 @@ def _check_windows_ref_name(name: str) -> None:
 
 
 def short_ref(name: str) -> str:
+    """``refs/heads/x`` -> ``x``, ``refs/remotes/o/x`` -> ``o/x``, ``refs/tags/v1`` -> ``v1``."""
     if name.startswith("refs/heads/"):
         return name[len("refs/heads/") :]
     if name.startswith("refs/remotes/"):
         return name[len("refs/remotes/") :]
+    if name.startswith("refs/tags/"):
+        return name[len("refs/tags/") :]
     if name.startswith("refs/"):
         return name[len("refs/") :]
     return name

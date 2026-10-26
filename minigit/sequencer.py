@@ -10,7 +10,8 @@ empty tree). A conflict leaves stages 1/2/3 in the index, markers in the worktre
 ``CHERRY_PICK_HEAD`` / ``REVERT_HEAD``; ``--continue`` is ``commit`` without ``-m``, ``--abort``
 restores HEAD's state while keeping unrelated local changes.
 
-Several revisions are applied in order. When one of them conflicts, the ones still to do are kept in
+Several revisions are applied in order; an ``A..B`` range (``expand_revs``) stands for the commits
+reachable from B but not from A, oldest first. When one of them conflicts, the ones still to do are kept in
 ``.minigit/SEQUENCER`` (JSON) and ``--continue`` picks them up after committing the resolution;
 ``--abort`` then also moves HEAD back to where the whole sequence started.
 
@@ -86,7 +87,7 @@ def parent_for(repo: Repository, sha: str, commit: Commit, mainline: int | None,
     parents = commit.parents
     if len(parents) > 1:
         if mainline is None:
-            raise MinigitError(f"commit {sha[:7]} is a merge but no -m option was given")
+            raise MinigitError(f"commit {sha[:7]} is a merge but no -m option was given.")
         if not 1 <= mainline <= len(parents):
             raise MinigitError(f"commit {sha[:7]} does not have parent {mainline}")
         return parents[mainline - 1]
@@ -346,17 +347,40 @@ def _run(repo: Repository, action: str, shas: list[str], *, mainline: int | None
 # public API
 # ---------------------------------------------------------------------------
 
+def expand_revs(repo: Repository, revs: list[str], action: str) -> list[str]:
+    """Resolve single revisions and ``A..B`` ranges to full shas, in the order they are given.
+
+    ``A..B`` is every commit reachable from ``B`` but not from ``A``, oldest first (``A^..B`` thus
+    includes ``A``; an empty side means ``HEAD``). Merge commits in a range are kept and, as for a
+    single merge commit, need ``-m N``. The whole list being empty is ``empty commit set passed``.
+    """
+    from .graph import ancestors, topo_walk
+
+    store = repo.objects
+    shas: list[str] = []
+    for r in revs:
+        if "..." in r:
+            raise UsageError(f"{action}: symmetric differences like '{r}' are not supported; use 'A..B'")
+        if ".." not in r:
+            shas.append(resolve_rev(repo, r))
+            continue
+        a, b = r.split("..", 1)
+        excluded = ancestors(store, [resolve_rev(repo, a or "HEAD")])
+        tip = resolve_rev(repo, b or "HEAD")
+        newest_first = [sha for sha, _c in topo_walk(store, [tip]) if sha not in excluded]
+        shas.extend(newest_first[::-1])
+    if not shas:
+        raise MinigitError("empty commit set passed")
+    return shas
+
+
 def start(repo: Repository, action: str, revs: list[str], *, mainline: int | None, no_commit: bool,
            record_origin: bool = False, allow_empty: bool = False) -> list[PickOutcome]:
     repo.require_worktree()
     _require_no_operation(repo)
     if not revs:
         raise UsageError(f"{action}: a revision is required")
-    for r in revs:
-        if ".." in r:
-            raise UsageError(f"{action}: ranges like '{r}' are not supported; list the commits instead "
-                             f"(oldest first), e.g. '{action} A B C'")
-    shas = [resolve_rev(repo, r) for r in revs]
+    shas = expand_revs(repo, revs, action)
     head = repo.head_commit()
     if head is None:
         raise MinigitError("cannot cherry-pick onto an unborn branch (no commits yet)" if action == "cherry-pick"

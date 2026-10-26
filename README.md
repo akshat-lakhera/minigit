@@ -2,7 +2,8 @@
 
 A git clone written from scratch in Python 3.11 with the standard library only, plus a multi-user HTTP
 server. It reads and writes git's own object format (blobs, trees, commits, SHA-1 ids, zlib loose objects;
-the index is minigit's own binary format), has branches, three-way merges with conflict markers, blame, grep, cherry-pick, revert,
+the index is minigit's own binary format), has branches, tags (lightweight and annotated), three-way merges with
+conflict markers, blame, grep, cherry-pick, revert,
 rebase and stash, and lets several people clone, push and pull the same repositories safely, with
 lightweight pull requests and a read-only web view.
 
@@ -51,6 +52,7 @@ minigit log --oneline
 minigit blame a.txt
 minigit grep -n line
 minigit revert HEAD                # new commit that undoes the last one
+minigit tag -a v1.0 -m "First release"   # annotated tag; `minigit tag` lists, `push origin v1.0` shares it
 ```
 
 ## Quickstart, several people
@@ -155,7 +157,7 @@ operations are available as JSON over HTTP under `/<repo>/pulls` (`features/pull
 ## Web UI
 
 `minigit serve` also serves a read-only, JavaScript-free site at `http://host:8080/-/`: repository list,
-summary, branches, paged commit log, a commit with its diff, a file browser and raw file download. Access
+summary, branches, tags, paged commit log, a commit with its diff, a file browser and raw file download. Access
 follows the same ACLs as the protocol (the browser asks for user name + token; `--public` repos are readable
 anonymously; any other repository name, existing or not, answers 401 to an anonymous browser). Browsers cache HTTP
 Basic credentials, so there is no log-out other than closing the browser. Pass `serve --no-web` to turn it off.
@@ -166,19 +168,20 @@ Basic credentials, so there is no log-out other than closing the browser. Pass `
 |---|---|
 | `init [--bare] [-b BRANCH] [dir]` | Create an empty repository |
 | `config [--global] [-l] [--unset] KEY [VALUE]` | Get and set repo or global options |
-| `add [-f] PATHSPEC...` | Stage file contents (`.` for everything) |
+| `add [-A \| -u] [-f] PATHSPEC...` | Stage file contents (`.` for everything; `-A` every change from the repo root, `-u` tracked files only) |
 | `rm [--cached] [-r] [-f] PATH...` | Remove files from the work tree and/or index |
 | `status [-s] [--porcelain]` | Working tree status |
-| `diff [--staged] [REV \| A..B] [-- PATH]` | Changes between work tree, index and commits |
-| `commit -m MSG [-a] [--allow-empty]` | Record a commit |
-| `log [--oneline] [-n N] [--all] [REV...]` | Commit history |
-| `show [REV[:PATH]]` | Show a commit, blob or tree |
-| `branch [-v] [-r] [-a] [-d NAME] [-D NAME] [NAME [START]]` | List, create, delete branches |
+| `diff [--stat] [--staged] [REV \| A..B] [-- PATH]` | Changes between work tree, index and commits (`--stat`: diffstat instead of the patch) |
+| `commit -m MSG [-a] [--allow-empty] [--amend]` | Record a commit (`--amend` replaces the last one, keeping its author) |
+| `log [--oneline] [--graph] [--stat] [-n N] [--all] [REV...] [-- PATH...]` | Commit history: as an ASCII graph, with diffstats, or only the commits that change PATH |
+| `show [--stat] [-m] [REV[:PATH]]` | Show a commit (a merge against its first parent; `-m`: against each parent), an annotated tag, blob or tree |
+| `branch [-v \| -vv] [-r] [-a] [-d NAME] [-D NAME] [-u REMOTE/BRANCH \| --unset-upstream] [NAME [START]]` | List, create, delete branches (`-vv` adds `[origin/main: ahead 2, behind 1]`, `[origin/x: gone]`); set or forget a branch's upstream |
+| `tag [-l PATTERN] [-n]` / `tag [-a] [-f] NAME [REV] [-m MSG]...` / `tag -d NAME...` | List, create (lightweight, or annotated with `-m`) and delete tags; `features/tags.md` |
 | `switch [-c BRANCH] [--detach] TARGET` | Switch branches |
 | `checkout [-b BRANCH] TARGET \| REV -- PATH` | Switch branches, detach HEAD, or restore files |
 | `merge [--no-ff] [-m MSG] [--allow-unrelated-histories] REV` / `merge --abort` | Three-way merge with conflict markers |
-| `cherry-pick [-n] [-x] [-m N] [--allow-empty] REV...` (`--continue`, `--abort`) | Apply the change of existing commits onto HEAD |
-| `revert [-n] [-m N] REV...` (`--continue`, `--abort`) | Record a commit that undoes a commit |
+| `cherry-pick [-n] [-x] [-m N] [--allow-empty] (REV \| A..B)...` (`--continue`, `--abort`) | Apply the change of existing commits onto HEAD (`A..B`: oldest first, `A^..B` includes `A`) |
+| `revert [-n] [-m N] (REV \| A..B)...` (`--continue`, `--abort`) | Record commits that undo existing commits |
 | `stash [push] [-m MSG] [-u]` / `stash (pop \| apply \| drop \| show) [stash@{N}]` / `stash (list \| clear)` | Shelve local changes (with `-u` also untracked files) and reapply them later |
 | `rebase [--onto NEWBASE] [UPSTREAM [BRANCH]]` (`--continue`, `--skip`, `--abort`) | Replay a branch's commits on top of another commit (linear history) |
 | `reset [--soft \| --mixed \| --hard] [REV]` | Move HEAD, reset index / work tree |
@@ -187,9 +190,9 @@ Basic credentials, so there is no log-out other than closing the browser. Pass `
 | `grep [-i -n -l -c -w -F] [-e PAT] [--cached] PATTERN [REV] [PATH...]` | Search tracked files or a tree |
 | `remote [-v] \| add NAME URL \| remove NAME` | Manage remotes |
 | `clone URL [dir]` | Clone from a minigit server |
-| `fetch [--prune] [REMOTE]` | Download objects, update remote-tracking branches; `origin/*` branches deleted on the server are removed (always, so `--prune` is accepted only for git compatibility) |
-| `pull [--allow-unrelated-histories] [REMOTE [BRANCH]]` | Fetch and merge the upstream branch |
-| `push [-u] [-f] [--delete] [REMOTE [SRC[:DST]]]` | Upload a branch (or delete a remote branch) |
+| `fetch [--prune] [--tags] [REMOTE]` | Download objects, update remote-tracking branches and bring the tags of fetched commits (`--tags`: every tag); `origin/*` branches deleted on the server are removed (always, so `--prune` is accepted only for git compatibility) |
+| `pull [--rebase \| --no-rebase] [--allow-unrelated-histories] [REMOTE [BRANCH]]` | Fetch and merge the upstream branch; `--rebase` replays your commits on top of it instead (a conflict stops like `rebase`: `rebase --continue` / `--abort`) |
+| `push [-u] [-f] [--delete] [REMOTE [SRC[:DST]]]` / `push --tags [REMOTE]` | Upload a branch or a tag (`push origin v1`), all tags, or delete a remote branch or tag |
 | `pr open -t\|--title T [-m BODY]... [--head B] [--base B]` | Open a pull request on the server |
 | `pr list [--state open\|merged\|closed\|all]` / `pr show N` / `pr diff N` | List pull requests, show one, show its diff |
 | `pr merge N [-m MSG]` / `pr close N` | Merge a pull request on the server (always a merge commit) or close it; every `pr` command takes `--remote NAME` |
@@ -206,6 +209,7 @@ Basic credentials, so there is no log-out other than closing the browser. Pass `
 | `server set-repo ROOT REPO [--public \| --private] [--allow-force \| --no-allow-force]` | Change a repository's flags |
 | `server list ROOT` | List users (with token names) and repositories |
 | `fsck` | Verify the object store and ref connectivity |
+| `gc [--force] [--prune]` | Remove stale temporary object files; `--prune` also deletes unreachable objects |
 | `cat-file (-p \| -t \| -s) OBJ` | Print an object's content, type or size |
 | `ls-files [-s]` | List files in the index |
 | `hash-object [-w] FILE` | Compute (and store) a blob id |
@@ -223,8 +227,8 @@ work tree/
     HEAD                 "ref: refs/heads/main" or a detached 40-hex id
     config               INI (user.*, remote.*, branch.*)
     index                minigit's own binary index ("MIDX", SPEC section 3; not git's)
-    objects/ab/cdef...   zlib loose objects: "<type> <size>\0<payload>", SHA-1 ids
-    refs/heads/*  refs/remotes/<remote>/*
+    objects/ab/cdef...   zlib loose objects: "<type> <size>\0<payload>", SHA-1 ids (blob, tree, commit, tag)
+    refs/heads/*  refs/remotes/<remote>/*  refs/tags/*
     ORIG_HEAD  MERGE_HEAD  MERGE_MSG   present during merges / resets
 ```
 
@@ -236,9 +240,10 @@ a pull request database `pulls.json` lives inside the bare repository). Details 
 
 ## Limitations compared with real git
 
-- No interactive rebase, tags, submodules, hooks, worktrees or `.gitattributes`.
-- Loose objects only, no packfiles, no delta compression, no gc. Large histories and big binaries are slow and
-  take disk. Clone/fetch transfer whole objects over the minigit HTTP protocol, not git's.
+- No interactive rebase, `describe`, submodules, hooks, worktrees or `.gitattributes`.
+- Loose objects only, no packfiles, no delta compression (`gc` only removes temporary files and unreachable
+  objects). Large histories and big binaries are slow and take disk. Clone/fetch transfer whole objects over the
+  minigit HTTP protocol, not git's.
 - The transport is minigit's own HTTP protocol (token auth, no SSH, no TLS: put a reverse proxy in front for
   HTTPS). It cannot talk to a real git server.
 - Merge is a straightforward three-way merge; no rename detection.
@@ -251,9 +256,9 @@ a pull request database `pulls.json` lives inside the bare repository). Details 
 python -m unittest discover -s tests -t .
 ```
 
-798 tests in `tests/` (counted as `def test_`): unit tests per module, CLI tests, and end-to-end tests that start a
+920 tests in `tests/` (counted as `def test_`): unit tests per module, CLI tests, and end-to-end tests that start a
 live `minigit serve` and drive clones, pushes, conflicts and concurrent pushes through real subprocesses.
-`tests_blackbox/` holds another 422 tests, independent QA suites written against `SPEC.md` only (they drive the CLI
+`tests_blackbox/` holds another 425 tests, independent QA suites written against `SPEC.md` only (they drive the CLI
 as a user would); run them with `python -m unittest discover -s tests_blackbox -t .`.
 
 ## Demo

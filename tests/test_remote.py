@@ -881,6 +881,144 @@ class ForcePushTests(LiveServerCase):
                          f" + {two[:7]}...{three[:7]} main -> origin/main (forced update)")
 
 
+class TagTransportTests(LiveServerCase):
+    def tag(self, repo, name, target, message=None):
+        from minigit import tags
+        tags.tag_create(repo, name, target, messages=[message] if message else None)
+        return repo.refs.resolve("refs/tags/" + name)
+
+    def test_push_tag_lines_and_clone_brings_tags(self):
+        alice, first = self.alice_with_commit()
+        second = self.commit(alice, {"a.txt": b"2\n"}, "second")
+        light = self.tag(alice, "v0", first)
+        ann = self.tag(alice, "v1", second, "release one")
+        self.assertNotEqual(ann, second)
+        # a tag is pushed by its short name; the branch is still unpushed, so the pack has the commit too
+        lines = self.push("alice", alice, None, "v1")
+        self.assertEqual(lines, [f"To {self.url}", " * [new tag]         v1 -> v1"])
+        self.assertEqual(self.server_ref("refs/tags/v1"), ann)
+        self.assertEqual(self.server_repo.objects.read(ann)[0], "tag")
+        self.assertEqual(pack.fsck(self.server_repo), [])
+        self.assertIsNone(alice.refs.resolve("refs/remotes/origin/v1"), "tags have no tracking namespace")
+        self.assertEqual(self.push("alice", alice, None, "refs/tags/v1"), ["Everything up-to-date"])
+        lines = self.push("alice", alice, None, "refs/tags/v0:v0")
+        self.assertEqual(lines[1], " * [new tag]         v0 -> v0")
+        self.push("alice", alice)
+        # a clone gets every tag whose commit it fetched
+        bob, _ = self.clone("bob")
+        self.assertEqual(bob.refs.resolve("refs/tags/v0"), light)
+        self.assertEqual(bob.refs.resolve("refs/tags/v1"), ann)
+        self.assertEqual(bob.objects.read(ann)[0], "tag")
+        from minigit.revparse import resolve_rev
+        self.assertEqual(resolve_rev(bob, "v1"), second)
+
+    def test_fetch_auto_follows_tags_and_tags_option(self):
+        alice, first = self.alice_with_commit()
+        bob, _ = self.clone("bob")
+        second = self.commit(alice, {"a.txt": b"2\n"}, "second")
+        ann = self.tag(alice, "v1", second, "release one")
+        # an orphan commit (not on any branch) with a lightweight tag
+        alice.refs.set_detached_head(first)
+        orphan = self.commit(alice, {"o.txt": b"o\n"}, "orphan")
+        alice.refs.set_symbolic_head("refs/heads/main")
+        orphan_tag = self.tag(alice, "orphan", orphan)
+        self.push("alice", alice, None, "v1")
+        self.push("alice", alice, None, "orphan")
+        self.push("alice", alice)
+        changes = self.fetch("bob", bob)
+        self.assertEqual(R.format_fetch(self.url, changes).split("\n"), [
+            f"From {self.url}",
+            f"   {first[:7]}..{second[:7]}  main -> origin/main",
+            " * [new tag]         v1 -> v1",
+        ])
+        self.assertEqual(bob.refs.resolve("refs/tags/v1"), ann)
+        self.assertIsNone(bob.refs.resolve("refs/tags/orphan"), "its commit is on no fetched branch")
+        self.assertFalse(bob.objects.has(orphan))
+        # fetch --tags brings every tag, with the objects they need
+        with self.as_user("bob"):
+            changes = R.fetch(bob, "origin", all_tags=True)
+        self.assertEqual(R.format_fetch(self.url, changes).split("\n"),
+                         [f"From {self.url}", " * [new tag]         orphan -> orphan"])
+        self.assertEqual(bob.refs.resolve("refs/tags/orphan"), orphan_tag)
+        self.assertTrue(bob.objects.has(orphan))
+        self.assertEqual(pack.fsck(bob), [])
+        # nothing new: no lines, and no request for objects
+        with mock.patch.object(T.HttpRemote, "fetch_pack", side_effect=AssertionError("no fetch expected")):
+            changes = self.fetch("bob", bob)
+        self.assertEqual(R.format_fetch(self.url, changes), "")
+        # a local tag that differs is never clobbered by fetch
+        bob.refs.update("refs/tags/v1", first)
+        changes = self.fetch("bob", bob)
+        self.assertEqual(R.format_fetch(self.url, changes).split("\n"),
+                         [f"From {self.url}", " ! [rejected]        v1 -> v1 (would clobber existing tag)"])
+        self.assertEqual(bob.refs.resolve("refs/tags/v1"), first)
+
+    def test_tag_exists_rejection_delete_and_push_tags(self):
+        alice, first = self.alice_with_commit()
+        second = self.commit(alice, {"a.txt": b"2\n"}, "second")
+        self.tag(alice, "v1", first)
+        self.push("alice", alice, None, "v1")
+        # moving the tag locally and pushing again: rejected before upload, git's wording
+        alice.refs.update("refs/tags/v1", second)
+        with self.assertRaises(errors.PushRejectedError) as cm:
+            self.push("alice", alice, None, "v1")
+        self.assertEqual(cm.exception.results[0]["reason"], "tag-exists")
+        text = R.format_push_rejection(cm.exception)
+        self.assertIn(" ! [rejected]        v1 -> v1 (already exists)", text)
+        self.assertIn("hint: Updates were rejected because the tag already exists in the remote.", text)
+        self.assertNotIn("'minigit pull'", text)
+        self.assertEqual(self.server_ref("refs/tags/v1"), first)
+        # --force on a repository that forbids it: the server says so
+        with self.assertRaises(errors.PushRejectedError) as cm:
+            self.push("alice", alice, None, "v1", force=True)
+        self.assertEqual(cm.exception.results[0]["reason"], "force-disabled")
+        # push --tags: new tags go up, the differing one is reported, exit is a rejection
+        self.tag(alice, "v2", second)
+        self.tag(alice, "v3", second, "three")
+        with self.assertRaises(errors.PushRejectedError) as cm:
+            with self.as_user("alice"):
+                R.push_tags(alice, "origin")
+        self.assertEqual(self.server_ref("refs/tags/v2"), second)
+        self.assertEqual(self.server_ref("refs/tags/v3"), alice.refs.resolve("refs/tags/v3"))
+        text = R.format_push_rejection(cm.exception)
+        self.assertIn(" * [new tag]         v2 -> v2", text)
+        self.assertIn(" * [new tag]         v3 -> v3", text)
+        self.assertIn(" ! [rejected]        v1 -> v1 (already exists)", text)
+        # delete on the server, then push --tags is clean
+        lines = self.push("alice", alice, None, "v1", delete=True)
+        self.assertEqual(lines, [f"To {self.url}", " - [deleted]         v1"])
+        self.assertIsNone(self.server_ref("refs/tags/v1"))
+        with self.as_user("alice"):
+            lines = R.push_tags(alice, "origin")
+        self.assertEqual(lines, [f"To {self.url}", " * [new tag]         v1 -> v1"])
+        self.assertEqual(self.server_ref("refs/tags/v1"), second)
+        with self.as_user("alice"):
+            self.assertEqual(R.push_tags(alice, "origin"), ["Everything up-to-date"])
+        # --delete of a name that is both a branch and a tag on the server is ambiguous
+        self.push("alice", alice, None, "main:v1")
+        with self.assertRaises(errors.MinigitError) as cm:
+            self.push("alice", alice, None, "v1", delete=True)
+        self.assertIn("matches more than one", cm.exception.message)
+        self.push("alice", alice, None, "refs/heads/v1", delete=True)
+        self.assertIsNone(self.server_ref("refs/heads/v1"))
+        self.assertEqual(self.server_ref("refs/tags/v1"), second)
+        self.assertEqual(pack.fsck(self.server_repo), [])
+
+
+class TagForcePushTests(LiveServerCase):
+    allow_force = True
+
+    def test_force_replaces_a_tag(self):
+        alice, first = self.alice_with_commit()
+        second = self.commit(alice, {"a.txt": b"2\n"}, "second")
+        alice.refs.update("refs/tags/v1", first)
+        self.push("alice", alice, None, "v1")
+        alice.refs.update("refs/tags/v1", second)
+        lines = self.push("alice", alice, None, "v1", force=True)
+        self.assertEqual(lines[1], f" + {first[:7]}...{second[:7]} v1 -> v1 (forced update)")
+        self.assertEqual(self.server_ref("refs/tags/v1"), second)
+
+
 class PullTests(LiveServerCase):
     def test_two_clones_of_an_empty_repo_need_allow_unrelated(self):
         # QA bug 12: both clone the fresh empty repo and each make a root commit
@@ -980,6 +1118,149 @@ class PullTests(LiveServerCase):
         self.assertEqual(outcome.kind, "fast-forward")
         self.assertEqual(bob.head_commit(), sha)
         self.assertEqual(self.read(bob, "a.txt"), b"alpha\n")
+
+
+class PullRebaseTests(LiveServerCase):
+    def pull_rebase(self, who, repo, *args):
+        with self.as_user(who):
+            return R.pull(repo, *args, rebase=True)
+
+    def test_rebase_replays_own_commits_on_top_of_the_fetched_branch(self):
+        alice, base = self.alice_with_commit()
+        bob, _ = self.clone("bob")
+        theirs = self.commit(alice, {"alice.txt": b"alice\n"}, "alice work")
+        self.push("alice", alice)
+        mine = self.commit(bob, {"bob.txt": b"bob\n"}, "bob work")
+        changes, outcome = self.pull_rebase("bob", bob)
+        self.assertEqual([c.kind for c in changes], ["updated"])
+        self.assertEqual(outcome.kind, "rebased")
+        self.assertEqual(outcome.old_head, mine)
+        self.assertEqual(outcome.messages, ["Successfully rebased and updated refs/heads/main."])
+        head = bob.head_commit()
+        self.assertEqual(outcome.commit, head)
+        self.assertNotEqual(head, mine)
+        replayed = bob.read_commit(head)
+        self.assertEqual(replayed.parents, (theirs,))           # linear: bob work on top of alice work
+        self.assertEqual(replayed.message, "bob work\n")
+        self.assertEqual(bob.read_commit(theirs).parents, (base,))
+        self.assertEqual((self.read(bob, "alice.txt"), self.read(bob, "bob.txt")), (b"alice\n", b"bob\n"))
+        self.assertEqual(bob.refs.current_branch(), "main")
+        self.assertIsNone(bob.merge_head())
+        self.assertFalse(os.path.isdir(bob.gpath("rebase")))
+        self.push("bob", bob)                                   # a fast-forward for the server
+        self.assertEqual(self.server_ref(), head)
+        # again: nothing to do
+        _, outcome = self.pull_rebase("bob", bob)
+        self.assertEqual((outcome.kind, outcome.messages), ("up-to-date", ["Already up to date."]))
+        self.assertEqual(bob.head_commit(), head)
+
+    def test_rebase_fast_forwards_without_own_commits(self):
+        alice, _ = self.alice_with_commit()
+        bob, _ = self.clone("bob")
+        new = self.commit(alice, {"a.txt": b"updated\n"}, "update")
+        self.push("alice", alice)
+        _, outcome = self.pull_rebase("bob", bob)
+        self.assertEqual(outcome.kind, "fast-forward")
+        self.assertEqual(outcome.messages, ["Fast-forwarded main to origin/main."])
+        self.assertEqual(bob.head_commit(), new)
+        self.assertEqual(self.read(bob, "a.txt"), b"updated\n")
+        self.assertEqual(bob.refs.current_branch(), "main")
+
+    def test_rebase_already_up_to_date_when_ahead(self):
+        alice, _ = self.alice_with_commit()
+        mine = self.commit(alice, {"x.txt": b"x\n"}, "local only")
+        _, outcome = self.pull_rebase("alice", alice)
+        self.assertEqual((outcome.kind, outcome.messages), ("up-to-date", ["Already up to date."]))
+        self.assertEqual(alice.head_commit(), mine)
+
+    def test_rebase_conflict_stops_and_abort_or_continue_finish(self):
+        alice, _ = self.alice_with_commit({"f.txt": b"line\n"})
+        bob, _ = self.clone("bob")
+        self.commit(bob, {"f.txt": b"bob\n"}, "bob")
+        self.push("bob", bob)
+        mine = self.commit(alice, {"f.txt": b"alice\n"}, "alice")
+        _, outcome = self.pull_rebase("alice", alice)
+        self.assertEqual(outcome.kind, "conflict")
+        self.assertEqual(outcome.conflicts, ["f.txt"])
+        self.assertEqual(outcome.messages[0], "CONFLICT (content): Merge conflict in f.txt")
+        self.assertEqual(outcome.messages[1], f"Could not apply {mine[:7]}... alice")
+        self.assertIn('then run "minigit rebase --continue".', outcome.messages[3])
+        self.assertIn(b"<<<<<<< HEAD\nbob\n=======\nalice\n>>>>>>> ", self.read(alice, "f.txt"))
+        self.assertIsNone(alice.merge_head())
+        self.assertEqual(alice.refs.read_special("REBASE_HEAD"), mine)
+        self.assertEqual(alice.refs.resolve("refs/heads/main"), mine)   # the branch moves only at the end
+        self.assertEqual(alice.operation_in_progress()[0], "rebase")
+        from minigit import rebase as rebase_mod
+        # the usual rebase state: --abort puts everything back
+        rebase_mod.abort(alice)
+        self.assertEqual(alice.head_commit(), mine)
+        self.assertEqual(alice.refs.current_branch(), "main")
+        self.assertEqual(self.read(alice, "f.txt"), b"alice\n")
+        # ... and --continue finishes a resolved one
+        _, outcome = self.pull_rebase("alice", alice)
+        self.assertEqual(outcome.kind, "conflict")
+        with open(alice.abspath("f.txt"), "wb") as fh:
+            fh.write(b"both\n")
+        with index.locked_index(alice) as idx:
+            data = b"both\n"
+            idx.put(index.IndexEntry(path="f.txt", mode="100644", sha=alice.objects.write("blob", data),
+                                     size=len(data), mtime_ns=0))
+        res = rebase_mod.continue_(alice)
+        self.assertFalse(res.stopped)
+        self.assertEqual(res.lines[-1], "Successfully rebased and updated refs/heads/main.")
+        head = alice.head_commit()
+        self.assertEqual(alice.read_commit(head).parents, (self.server_ref(),))
+        self.assertEqual(alice.read_commit(head).message, "alice\n")
+        self.push("alice", alice)
+        self.assertEqual(self.server_ref(), head)
+
+    def test_rebase_refuses_dirty_tree_unborn_head_and_open_rebase_before_fetching(self):
+        alice, _ = self.alice_with_commit()
+        bob, _ = self.clone("bob")
+        self.commit(alice, {"a.txt": b"updated\n"}, "update")
+        self.push("alice", alice)
+        old_tracking = bob.refs.resolve("refs/remotes/origin/main")
+        with open(bob.abspath("a.txt"), "ab") as fh:
+            fh.write(b"local edit\n")
+        with self.assertRaises(errors.MinigitError) as cm:
+            self.pull_rebase("bob", bob)
+        self.assertEqual(cm.exception.message, "cannot rebase: you have unstaged changes")
+        self.assertEqual(bob.refs.resolve("refs/remotes/origin/main"), old_tracking)   # nothing fetched
+        with index.locked_index(bob) as idx:
+            data = b"alpha\nlocal edit\n"
+            idx.put(index.IndexEntry(path="a.txt", mode="100644", sha=bob.objects.write("blob", data),
+                                     size=len(data), mtime_ns=0))
+        with self.assertRaises(errors.MinigitError) as cm:
+            self.pull_rebase("bob", bob)
+        self.assertEqual(cm.exception.message, "cannot rebase: your index contains uncommitted changes")
+        # an unborn HEAD: merge-pull fast-forwards, rebase-pull refuses with rebase's message
+        carol, _ = self.clone("bob", "carol")
+        carol.refs.update("refs/heads/main", None, expected=carol.head_commit())
+        with self.assertRaises(errors.MinigitError) as cm:
+            self.pull_rebase("bob", carol)
+        self.assertEqual(cm.exception.message,
+                         "cannot rebase: your current branch 'main' does not have any commits yet")
+        # a stopped rebase must be finished first
+        dave, _ = self.clone("bob", "dave")
+        self.commit(dave, {"a.txt": b"dave\n"}, "dave")
+        self.commit(alice, {"a.txt": b"alice again\n"}, "alice again")
+        self.push("alice", alice)
+        _, outcome = self.pull_rebase("bob", dave)
+        self.assertEqual(outcome.kind, "conflict")
+        with self.assertRaises(errors.MinigitError) as cm:
+            self.pull_rebase("bob", dave)
+        self.assertEqual(cm.exception.message, "rebase in progress; finish it first")
+
+    def test_no_rebase_is_the_default_merge(self):
+        alice, _ = self.alice_with_commit()
+        bob, _ = self.clone("bob")
+        self.commit(alice, {"alice.txt": b"alice\n"}, "alice")
+        self.push("alice", alice)
+        self.commit(bob, {"bob.txt": b"bob\n"}, "bob")
+        with self.as_user("bob"):
+            _, outcome = R.pull(bob, rebase=False)
+        self.assertEqual(outcome.kind, "merged")
+        self.assertEqual(len(bob.read_commit(bob.head_commit()).parents), 2)
 
 
 class RemoteConfigTests(_EnvCase):

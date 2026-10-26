@@ -6,14 +6,33 @@ from __future__ import annotations
 
 from typing import Sequence
 
-from minigit.errors import MinigitError, RevisionError
-from minigit.objects import EMPTY_TREE, Commit, parse_tree
+from minigit.errors import MinigitError, ObjectError, RevisionError
+from minigit.objects import EMPTY_TREE, Commit, parse_commit, parse_tree, peel
 from minigit.refs import short_ref
 from minigit.util import format_date
 
 
+def commit_of_ref(repo, sha: str) -> str | None:
+    """The commit a ref value names: ``sha`` itself, or the commit behind an annotated tag; else None."""
+    try:
+        obj_type, peeled = peel(repo.objects, sha)
+    except ObjectError:
+        return None
+    return peeled if obj_type == "commit" else None
+
+
+def commit_tips(repo) -> list[str]:
+    """The commits named by every ref (tags peeled), in ref-name order, without duplicates."""
+    out: list[str] = []
+    for sha in repo.refs.list("refs/").values():
+        commit = commit_of_ref(repo, sha)
+        if commit is not None and commit not in out:
+            out.append(commit)
+    return out
+
+
 def decorations(repo) -> dict[str, list[str]]:
-    """sha -> labels, e.g. ``["HEAD -> main", "origin/main", "feature"]``."""
+    """sha -> labels, e.g. ``["HEAD -> main", "tag: v1", "origin/main", "feature"]``."""
     out: dict[str, list[str]] = {}
     head_target = repo.refs.head_target()
     head = repo.head_commit()
@@ -21,18 +40,24 @@ def decorations(repo) -> dict[str, list[str]]:
         out.setdefault(head, []).append("HEAD")
     allrefs = repo.refs.list("refs/")
 
-    # git's order: HEAD (-> current branch), then remote-tracking refs, then the other
-    # local branches, e.g. "(HEAD -> main, origin/main, feature)".
+    # git's order: HEAD (-> current branch), then tags, then remote-tracking refs, then the
+    # other local branches, e.g. "(HEAD -> main, tag: v1, origin/main, feature)".
     def group(name: str) -> int:
-        if name.startswith("refs/remotes/"):
+        if name.startswith("refs/tags/"):
             return 0
-        if name.startswith("refs/heads/"):
+        if name.startswith("refs/remotes/"):
             return 1
-        return 2
+        if name.startswith("refs/heads/"):
+            return 2
+        return 3
 
     for name in sorted(allrefs, key=lambda n: (group(n), n)):
         sha = allrefs[name]
         label = short_ref(name)
+        if name.startswith("refs/tags/"):
+            # an annotated tag decorates the commit it names, not its own object
+            sha = commit_of_ref(repo, sha) or sha
+            label = f"tag: {label}"
         labels = out.setdefault(sha, [])
         if name == head_target:
             labels.insert(0, f"HEAD -> {label}")
@@ -48,8 +73,77 @@ def _unborn_error(repo) -> MinigitError:
     return MinigitError(f"your current branch '{branch}' does not have any commits yet")
 
 
+class PathFilter:
+    """``log -- path...``: does a commit's tree differ from its first parent's at one of the paths?
+
+    Each path matches itself and everything under it (a directory prefix). The two trees are
+    walked only along the path components, so a commit costs a few tree reads, not a flatten.
+    """
+
+    def __init__(self, store, paths: Sequence[str]) -> None:
+        self.store = store
+        self.parts = [[x for x in p.replace("\\", "/").split("/") if x] for p in paths]
+        self._trees: dict[str, dict[str, tuple[str, str]]] = {}
+        self._commit_trees: dict[str, str] = {}
+        self._verdict: dict[str, bool] = {}
+
+    def _entries(self, tree_sha: str) -> dict[str, tuple[str, str]]:
+        t = self._trees.get(tree_sha)
+        if t is None:
+            t = self._trees[tree_sha] = {e.name: (e.mode, e.sha) for e in parse_tree(
+                self.store.read_typed(tree_sha, "tree"))}
+        return t
+
+    def _lookup(self, tree_sha: str | None, parts: Sequence[str]) -> tuple[str, str] | None:
+        if tree_sha is None:
+            return None
+        if not parts:
+            return ("40000", tree_sha)
+        sha = tree_sha
+        for i, name in enumerate(parts):
+            e = self._entries(sha).get(name)
+            if e is None:
+                return None
+            if i == len(parts) - 1:
+                return e
+            if e[0] != "40000":
+                return None
+            sha = e[1]
+        return None
+
+    def tree_of(self, sha: str) -> str:
+        t = self._commit_trees.get(sha)
+        if t is None:
+            t = self._commit_trees[sha] = parse_commit(self.store.read_typed(sha, "commit")).tree
+        return t
+
+    def matches(self, sha: str, commit: Commit | None = None) -> bool:
+        v = self._verdict.get(sha)
+        if v is None:
+            if commit is None:
+                commit = parse_commit(self.store.read_typed(sha, "commit"))
+            self._commit_trees[sha] = commit.tree
+            parent_tree = self.tree_of(commit.parents[0]) if commit.parents else None
+            v = self._verdict[sha] = any(
+                self._lookup(commit.tree, parts) != self._lookup(parent_tree, parts) for parts in self.parts)
+        return v
+
+    def rewrite_parents(self, commit: Commit) -> list[str]:
+        """Each parent replaced by its nearest first-parent ancestor that matches (dropped if none)."""
+        out: list[str] = []
+        for p in commit.parents:
+            sha: str | None = p
+            while sha is not None and not self.matches(sha):
+                c = parse_commit(self.store.read_typed(sha, "commit"))
+                sha = c.parents[0] if c.parents else None
+            if sha is not None and sha not in out:
+                out.append(sha)
+        return out
+
+
 def log_entries(repo, revs: Sequence[str] | None, max_count: int | None,
-                all_refs: bool = False) -> list[tuple[str, Commit]]:
+                all_refs: bool = False, paths: Sequence[str] = ()) -> list[tuple[str, Commit]]:
+    """The commits ``log`` prints, newest first. ``paths`` keeps only commits that change one of them."""
     from minigit.graph import topo_walk
     from minigit.revparse import resolve_rev
 
@@ -60,7 +154,7 @@ def log_entries(repo, revs: Sequence[str] | None, max_count: int | None,
         head = repo.head_commit()
         if head is not None:
             starts.append(head)
-        starts.extend(repo.refs.list("refs/").values())
+        starts.extend(commit_tips(repo))
     if not revs and not all_refs:
         head = repo.head_commit()
         if head is None:
@@ -71,12 +165,15 @@ def log_entries(repo, revs: Sequence[str] | None, max_count: int | None,
         raise _unborn_error(repo)
     if max_count is not None and max_count <= 0:
         return []
-    if max_count is not None and len(starts) == 1:
+    if max_count is not None and len(starts) == 1 and not paths:
         chain = _linear_prefix(repo.objects, starts[0], max_count)
         if chain is not None:
             return chain
+    filt = PathFilter(repo.objects, paths) if paths else None
     entries: list[tuple[str, Commit]] = []
     for sha, commit in topo_walk(repo.objects, starts):
+        if filt is not None and not filt.matches(sha, commit):
+            continue
         entries.append((sha, commit))
         if max_count is not None and len(entries) >= max_count:
             break
@@ -90,12 +187,10 @@ def _linear_prefix(store, start: str, max_count: int) -> list[tuple[str, Commit]
     ancestor of the last parent, so that parent is the only commit topo_walk can yield next. A
     merge before the limit makes the order depend on the whole graph: None (use topo_walk).
     """
-    from minigit.objects import parse_commit
-
     entries: list[tuple[str, Commit]] = []
     sha = start
     while True:
-        commit = parse_commit(store.read_typed(sha, "commit"))
+        commit = store.commit(sha)
         entries.append((sha, commit))
         if len(entries) >= max_count or not commit.parents:
             return entries
@@ -109,8 +204,11 @@ def _decor_suffix(decor: dict[str, list[str]], sha: str) -> str:
     return f" ({', '.join(labels)})" if labels else ""
 
 
-def format_commit_header(sha: str, commit: Commit, decor: dict[str, list[str]]) -> list[str]:
-    lines = [f"commit {sha}{_decor_suffix(decor, sha)}"]
+def format_commit_header(sha: str, commit: Commit, decor: dict[str, list[str]],
+                         from_parent: str | None = None) -> list[str]:
+    """The ``commit``/``Merge:``/``Author:``/``Date:`` block and the indented message (no trailing blank)."""
+    origin = f" (from {from_parent})" if from_parent else ""
+    lines = [f"commit {sha}{origin}{_decor_suffix(decor, sha)}"]
     if len(commit.parents) > 1:
         lines.append("Merge: " + " ".join(p[:7] for p in commit.parents))
     lines.append(f"Author: {commit.author.name} <{commit.author.email}>")
@@ -121,12 +219,65 @@ def format_commit_header(sha: str, commit: Commit, decor: dict[str, list[str]]) 
     return lines
 
 
-def format_log(repo, entries: list[tuple[str, Commit]], oneline: bool) -> str:
+def _stat_lines(repo, sha: str, commit: Commit) -> list[str]:
+    """``log --stat``: the diffstat against the first parent; nothing for merges, like git."""
+    from minigit.diff import diffstat
+    from minigit.trees import commit_flat, flatten_tree
+
+    if len(commit.parents) > 1:
+        return []
+    store = repo.objects
+    old = commit_flat(store, commit.parents[0]) if commit.parents else flatten_tree(store, EMPTY_TREE)
+    block = diffstat(repo, old, flatten_tree(store, commit.tree)).decode("utf-8", "surrogateescape")
+    return block.rstrip("\n").split("\n") if block else []
+
+
+def _graph_block(graph, lines: list[str]) -> list[str]:
+    """Prefix one commit's lines with the graph, then the rows that split or join lanes."""
+    out: list[str] = []
+    while True:
+        prefix, is_commit = graph.next_line()
+        if is_commit:
+            break
+        out.append(prefix)  # rows that make room before an octopus merge
+    out.append(prefix + lines[0])
+    for line in lines[1:]:
+        prefix, _ = graph.next_line()
+        out.append(prefix + line)
+    while not graph.finished():
+        prefix, _ = graph.next_line()
+        out.append(prefix)
+    return out
+
+
+def format_log(repo, entries: list[tuple[str, Commit]], oneline: bool, *, graph: bool = False,
+               stat: bool = False, paths: Sequence[str] = ()) -> str:
+    """Render ``log`` output. ``paths`` are the ``log -- path`` filter (needed to join the graph)."""
+    from minigit.graph import AsciiGraph
+
     decor = decorations(repo)
-    if oneline:
-        return "".join(f"{sha[:7]}{_decor_suffix(decor, sha)} {commit.subject}\n" for sha, commit in entries)
-    blocks = ["\n".join(format_commit_header(sha, commit, decor)) + "\n" for sha, commit in entries]
-    return "\n".join(blocks)
+    drawer = AsciiGraph() if graph else None
+    filt = PathFilter(repo.objects, paths) if graph and paths else None
+    out: list[str] = []
+    for n, (sha, commit) in enumerate(entries):
+        if oneline:
+            lines = [f"{sha[:7]}{_decor_suffix(decor, sha)} {commit.subject}"]
+        else:
+            lines = format_commit_header(sha, commit, decor)
+            if stat:
+                block = _stat_lines(repo, sha, commit)
+                if block:
+                    lines.append("")
+                    lines.extend(block)
+        if drawer is not None:
+            parents = filt.rewrite_parents(commit) if filt is not None else commit.parents
+            drawer.update(sha, parents)
+        if n and not oneline:
+            out.append(drawer.padding_line() if drawer else "")  # the blank line between commits
+        if drawer is not None:
+            lines = _graph_block(drawer, lines)
+        out.extend(lines)
+    return "".join(line + "\n" for line in out)
 
 
 def format_tree_listing(data: bytes) -> bytes:
@@ -137,10 +288,28 @@ def format_tree_listing(data: bytes) -> bytes:
     return "".join(lines).encode("utf-8", "surrogateescape")
 
 
-def show(repo, spec: str = "HEAD") -> bytes:
-    from minigit.diff import diff_flats
-    from minigit.objects import parse_commit
-    from minigit.revparse import resolve_object
+def format_tag_header(tag) -> list[str]:
+    """git's ``show`` header for an annotated tag: ``tag NAME``, Tagger, Date, blank, the message."""
+    lines = [f"tag {tag.tag}"]
+    if tag.tagger is not None:
+        lines.append(f"Tagger: {tag.tagger.name} <{tag.tagger.email}>")
+        lines.append(f"Date:   {format_date(tag.tagger.timestamp, tag.tagger.tz_offset)}")
+    lines.append("")
+    lines.extend(tag.message.rstrip("\n").split("\n"))
+    return lines
+
+
+def show(repo, spec: str = "HEAD", *, stat: bool = False, each_parent: bool = False) -> bytes:
+    """``show``: a blob's bytes, a tree listing, an annotated tag, or a commit's header and diff (SPEC section 6).
+
+    An annotated tag prints its header(s) first, then the tagged commit. A merge commit is diffed
+    against its first parent after a line saying so; with ``each_parent`` (``show -m``) it is diffed
+    against every parent in turn, each part headed by the full header with ``(from <parent>)``.
+    ``stat`` prints the diffstat instead of the patch.
+    """
+    from minigit.diff import diff_flats, diffstat
+    from minigit.objects import parse_tag
+    from minigit.revparse import peel_to_commit, resolve_object
     from minigit.trees import commit_flat, flatten_tree
 
     sha = resolve_object(repo, spec)
@@ -149,23 +318,39 @@ def show(repo, spec: str = "HEAD") -> bytes:
         return data
     if obj_type == "tree":
         return format_tree_listing(data)
+    prefix = b""
+    if obj_type == "tag":
+        # the tag header(s), a blank line, then the tagged commit as usual
+        while obj_type == "tag":
+            tag = parse_tag(data)
+            prefix += ("\n".join(format_tag_header(tag)) + "\n\n").encode("utf-8", "surrogateescape")
+            sha = tag.object
+            obj_type, data = repo.objects.read(sha)
+        sha = peel_to_commit(repo, sha, spec)
     if obj_type != "commit":
         raise RevisionError(f"'{spec}' is not a commit")
     commit = parse_commit(data)
-    header = "\n".join(format_commit_header(sha, commit, decorations(repo))) + "\n"
-    out = header.encode("utf-8", "surrogateescape")
+    decor = decorations(repo)
     store = repo.objects
-    old = commit_flat(store, commit.parents[0]) if commit.parents else flatten_tree(store, EMPTY_TREE)
     new = flatten_tree(store, commit.tree)
+
+    def body(parent: str | None) -> bytes:
+        old = commit_flat(store, parent) if parent else flatten_tree(store, EMPTY_TREE)
+        return diffstat(repo, old, new) if stat else diff_flats(repo, old, new)
+
+    if len(commit.parents) > 1 and each_parent:
+        parts = []
+        for p in commit.parents:
+            text = "\n".join(format_commit_header(sha, commit, decor, from_parent=p)) + "\n"
+            diff = body(p)
+            parts.append(text.encode("utf-8", "surrogateescape") + (b"\n" + diff if diff else b""))
+        return prefix + b"\n".join(parts)
+    header = "\n".join(format_commit_header(sha, commit, decor)) + "\n"
+    out = prefix + header.encode("utf-8", "surrogateescape")
+    first = commit.parents[0] if commit.parents else None
     if len(commit.parents) > 1:
-        # Like git's combined diff, only paths whose result differs from every parent
-        # (conflict resolutions, evil-merge changes), shown against the first parent.
-        others = [commit_flat(store, p) for p in commit.parents[1:]]
-        keep = {p for p in set(old) | set(new)
-                if new.get(p) != old.get(p) and all(new.get(p) != o.get(p) for o in others)}
-        old = {p: e for p, e in old.items() if p in keep}
-        new = {p: e for p, e in new.items() if p in keep}
-    body = diff_flats(repo, old, new)
-    if body:
-        out += b"\n" + body
+        out += f"\n(merge commit: showing the diff against the first parent {first[:7]})\n".encode()
+    diff = body(first)
+    if diff:
+        out += b"\n" + diff
     return out

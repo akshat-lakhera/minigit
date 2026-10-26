@@ -236,6 +236,8 @@ def default_merge_message(repo: Repository, rev: str) -> str:
         return f"Merge branch '{ref[len('refs/heads/'):]}'"
     if ref and ref.startswith("refs/remotes/"):
         return f"Merge remote-tracking branch '{ref[len('refs/remotes/'):]}'"
+    if ref and ref.startswith("refs/tags/"):
+        return f"Merge tag '{ref[len('refs/tags/'):]}'"
     return f"Merge commit '{rev}'"
 
 

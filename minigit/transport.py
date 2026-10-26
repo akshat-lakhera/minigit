@@ -267,6 +267,14 @@ def _describe(exc: BaseException) -> str:
 class RemoteRefs:
     head: str | None
     refs: dict[str, str] = field(default_factory=dict)
+    peeled: dict[str, str] = field(default_factory=dict)   # annotated tag ref -> the commit it names
+
+    def commit_of(self, ref: str) -> str | None:
+        """The commit a ref names on the server: its value, or the peeled value of an annotated tag."""
+        sha = self.refs.get(ref)
+        if sha is None:
+            return None
+        return self.peeled.get(ref, sha)
 
 
 class HttpRemote:
@@ -426,7 +434,17 @@ class HttpRemote:
                     or not _is_hex40(sha):
                 raise RemoteError(f"malformed info/refs response from {self.url} (ref {name!r})")
             clean[name] = sha
-        return RemoteRefs(head=head, refs=dict(sorted(clean.items())))
+        peeled_raw = payload.get("peeled", {})
+        if peeled_raw is None:
+            peeled_raw = {}
+        if not isinstance(peeled_raw, dict):
+            raise RemoteError(f"malformed info/refs response from {self.url} (peeled)")
+        peeled: dict[str, str] = {}
+        for name, sha in peeled_raw.items():
+            if not isinstance(name, str) or name not in clean or not _is_hex40(sha):
+                raise RemoteError(f"malformed info/refs response from {self.url} (peeled {name!r})")
+            peeled[name] = sha
+        return RemoteRefs(head=head, refs=dict(sorted(clean.items())), peeled=peeled)
 
     def fetch_pack(self, wants: Sequence[str], haves: Sequence[str]) -> bytes:
         body = json.dumps({"want": list(wants), "have": list(haves)}).encode("utf-8")

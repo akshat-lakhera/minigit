@@ -46,7 +46,8 @@ Tests are run from `E:\ideas\minigit` with `python -m unittest discover -s tests
     objects/ab/<38 hex>       loose zlib objects
     refs/heads/<branch>       "<40hex>\n"
     refs/remotes/<remote>/<branch>
-    ORIG_HEAD       "<40hex>\n"  written by merge/reset/pull
+    refs/tags/<tag>           "<40hex>\n": a commit (lightweight) or a tag object (annotated); section 6 "tag"
+    ORIG_HEAD       "<40hex>\n"  written by merge/reset/pull/cherry-pick/revert/commit --amend
     MERGE_HEAD      "<40hex>\n"  present only while a conflicted merge is open
     MERGE_MSG       default message for the merge commit
     CHERRY_PICK_HEAD  REVERT_HEAD  SEQUENCER   cherry-pick / revert in progress (section 6)
@@ -108,7 +109,21 @@ Lookup order: the repo `config` first, then the global config. The `MINIGIT_AUTH
   \n
   <message>               (always ends with exactly one "\n")
   ```
-- Out of scope: tag objects, symlinks (symlinked files are read as regular files; symlinked dirs are skipped), packs with deltas, gc.
+- **tag** (annotated tag, `features/tags.md`): UTF-8 text, hashed as `tag <len>\0` + content, byte for byte what git writes.
+  ```
+  object <sha>\n
+  type commit\n           (the tagged object's type; minigit writes commit, or tag for a tag of a tag)
+  tag <name>\n
+  tagger <name> <<email>> <unix> <+hhmm>\n
+  \n
+  <message>               (always ends with exactly one "\n")
+  ```
+  `tagger` is optional on read (very old git tags); unknown headers are dropped. `parse_tag` rejects a missing
+  `object`/`type`/`tag` line, a bad sha and an unknown type. `peel(store, sha)` follows a chain of tag objects
+  (at most 16) to the first non-tag object. `ObjectStore.write("tag", ...)` refuses a malformed tag like it refuses a
+  malformed tree. Lightweight tags are plain refs (section 4) and need no object.
+- **Caches:** objects are immutable, so an `ObjectStore` keeps per-process caches of the parsed commits and trees it has read (`commit(sha)`, `tree(sha)`) and of every object's type (`object_type(sha)`, from the header only when not yet seen); each is bounded (`CACHE_LIMIT`, cleared when full). A `Repository` is opened per command (and per server request), so nothing outlives the process.
+- Out of scope: symlinks (symlinked files are read as regular files; symlinked dirs are skipped), packs with deltas. `gc` (section 6) only removes temporary files and unreachable loose objects.
 
 ---
 
@@ -152,7 +167,7 @@ trailer: 20B sha1 over all preceding bytes
   1. Lock `<ref>.lock`.
   2. Read the current value.
   3. If `expected is not ANY` and `current != expected`, raise `RefUpdateError`. `expected=None` means the ref must not exist.
-  4. `new=None` deletes the ref and prunes empty parent directories up to `refs/heads` or `refs/remotes/<r>`.
+  4. `new=None` deletes the ref and prunes empty parent directories up to `refs/heads`, `refs/tags` or `refs/remotes/<r>`.
   5. Otherwise write `new + "\n"` and commit.
   - A file/dir clash (`refs/heads/a` exists while creating `refs/heads/a/b`, or the reverse) raises `RefUpdateError`.
 - **HEAD:** `update_head(new, expected)` updates the branch that HEAD points to (an unborn branch is allowed), or HEAD itself when detached.
@@ -164,10 +179,17 @@ trailer: 20B sha1 over all preceding bytes
 - **Base names:**
   - `HEAD`, `@`, `ORIG_HEAD`, `MERGE_HEAD`
   - a full 40-hex sha
-  - a name, looked up in this order: `refs/<n>` if it starts with `refs/`, then `refs/heads/<n>`, then `refs/remotes/<n>`
+  - a name, looked up in this order (git's): `refs/<n>` if it starts with `refs/`, then `refs/tags/<n>`, then
+    `refs/heads/<n>`, then `refs/remotes/<n>`. So a tag shadows a branch of the same name; `refs/heads/x` names the branch.
   - a hex prefix of at least 4 characters, resolved by listing `objects/xx/`
 - **Suffixes**, applied left to right: `~N`, `^` (= `^1`), `^N`.
-- `rev:path` resolves to a blob or tree (used by show and cat-file). `A..B` is handled only by `diff`.
+- `rev:path` resolves to a blob or tree (used by show and cat-file). `A..B` is handled by `diff` (two trees) and by
+  `cherry-pick` / `revert` (a commit range, section 6); `resolve_rev` itself never sees it.
+- **Annotated tags are peeled.** `resolve_object("v1")` is the tag object itself (as `git rev-parse v1`), so
+  `cat-file -t v1` prints `tag` and `rev-parse v1` prints the tag's id. `resolve_rev` (every command that needs a
+  commit: log, show, diff, switch --detach, checkout, merge, rebase, cherry-pick, reset, blame, grep, ...) follows the
+  tag (or a chain of tags) to the commit; so do the suffixes (`v1~0`, `v1^0` and `v1~2` name commits) and `v1:path`.
+  A tag that names a tree or blob gives `'<x>' is not a commit`.
 - **Errors** (all `RevisionError`):
   - `unknown revision 'x'`
   - `ambiguous short id 'abcd' (matches N objects)`
@@ -196,12 +218,18 @@ Notation:
 - `init [--bare] [-b B] [dir]` creates the layout and sets `HEAD = ref: refs/heads/B` (default `main`).
 - On an existing repo it changes nothing and reports reinit.
 
-### add `<pathspec>... [-f]`
+### add `[-A | -u] [-f] <pathspec>...`
 - **Directory, or `.`:** stage every non-ignored file under it, and remove index entries under it whose files are gone.
 - **File:** stage it. A stage-0 entry also clears conflict stages.
 - **Missing but tracked:** remove it from the index.
 - **Explicitly named ignored file** without `-f`: `MinigitError("path 'p' is ignored by .minigitignore (use -f)")`.
 - **No match:** `pathspec 'x' did not match any files`.
+- **`-A` / `--all`:** with no pathspec, stage every change of the whole work tree (new, modified and deleted files) from
+  the repository root, whatever `cwd` is; it is `add .` run from the root. With pathspecs it is a plain `add` of them.
+- **`-u` / `--update`:** tracked files only: a modified file is re-staged, a missing one is removed from the index, a
+  new file is never staged. No pathspec: the whole tree. With pathspecs: the tracked files under them; a pathspec with
+  no tracked file under it is `pathspec 'x' did not match any files`.
+- `-A` together with `-u`, and no pathspec without `-A`/`-u`, are `UsageError`s.
 - The whole command is all-or-nothing: the index is written once.
 
 ### rm `[--cached] [-r] [-f] <paths>`
@@ -222,6 +250,8 @@ Notation:
   On branch main            | HEAD detached at abc1234
   No commits yet            (only when unborn, after a blank line)
   Your branch is ahead of 'origin/main' by N commit(s).   | behind ... by M commit(s), and can be fast-forwarded. | have diverged, N and M ... | up to date with 'origin/main'.
+  Your branch is based on 'origin/x', but the upstream is gone.     (branch.<b>.remote/merge set, tracking ref missing;
+    (use "minigit branch --unset-upstream" to fixup)                 the porcelain output is not affected)
   You have unmerged paths.  | All conflicts fixed but you are still merging.   (when MERGE_HEAD)
 
   Changes to be committed:
@@ -250,6 +280,18 @@ Notation:
   | `diff <a> <b>` / `diff a..b` | a | b |
 
   `-- <paths>` filters by prefix (`p == s` or `p.startswith(s + "/")`).
+- **`--stat`** (every form above): git's diffstat instead of the patch. One line per changed file,
+  ` <name> | <N> <bar>`: the name column is padded to the longest name (a name too long for the line is
+  cut at a `/` and prefixed with `...`), `N` is insertions + deletions, right-aligned, and the bar has one
+  `+` per insertion and one `-` per deletion, scaled down the way git does so the longest line fits in 80
+  columns. A binary file shows ` Bin <old> -> <new> bytes` instead of the count and bar (and makes the
+  count column at least 3 wide); a mode-only change shows ` | 0`; an exact rename (a deleted and an added
+  path with the same blob) is one line `old => new | 0` (`dir/{a => b}.txt` when the names share a
+  directory prefix or suffix) at the new path; an unmerged path shows ` | Unmerged`. The block ends with
+  ` N files changed, X insertions(+), Y deletions(-)`: `1 file changed`, singular `insertion(+)` /
+  `deletion(-)` for 1, and the insertions or deletions part is omitted when it is zero while the other is
+  not (both stay when both are zero). Empty output when nothing changed. `commit`'s summary line uses
+  the same counting (`diff.file_stats`).
 - **Per changed file:**
   ```
   diff --git a/p b/p
@@ -268,7 +310,7 @@ Notation:
     stage 2 ("ours") when that stage exists, which is what `git diff --ours` prints; a path with no
     stage 2 (an add/unmerged `UA` entry) prints only the marker line.
 
-### commit `-m M [-m M2...] [-a] [--allow-empty]`
+### commit `-m M [-m M2...] [-a] [--allow-empty] [--amend]`
 1. Hold the index lock. With `-a`, re-stage tracked files that were modified or deleted.
 2. If `U` is non-empty: `cannot commit: unresolved conflicts in: a, b`.
 3. `tree = build_tree(I)`. The parents are `[head]` (or none), plus `MERGE_HEAD` if it exists.
@@ -278,10 +320,20 @@ Notation:
 7. Write the object, then `update_head(new, expected=head)`. Remove `MERGE_HEAD` and `MERGE_MSG`.
 8. Return `[main (root-commit) abc1234] subject` or `[main abc1234] subject` (`[detached HEAD abc1234]` when detached).
 - **Identity:** `MINIGIT_AUTHOR_NAME`/`_EMAIL`, else `user.name`/`user.email`. If missing: `please set your identity: minigit config --global user.name "You"; minigit config --global user.email you@example.com`. The time is `MINIGIT_AUTHOR_DATE` or now, with the local tz offset. The committer equals the author.
+- **`--amend`** replaces the HEAD commit `old`. Before the lock: an unborn HEAD is `you have nothing to amend`; an
+  operation in progress is `you cannot amend during a merge` (`cherry-pick`, `revert`, `rebase` likewise). Then steps 1
+  and 2 as above, and: the parents are `old.parents` (never `MERGE_HEAD`); step 4 is skipped, so an amend that changes
+  nothing is allowed without `--allow-empty`; the message is the `-m` values or else `old.message`; the author is
+  `old.author` (name, email, date) and the committer the identity. Write `ORIG_HEAD = old`, then
+  `update_head(new, expected=old)`. The summary is `[main abc1234] subject` (never `(root-commit)`), and the stat line
+  compares with the kept parent.
 
-### log `[--oneline] [-n N] [--all] [rev...]`
+### log `[--oneline] [-n N] [--all] [--graph] [--stat] [rev...] [-- path...]`
 - Topological order with committer time as the tie-breaker. This is Kahn's algorithm over the reachable set, using a heap keyed `(-committer_ts, insertion_seq)`. A parent is never printed before its children.
-- Decorations: `(HEAD -> main, origin/main, feature)`, or `(HEAD, main)` when detached.
+- Decorations, in git's order: `HEAD -> <branch>` first, then tags as `tag: <name>`, then remote-tracking refs, then
+  the other local branches, each group sorted by name: `(HEAD -> main, tag: v1, origin/main, feature)`, or
+  `(HEAD, main)` when detached. An annotated tag decorates the commit it names, never its own object.
+- `--all` starts from every ref; a tag ref contributes the commit it names (peeled).
 - **Full format:**
   ```
   commit <sha>[ (decor)]
@@ -295,14 +347,77 @@ Notation:
   There is a blank line between commits.
 - **`--oneline`:** `<sha7>[ (decor)] <subject>`.
 - An unborn HEAD gives `your current branch 'main' does not have any commits yet`.
+- **Paths** (`-- path...`, relative to the current directory like `diff`'s): only commits whose tree
+  differs from their first parent's tree (the empty tree for a root commit) at one of the paths. A path
+  matches itself and everything under it (`p == s` or `p.startswith(s + "/")`; `.` is the whole tree).
+  Without `--`, git's rule: an argument that is not a revision but exists in the work tree or in the HEAD
+  tree is a path, and so is every argument after it; an argument that is both a revision and such a path
+  is a `UsageError` (`log: ambiguous argument 'x': both revision and filename`) and must be put after
+  `--`. Works with `--oneline`, `-n`, `--all`, `--graph` and `--stat`.
+- **`--graph`:** git's ASCII graph to the left of every line, in the same order as without it (which is
+  git's `--date-order`): `*` for the commit, `|` for the lanes passing by, `\` and `/` where lanes split
+  and join; a merge is `*   <text>` followed by a `|\  ` row, and a lane rejoining its parent prints a
+  `|/  ` row. The drawing (`graph.AsciiGraph`) is a port of git's graph.c and is identical to git's for
+  one and two lanes, trailing spaces included; the blank line between two commits carries the lanes of
+  the second commit. With `-n` the open lanes leave the picture at the bottom, as in git. With paths,
+  every commit is joined to its nearest shown first-parent ancestors. Octopus merges (3+ parents) are
+  drawn (`*-.`) but are not guaranteed to match git.
+- **`--stat`:** after the message of every non-merge commit, a blank line and the `diff --stat` block
+  against the first parent (the empty tree for a root commit). A merge commit gets no block, as in git.
 
-### show `[spec]`
-- **Commit:** the log full header, then the diff against the first parent (or the empty tree). A merge commit shows the header only.
+### show `[--stat] [-m] [spec]`
+- **Commit:** the log full header, a blank line, then the diff against the first parent (or the empty
+  tree). A merge commit prints, after the header, a blank line, the line
+  `(merge commit: showing the diff against the first parent <sha7>)`, a blank line and that diff.
+  `-m` instead prints one part per parent, separated by a blank line, each with the full header whose
+  first line is `commit <sha> (from <parent sha>)[ (decor)]` followed by the diff against that parent
+  (no effect on a non-merge commit). `--stat` prints the `diff --stat` block instead of the diff.
 - **Blob:** raw bytes.
 - **Tree:** `<mode> <type> <sha>\t<name>` lines.
+- **Annotated tag** (git's layout): the tag header, a blank line, then the tagged commit exactly as above.
+  ```
+  tag v1
+  Tagger: Name <email>
+  Date:   Tue Oct 20 09:05:03 2026 +0530
+
+  <message lines, not indented>
+
+  commit <sha> (...)
+  ...
+  ```
+  A tag of a tag prints one header per tag. A lightweight tag shows its commit directly.
+
+### tag (`tags.py`, `features/tags.md`)
+```
+minigit tag                                  list, sorted by name
+minigit tag -l PATTERN...                    list the names matching a shell pattern (fnmatch, case-sensitive)
+minigit tag -n                               list with the first message line (annotated) or the commit subject, name padded to 15 columns
+minigit tag NAME [REV]                       lightweight: refs/tags/NAME = the object REV names (default HEAD)
+minigit tag -a NAME [REV] -m MSG [-m MSG2]   annotated: a tag object (tagger = the commit identity, messages joined by blank lines); -m alone implies -a
+minigit tag -f ...                           replace an existing tag: prints "Updated tag 'v1' (was abc1234)"
+minigit tag -d NAME...                       delete: prints "Deleted tag 'v1' (was abc1234)" per tag
+```
+- REV must name a commit (possibly through a tag): `'<x>' is not a commit` otherwise. A tag of an annotated tag
+  stores the tag object (type `tag`), as git does.
+- Errors (exit 1): `tag 'v1' already exists`, `tag 'v1' not found`, `no tag message` (`-a` without `-m`, or an empty
+  message), `'<name>' is not a valid tag name` (`check_ref_name("refs/tags/<name>")`, plus git's refusals of a
+  leading `-`, `HEAD`, `@`, a `refs/` prefix and a trailing `.` or `/`). Usage errors (exit 2): more than two
+  positionals, `-d` without a name, `-n` with a name, `-a`/`-m`/`-f` while listing.
+- `branch` never lists tags. `switch v1` says `a branch is expected, got tag 'v1'`; `checkout v1` and
+  `switch --detach v1` detach at the tagged commit. `merge v1` defaults to the message `Merge tag 'v1'`.
 
 ### branch
-- **List:** `* main` or `  feature`, sorted. `-v` appends ` <sha7> <subject>`. `-r` lists `origin/x`; `-a` lists both.
+- **List:** `* main` or `  feature`, sorted. `-v` appends ` <sha7> <subject>` (names padded to the longest). `-r` lists `origin/x`; `-a` lists both.
+- **`-vv`:** like `-v`, plus git's upstream column between the sha and the subject for every local branch with a
+  configured upstream (`status.upstream_of` + `graph.ahead_behind`): `* main    abc1234 [origin/main] subject`,
+  `[origin/main: ahead 2]`, `[origin/main: behind 1]`, `[origin/main: ahead 2, behind 1]`, and
+  `[origin/main: gone]` when `branch.<b>.remote`/`merge` are set but the tracking ref no longer exists.
+  Branches without an upstream, remote branches and the detached-HEAD line print as with `-v`.
+- **`-u REMOTE/BRANCH [B]` / `--set-upstream-to=REMOTE/BRANCH [B]`:** set `branch.<B>.remote` and
+  `branch.<B>.merge` (B defaults to the current branch; detached: `HEAD does not point to a branch`). The
+  tracking ref `refs/remotes/REMOTE/BRANCH` must exist: `the requested upstream branch 'origin/x' does not
+  exist`. A local branch name makes B track it (remote `.`). Prints `branch 'B' set up to track 'origin/x'.`
+- **`--unset-upstream [B]`:** remove the two keys; `branch 'B' has no upstream information` when neither is set.
 - **`branch N [START]`:** `update(ref, sha, expected=None)`. If it exists: `a branch named 'N' already exists`.
 - **`-d N`:**
   - Refuse the current branch: `cannot delete the branch 'N' you are on`.
@@ -408,11 +523,19 @@ Notation:
 - If a chunk's last line lacks a newline, add one before the next marker.
 
 ### cherry-pick / revert (`cherry.py`, `sequencer.py`)
-`cherry-pick [-n] [-x] [-m N] [--allow-empty] REV...` and `revert [-n] [-m N] REV...`, both with `--continue` and
-`--abort`. Each is a three-way tree merge on top of HEAD (cherry-pick: base = the commit's parent, theirs = the
-commit; revert: base = the commit, theirs = its parent). A conflict leaves stages 1/2/3, markers, `MERGE_MSG` and
-`CHERRY_PICK_HEAD`/`REVERT_HEAD`; revisions still to do are kept in `.minigit/SEQUENCER`. Design and messages:
-`features/cherry-pick-revert.md`.
+`cherry-pick [-n] [-x] [-m N] [--allow-empty] (REV | A..B)...` and `revert [-n] [-m N] (REV | A..B)...`, both with
+`--continue` and `--abort`. Each is a three-way tree merge on top of HEAD (cherry-pick: base = the commit's parent,
+theirs = the commit; revert: base = the commit, theirs = its parent). A conflict leaves stages 1/2/3, markers,
+`MERGE_MSG` and `CHERRY_PICK_HEAD`/`REVERT_HEAD`; revisions still to do are kept in `.minigit/SEQUENCER`.
+- **Ranges** (`sequencer.expand_revs`): `A..B` is every commit reachable from `B` but not from `A` (`graph.ancestors`
+  of `A` subtracted from `graph.topo_walk([B])`), applied oldest first; `A^..B` therefore includes `A`; an empty side
+  means `HEAD`. Single revisions and ranges mix freely and are applied in the order given. A merge commit inside a
+  range is refused exactly like a single one, `commit <sha7> is a merge but no -m option was given.`, but only when
+  the range really contains one; with `-m N` the mainline applies to every commit of the command (so a non-merge in
+  the same range is `mainline was specified but commit <sha7> is not a merge`). Nothing to apply at all is
+  `empty commit set passed`; `A...B` is a `UsageError`. Every revision is resolved and validated before anything is
+  touched.
+Design and messages: `features/cherry-pick-revert.md`.
 
 ### stash (`stash.py`)
 `stash [push] [-m MSG] [-u]`, `stash (pop | apply | drop | show) [stash@{N} | N]`, `stash list`, `stash clear`.
@@ -425,7 +548,9 @@ Design and messages: `features/stash.md`.
 ### rebase (`rebase.py`)
 `rebase [--onto NEWBASE] [UPSTREAM [BRANCH]]`, `rebase --continue | --skip | --abort`. The non-merge commits of
 BRANCH (default: the current branch) that are not in UPSTREAM (default: the branch's configured upstream) are
-replayed oldest first on top of UPSTREAM (or NEWBASE), so the result is linear. Each replay is cherry-pick's
+replayed oldest first on top of UPSTREAM (or NEWBASE), so the result is linear. The order is git's
+(`git rev-list --reverse --topo-order --no-merges`, `graph.topo_order`): below a merge the first-parent lineage is
+replayed before the second-parent lineage whatever the dates, so the replayed commits get the ids git would give them. Each replay is cherry-pick's
 three-way merge and keeps the author and message; a commit whose patch id is already in the new base is dropped.
 HEAD is detached while replaying and the branch ref moves only after the last commit. A conflict stops the rebase
 (`REBASE_HEAD` and `.minigit/rebase/` hold the state). No interactive mode. Design and messages: `features/rebase.md`.
@@ -434,6 +559,19 @@ HEAD is detached while replaying and the branch ref moves only after the last co
 `blame [-L START,END] [-s] [-e] [--porcelain] [REV] PATH` and
 `grep [-i] [-n] [-l | -c] [-w] [-F] [-e PAT] [--cached] PATTERN [REV] [PATH...]` are read-only: they take no
 locks and write nothing. Design and output formats: `features/blame-grep.md`.
+
+### gc (`gc.py`)
+`gc [--force] [--prune]`. Removes the `objects/xx/tmp-*` files a writer that died mid-object left behind when they
+are older than one hour (any age with `--force`). With `--prune` it also deletes every object unreachable from the
+roots: all refs, `HEAD`, `ORIG_HEAD`, `MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`, `REBASE_HEAD`, the stash stack
+(`.minigit/stash`), the rebase state (`.minigit/rebase/{orig-head,onto,todo,done}`), the sequencer state
+(`SEQUENCER`: `orig_head` and `todo`) and every blob in the index. The walk is `pack.closure`; when a root names a
+missing or corrupt object, or a state file is not made of ids, the command fails with `error: cannot prune: ...`
+(exit 1) and nothing at all is deleted. Unreachable objects written within the last hour are kept unless `--force`
+is given, so a commit or push in flight in another process cannot lose objects. Output: `Removed N temporary files`
+and/or `Pruned N unreachable objects` (only the non-zero lines, in that order), else `Nothing to clean`. `fsck`
+reports every temporary file as `warning: temporary file objects/xx/tmp-... (run 'minigit gc')`; warnings alone
+leave its exit code at 0.
 
 ---
 
@@ -475,16 +613,19 @@ locks and write nothing. Design and output formats: `features/blame-grep.md`.
 | Method + path | Perm | Request | 200 response |
 |---|---|---|---|
 | `GET /` | optional | – | `{"repos": [readable names]}` |
-| `GET /<repo>/info/refs` | read | – | `{"protocol":1,"head":"refs/heads/main"\|null,"refs":{"refs/heads/main":"<sha>",...}}` |
+| `GET /<repo>/info/refs` | read | – | `{"protocol":1,"head":"refs/heads/main"\|null,"refs":{"refs/heads/main":"<sha>","refs/tags/v1":"<sha>",...},"peeled":{"refs/tags/v1":"<commit>"}}` |
 | `POST /<repo>/fetch` | read | JSON `{"want":[sha],"have":[sha]}` | body = pack, `Content-Type: application/x-minigit-pack` |
 | `POST /<repo>/push` | write | `application/x-minigit-push` body (below) | JSON results |
 
 In `info/refs`, `head` is the bare repo's symbolic HEAD target, even when that target is unborn. `null` means detached.
+`refs` holds every ref under `refs/`, tags included. `peeled` (git's `^{}` lines; omitted when empty) maps each
+annotated tag to the commit it names, so a client can decide which tags to fetch before it has the tag objects. A
+client ignores unknown keys and a server that sends no `peeled` is treated as "no annotated tags".
 
 **Web UI (`/-/`).** `minigit serve` also serves a read-only, JavaScript-free HTML site under the URL prefix `/-/`
 (module `webui.py`; design in `features/web-ui.md`). Requests whose first path segment is `-` are handled before the
 protocol checks, so they are **exempt from the `X-Minigit-Protocol` rule** and answer with HTML, not JSON. Pages:
-`/-/` (repository list), `/-/<repo>/` (summary), `branches`, `log`, `commit/<rev>`, `tree`, `blob` and `raw`. Only
+`/-/` (repository list), `/-/<repo>/` (summary), `branches`, `tags`, `log`, `commit/<rev>`, `tree`, `blob` and `raw`. Only
 GET and HEAD are accepted (other methods: 405). Access follows the protocol's ACLs and HTTP Basic auth (user name +
 token), and public repos are readable anonymously. As in the protocol, an anonymous request for any non-public
 repository name gets 401 with `WWW-Authenticate` whether or not the repository exists; a signed-in user gets 404 for a
@@ -512,7 +653,7 @@ count x ( 20B binary sha | u32be len | len bytes = zlib(b"<type> <size>\0" + con
 The receiver checks:
 - the trailer;
 - each entry: inflate with a 64 MiB cap, require `eof` and no `unused_data`, check the header type and size, and check that the sha matches;
-- that trees parse with valid names and modes, and that commits parse.
+- that trees parse with valid names and modes, and that commits and tags parse.
 
 Objects are stored with `ObjectStore.write`.
 
@@ -520,51 +661,65 @@ Objects are stored with `ObjectStore.write`.
 ```json
 {"protocol":1,"force":false,"updates":[{"ref":"refs/heads/main","old":"<sha>|null","new":"<sha>|null"}]}
 ```
-The client sends one update per push. The server applies several updates all or nothing.
+The client sends one update per push (`push --tags` sends one per tag). A `ref` is a branch (`refs/heads/*`) or a
+tag (`refs/tags/*`). The server applies several updates all or nothing.
 
 Push responses:
 ```json
 200 {"ok":true,"results":[{"ref":"refs/heads/main","status":"ok","old":"..","new":".."}]}
 409 {"ok":false,"code":"rejected","error":"push rejected","results":[{"ref":"refs/heads/main","status":"rejected",
-     "reason":"stale|non-fast-forward|force-disabled|delete-default-branch|ref-clash","current":"<sha>|null","message":"..."}]}
+     "reason":"stale|non-fast-forward|force-disabled|delete-default-branch|ref-clash|tag-exists","current":"<sha>|null","message":"..."}]}
 ```
 Messages:
 - non-ff: `the remote branch has commits you do not have; run 'minigit pull' first, then push again`
 - stale: `remote ref changed since you last fetched (expected X, found Y); run 'minigit pull' first`
-- ref-clash: `cannot create 'refs/heads/a/b': it clashes with the existing branch 'refs/heads/a'` (also case-only differences); the client prints no "pull" hint.
+- ref-clash: `cannot create 'refs/heads/a/b': it clashes with the existing branch 'refs/heads/a'` (also case-only differences); the client prints no "pull" hint. For tags: `cannot create 'refs/tags/a/b': it clashes with the existing tag 'refs/tags/a'` (branches and tags never clash with each other).
+- tag-exists: `tag 'v1' already exists on the remote (use --force to replace it)`; the client prints no "pull" hint.
 
 Any HTTP method the server does not implement gets a JSON 405 `method_not_allowed`. A request body that is not valid JSON, including JSON nested too deeply, gets 400. Trees with duplicate or unsorted entry names are malformed: the server answers a push containing one with 422 `bad_pack`, and `fsck` reports it.
 
 ### 7.3 Object negotiation (only missing objects move)
-- `closure(store, tips, seen)` walks commit → tree + parents, and tree → entries, skipping anything in `seen`.
+- `closure(store, tips, seen)` walks tag → object, commit → tree + parents, and tree → entries, skipping anything in `seen`.
 - **Fetch:**
-  - want = advertised tips missing locally. have = every local ref value plus HEAD.
-  - The server checks that each want is reachable from a current server ref (a commit-only walk). Otherwise 400.
+  - want = advertised branch tips missing locally, plus the tags to bring (below). have = every local ref value plus HEAD.
+  - The server checks that each want is reachable from a current server ref: a commit in the ancestry of a ref
+    (tags peeled), or a tag object that a ref names (`peel_tips`). Otherwise 400.
   - The server sends `closure(wants) − closure(haves ∩ server_has)`.
   - When there are no wants, the client skips the request.
-- **Push:** the client sends `closure(new) − closure({fresh advertised tips that exist locally})`.
+  - **Tags** (`refs/tags/*` on the server) are stored locally under the same name, with no tracking namespace, as git does:
+    - by default (auto-follow) a tag comes along when the commit it names (`peeled` value, else the ref value) is
+      reachable from a local ref or from a branch tip just fetched: the client computes that after the branch fetch and
+      requests the still-missing tag objects in a second `fetch` call (haves = local tips + the fetched branch tips);
+    - `fetch --tags` wants every tag up front, with the history each one needs;
+    - a tag that is new locally is created; one that is already equal is silent; one that exists locally with another
+      value is **never replaced** and is reported ` ! [rejected]        v1 -> v1 (would clobber existing tag)` (exit 0);
+    - a tag deleted on the server is not deleted locally.
+- **Push:** the client sends `closure(new) − closure({fresh advertised tips that exist locally})`; for an annotated tag `new` is the tag object, so the pack carries it along with any commits the server lacks.
 - **Connectivity (`check_connectivity`):**
-  - `complete` = commit ancestors of all current refs.
-  - From the tip, walk commits not in `complete`. Each must exist and be a commit. Its tree is walked fully (shared memo), and each entry must exist with the right type (`40000` → tree, else blob). Then the walk continues into the parents.
-  - A missing object raises `ObjectError("missing object <sha>")`.
+  - `complete` = commit ancestors of all current refs (a tag ref contributes the commit it names).
+  - The tip may be a tag object (or a chain of at most 16): each must exist and is peeled to the commit it names.
+  - From there, walk commits not in `complete`. Each must exist and be a commit. Its tree is walked fully (shared memo), and each entry must exist with the right type (`40000` → tree, else blob). Then the walk continues into the parents.
+  - A missing object raises `ObjectError("missing object <sha>")`. `fsck` runs the same walk from every ref, so a tag whose commit is missing is reported as `ref refs/tags/x: missing object <sha>`.
 
 ### 7.4 Server push processing (exact order)
 1. Authenticate, and require write permission (401/403).
 2. Require `Content-Length <= max_push_bytes` (411/413), then read the body.
 3. Parse the frame and the JSON (400). For each update:
-   - `check_ref_name`, and the ref must start with `refs/heads/`;
+   - `check_ref_name`, and the ref must start with `refs/heads/` or `refs/tags/` (`only branches and tags can be pushed`);
    - old and new are hex40 or null;
    - refs are unique.
 4. `pack.unpack` into the store (422). This is safe before any ref check: objects are immutable and unreachable until a ref points at them.
-5. For each `new != null`: `new` must be a commit, and `check_connectivity(new)` must pass (422).
+5. For each `new != null`: `new` must peel to a commit (a commit, or a tag object naming one), and `check_connectivity(new)` must pass (422).
 6. Acquire the per-repo `threading.Lock`. These locks live in a dict guarded by a global lock and keyed by the real path, with a 30 s timeout (503).
 7. For each update, read `cur = refs.resolve(ref)`:
+   - a ref-clash with an existing ref of the same kind (branches against branches, tags against tags) → `ref-clash`.
    - `cur != old` → `stale`.
-   - `new` and `cur` both non-null and `not is_ancestor(cur, new)`: `force` with `allow_force` is allowed; `force` without `allow_force` → `force-disabled`; otherwise `non-fast-forward`.
-   - `new == null` and `ref == bare HEAD target` → `delete-default-branch`.
+   - **Branch:** `new` and `cur` both non-null and `not is_ancestor(cur, new)`: `force` with `allow_force` is allowed; `force` without `allow_force` → `force-disabled`; otherwise `non-fast-forward`.
+   - **Tag:** `new` and `cur` both non-null and `cur != new` (a tag is never moved, fast-forward or not): `force` with `allow_force` is allowed; `force` without `allow_force` → `force-disabled`; otherwise `tag-exists`.
+   - `new == null` and `ref == bare HEAD target` → `delete-default-branch`. Deleting a tag is always allowed.
 8. **Any rejection:** apply nothing and return 409.
    - **Otherwise:** `refs.update(ref, new, expected=cur, timeout=5)` for each update.
-   - Then, if bare HEAD's target is unborn and this push created a branch, set HEAD to the first pushed branch.
+   - Then, if bare HEAD's target is unborn and this push created a branch, set HEAD to the first pushed branch (tags never move HEAD).
 9. Append to `audit.log`, release the lock, and respond 200.
 
 Readers take no lock: ref files are replaced atomically, and objects never change.
@@ -577,34 +732,59 @@ Readers take no lock: ref files are replaced atomically, and objects never chang
   4. Create `refs/heads/<b>` = `origin/<b>`, set `branch.<b>.remote=origin` and `branch.<b>.merge=refs/heads/<b>`, point HEAD at it, and run `checkout_tree({}, T)` + write the index.
   5. **Empty remote:** HEAD is `ref: refs/heads/<info.head short or main>` with the warning `warning: You appear to have cloned an empty repository.`
   6. If clone fails, it deletes the directory it created.
-- **`fetch [REMOTE]`:**
+  7. The fetch inside clone brings the tags of the fetched commits (7.3), stored at `refs/tags/*`.
+- **`fetch [--tags] [REMOTE]`:**
   1. `info_refs`, then fetch the pack and `unpack`.
   2. Run `check_connectivity` for each want.
   3. Only then set every `refs/remotes/<r>/<b>` (`expected=ANY`), and delete tracking refs whose branch is gone.
-  4. Output lines:
+     Then the tags (7.3): fetch the tag objects still missing, create the new `refs/tags/*`.
+  4. Output lines (branches first, deletions last among them, then tags):
      - `   a1b2c3d..e4f5a6b  main -> origin/main`
      - ` + a1b2c3d...e4f5a6b main -> origin/main (forced update)`
      - ` * [new branch]      feature -> origin/feature`
      - ` - [deleted]         old -> origin/old`
-- **`pull [REMOTE [BRANCH]]`:**
+     - ` * [new tag]         v1 -> v1`
+     - ` ! [rejected]        v1 -> v1 (would clobber existing tag)`
+- **`pull [--rebase | --no-rebase] [REMOTE [BRANCH]]`:**
   1. `fetch`.
   2. The upstream is `branch.<cur>.merge`, else the same branch name. The tracking ref must exist: `no upstream 'origin/x' (push with -u first)`.
   3. `merge.merge(repo, "refs/remotes/<r>/<b>", label="<r>/<b>", message="Merge branch '<b>' of <url>")`.
+  - **`--rebase`** (`--no-rebase` is the default): step 3 becomes `rebase.start(repo, "<r>/<b>")`, so the current
+    branch's own commits are replayed on top of the fetched branch (features/rebase.md). Before the fetch the
+    rebase preconditions are checked with rebase's own messages (`rebase.check_preconditions`: open operation,
+    unborn HEAD `cannot rebase: your current branch 'main' does not have any commits yet`, dirty tree
+    `cannot rebase: you have unstaged changes` / `... your index contains uncommitted changes`). When the tracking
+    ref is already reachable from HEAD: `Already up to date.` (exit 0). No own commits: rebase's fast-forward
+    (`Fast-forwarded main to origin/main.`). A conflict leaves the usual stopped rebase (exit 1, rebase's
+    `CONFLICT`/`Could not apply` lines and hints; `status` reports the rebase); `rebase --continue`, `--skip`
+    and `--abort` finish it. The outcome's `kind` is `"up-to-date"`, `"fast-forward"`, `"rebased"` or `"conflict"`.
 - **`push [-u] [--force] [--delete] [REMOTE [SRC[:DST]]]`:**
   1. Default: the current branch to the same name. A detached HEAD needs `SRC:DST`.
+     **Tags:** `SRC` naming a local tag (`refs/tags/<SRC>` exists and no branch of that name does; `refs/tags/v1`
+     is explicit) pushes the tag to `refs/tags/<DST>`; a name that is both a branch and a tag is refused
+     (`src refspec 'x' matches more than one`). `local` is the ref's value: the tag object for an annotated tag.
   2. Get a fresh `info_refs` and take `remote_old`.
   3. If `remote_old == local`: `Everything up-to-date`.
-  4. **Local pre-check** (not authoritative): if `remote_old` is set and is missing locally or is not an ancestor of local, and there is no `--force`, raise `PushRejectedError` without uploading.
+  4. **Local pre-check** (not authoritative): if `remote_old` is set and is missing locally or is not an ancestor of local, and there is no `--force`, raise `PushRejectedError` without uploading. For a tag, any differing `remote_old` without `--force` is rejected locally with reason `tag-exists`.
   5. Send the pack with `old = remote_old`.
-  6. **On 200:** set `refs/remotes/<r>/<dst> = local`. With `-u`, set the upstream. Lines: `To <url>` then `   a1b2c3d..e4f5a6b  main -> main` (or ` * [new branch]      main -> main`).
+  6. **On 200:** for a branch set `refs/remotes/<r>/<dst> = local` and, with `-u`, the upstream (tags get neither). Lines: `To <url>` then `   a1b2c3d..e4f5a6b  main -> main` (or ` * [new branch]      main -> main`, ` * [new tag]         v1 -> v1`, ` + a1b2c3d...e4f5a6b v1 -> v1 (forced update)`).
   7. **On rejection** (local or 409), the CLI prints this to stderr and exits 1:
      ```
      To <url>
-      ! [rejected]        main -> main (non-fast-forward)      (or (fetch first) for a lost race, (forced update disabled), (ref name clash), (invalid ref name))
+      ! [rejected]        main -> main (non-fast-forward)      (or (fetch first) for a lost race, (forced update disabled), (ref name clash), (invalid ref name), (already exists) for a tag)
      error: failed to push some refs to '<url>'
      hint: Updates were rejected because the remote contains work that you do not have locally.
      hint: Integrate the remote changes first ('minigit pull'), then push again.
      ```
+     For `tag-exists` the hints are `hint: Updates were rejected because the tag already exists in the remote.` and
+     `hint: Delete it there first ('minigit push --delete <remote> <tag>') or push with --force.`
+  - **`push --delete REMOTE NAME`:** `refs/heads/NAME` and `refs/tags/NAME` are explicit; a bare NAME is whichever the
+    remote has (both → `dst refspec 'x' matches more than one`, neither → `unable to delete 'x': remote ref does not
+    exist`). Line: ` - [deleted]         v1`. Deleting a branch also drops `refs/remotes/<r>/<name>`.
+  - **`push --tags [REMOTE]`:** one request with an update for every local tag the remote lacks (and, with
+    `--force`, every tag that differs). Tags that differ without `--force` are not sent; after the others were pushed
+    the command still exits 1 with one ` ! [rejected]        v1 -> v1 (already exists)` line per such tag, listed
+    after the ` * [new tag]` lines of the accepted ones. Nothing to send: `Everything up-to-date`.
 - **HTTP errors:**
   - 401 → `AuthError("authentication failed for '<url>': check user/token (minigit login)")`.
   - 403 → `PermissionDeniedError("permission denied: ...")`.
@@ -675,8 +855,10 @@ Every file is owned by exactly one module. Dependency order: **M1 → M2 → {M3
 | **M10 stash, rebase, cherry-pick/revert** | `stash.py`, `rebase.py`, `cherry.py`, `sequencer.py` (section 6) | `tests/test_stash.py`, `tests/test_rebase.py`, `tests/test_cherry.py`, `tests/test_cherry_pick_revert.py` | M1, M2, M4 |
 | **M11 blame, grep** | `blame.py`, `grep.py` (section 6) | `tests/test_blame_grep.py` | M1, M2, M3 |
 | **M12 server admin** | `admin.py` (operations on `server.json`), `serveradmin.py` (`minigit server` parsers and dispatch), `features/server-admin.md` | `tests/test_server_admin.py` | M1, M5 |
+| **M13 tags** | `tags.py` (`minigit tag`: list/create/delete, parser and handler), `features/tags.md`; tag objects live in `objects.py`, peeling in `revparse.py`, decorations in `history.py`, transport in `pack.py`/`server.py`/`remote.py`, the web page in `webui.py` | `tests/test_tags.py` (plus tag cases in the server, remote, web UI, CLI and e2e suites) | M1, M3, M5, M6, M8 |
+| **M14 gc** | `gc.py` (section 6) | `tests/test_gc.py` | M1, M2 (index), M5 (`pack.closure`) |
 
-M8 to M12 are add-ons to the base design above. Each registers or wires its own CLI parser and handler, and `cli.py` only calls them.
+M8 to M13 are add-ons to the base design above. Each registers or wires its own CLI parser and handler, and `cli.py` only calls them.
 
 Unit tests use `tempfile.TemporaryDirectory(ignore_cleanup_errors=True)` and do not import `tests/helpers.py`. Python 3.11's `rmtree` takes `onerror`, not `onexc`.
 
@@ -740,6 +922,11 @@ class ObjectStore:
     def read(self, sha: str) -> tuple[str, bytes]            # ObjectError("object <sha> not found") / corrupt
     def read_typed(self, sha: str, obj_type: str) -> bytes   # ObjectError on type mismatch
     def read_raw(self, sha: str) -> bytes                    # stored zlib bytes
+    def object_type(self, sha: str) -> str                   # cached type, else from the header only (no hash check)
+    def commit(self, sha: str, data: bytes | None = None) -> Commit           # parsed and cached per process
+    def tree(self, sha: str, data: bytes | None = None) -> list[TreeEntry]    # parsed and cached per process
+    def load(self, sha: str) -> tuple[str, Commit | list[TreeEntry] | bytes]  # (type, parsed) through the caches
+    def temp_files(self) -> list[str]                        # paths of objects/xx/tmp-* files
     def resolve_prefix(self, prefix: str) -> list[str]       # all full shas starting with prefix (len >= 4)
     def iter_all(self) -> Iterator[str]
 @dataclass(frozen=True)
@@ -759,6 +946,14 @@ class Commit:
     def subject(self) -> str                                 # first line of message
 def parse_commit(data: bytes) -> Commit
 def serialize_commit(c: Commit) -> bytes
+@dataclass(frozen=True)
+class Tag:
+    object: str; type: str; tag: str; tagger: Signature | None; message: str
+    @property
+    def subject(self) -> str
+def parse_tag(data: bytes) -> Tag                            # section 2; ObjectError
+def serialize_tag(t: Tag) -> bytes
+def peel(store: ObjectStore, sha: str) -> tuple[str, str]    # (type, sha) of the first non-tag object; follows <= 16 tags
 
 # trees.py
 Entry = tuple[str, str]; FlatTree = dict[str, Entry]
@@ -783,7 +978,7 @@ class Config:
 ANY: object
 def check_ref_name(name: str) -> None                        # RefUpdateError / MinigitError on bad name
 def is_hex_sha(s: str) -> bool                               # 40 lowercase hex
-def short_ref(name: str) -> str                              # refs/heads/x -> x ; refs/remotes/o/x -> o/x
+def short_ref(name: str) -> str                              # refs/heads/x -> x ; refs/remotes/o/x -> o/x ; refs/tags/v1 -> v1
 class RefStore:
     def __init__(self, gitdir: str) -> None
     def read_raw(self, name: str) -> str | None              # "ref: refs/heads/x" | sha | None
@@ -830,11 +1025,18 @@ def is_ancestor(store: ObjectStore, anc: str, desc: str) -> bool        # anc ==
 def merge_bases(store: ObjectStore, a: str, b: str) -> list[str]
 def best_merge_base(store: ObjectStore, a: str, b: str) -> str | None
 def topo_walk(store: ObjectStore, starts: Iterable[str]) -> Iterator[tuple[str, Commit]]   # section 6 log order
+def topo_order(store: ObjectStore, starts: Iterable[str], excluded=frozenset()) -> list[tuple[str, Commit]]  # git --topo-order (rebase)
 def ahead_behind(store: ObjectStore, local: str, upstream: str) -> tuple[int, int]
+class AsciiGraph:                                                  # log --graph (a port of git's graph.c)
+    def update(self, sha: str, parents: Sequence[str]) -> None    # once per commit, in log order
+    def next_line(self) -> tuple[str, bool]                       # (prefix, is the commit's "*" line) per text line
+    def finished(self) -> bool                                    # False while split/join rows are still pending
+    def padding_line(self) -> str                                 # the blank line before a commit, after update()
 
 # revparse.py
-def resolve_object(repo: Repository, spec: str) -> str       # any object, incl. rev:path
-def resolve_rev(repo: Repository, spec: str) -> str          # must be a commit
+def resolve_object(repo: Repository, spec: str) -> str       # any object, incl. rev:path; an annotated tag is the tag object
+def resolve_rev(repo: Repository, spec: str) -> str          # must be a commit (tags are peeled)
+def peel_to_commit(repo: Repository, sha: str, label: str) -> str   # sha, or the commit a tag (chain) names; RevisionError "'label' is not a commit"
 def resolve_ref(repo: Repository, name: str) -> str | None   # "main" -> "refs/heads/main", "origin/x" -> "refs/remotes/origin/x"
 def resolve_local_branch(repo: Repository, name: str) -> str | None   # "refs/heads/<name>" if it exists
 def abbrev(sha: str, n: int = 7) -> str
@@ -896,7 +1098,16 @@ def changed_paths(old: FlatTree, new: FlatTree, pathspecs: Sequence[str] = ()) -
 def render_file_diff(path: str, old: FileVersion | None, new: FileVersion | None, context: int = 3) -> bytes
 def diff_flats(repo: Repository, old: FlatTree, new: FlatTree, *, new_from_worktree: bool = False,
                pathspecs: Sequence[str] = ()) -> bytes
-def diff_command(repo: Repository, cwd: str, *, staged: bool, revs: Sequence[str], pathspecs: Sequence[str]) -> bytes
+def diff_command(repo: Repository, cwd: str, *, staged: bool, revs: Sequence[str], pathspecs: Sequence[str],
+                 stat: bool = False) -> bytes
+@dataclass
+class FileStat: name: str; added: int; deleted: int; binary: bool = False; unmerged: bool = False   # one --stat line
+def file_stats(repo: Repository, old: FlatTree, new: FlatTree, *, new_from_worktree: bool = False,
+               pathspecs: Sequence[str] = (), unmerged: Sequence[str] = ()) -> list[FileStat]
+def format_shortstat(files: int, insertions: int, deletions: int) -> str   # " N files changed, ..."
+def format_diffstat(stats: Sequence[FileStat], width: int = 80) -> str    # the --stat block, "" if empty
+def diffstat(repo: Repository, old: FlatTree, new: FlatTree, *, new_from_worktree: bool = False,
+             pathspecs: Sequence[str] = (), unmerged: Sequence[str] = ()) -> bytes
 
 # status.py
 @dataclass
@@ -904,32 +1115,49 @@ class StatusResult:
     branch: str | None; head: str | None; detached: bool; unborn: bool
     upstream: str | None; ahead: int; behind: int; merging: bool
     entries: list[tuple[str, str]]                           # (XY, path); "??" untracked; sorted by path then XY
+    upstream_gone: bool = False                              # upstream configured, tracking ref missing
     def is_clean(self) -> bool                               # no entries other than none
+def upstream_of(repo: Repository, branch: str) -> tuple[str, str | None] | None   # (tracking ref, its sha or None)
 def compute_status(repo: Repository) -> StatusResult
 def format_status_long(st: StatusResult) -> str
 def format_status_porcelain(st: StatusResult) -> str
 
 # history.py
-def decorations(repo: Repository) -> dict[str, list[str]]  # sha -> ["HEAD -> main", "origin/main"]
-def log_entries(repo: Repository, revs: Sequence[str] | None, max_count: int | None, all_refs: bool = False) -> list[tuple[str, Commit]]
-def format_log(repo: Repository, entries: list[tuple[str, Commit]], oneline: bool) -> str
-def show(repo: Repository, spec: str = "HEAD") -> bytes
+def decorations(repo: Repository) -> dict[str, list[str]]  # sha -> ["HEAD -> main", "tag: v1", "origin/main"]
+def commit_tips(repo: Repository) -> list[str]             # the commits every ref names (tags peeled), for log --all
+class PathFilter:                                           # log -- path: tree differs from the first parent's
+    def __init__(self, store: ObjectStore, paths: Sequence[str]) -> None
+    def matches(self, sha: str, commit: Commit | None = None) -> bool
+    def rewrite_parents(self, commit: Commit) -> list[str]  # nearest matching first-parent ancestors (--graph)
+def log_entries(repo: Repository, revs: Sequence[str] | None, max_count: int | None, all_refs: bool = False,
+                paths: Sequence[str] = ()) -> list[tuple[str, Commit]]
+def format_log(repo: Repository, entries: list[tuple[str, Commit]], oneline: bool, *, graph: bool = False,
+               stat: bool = False, paths: Sequence[str] = ()) -> str
+def format_tag_header(tag: Tag) -> list[str]               # show of an annotated tag: tag NAME, Tagger, Date, message
+def show(repo: Repository, spec: str = "HEAD", *, stat: bool = False, each_parent: bool = False) -> bytes
 
 # ops.py
 def init(path: str, *, bare: bool = False, initial_branch: str = "main") -> str        # "Initialized empty minigit repository in <gitdir>" | "Reinitialized existing ..."
-def add(repo: Repository, pathspecs: Sequence[str], cwd: str, *, force: bool = False) -> list[str]   # staged/removed paths
+def add(repo: Repository, pathspecs: Sequence[str], cwd: str, *, force: bool = False,
+        all_: bool = False, update: bool = False) -> list[str]   # staged/removed paths; -A / -u (section 6)
 def rm(repo: Repository, pathspecs: Sequence[str], cwd: str, *, cached: bool = False, recursive: bool = False,
        force: bool = False) -> list[str]                    # "rm 'p'" lines
-def commit(repo: Repository, messages: Sequence[str], *, all_: bool = False, allow_empty: bool = False) -> tuple[str, str]  # (sha, summary line)
+def commit(repo: Repository, messages: Sequence[str], *, all_: bool = False, allow_empty: bool = False,
+           stat: bool = False, amend: bool = False) -> tuple[str, str]  # (sha, summary line [+ stat line]); --amend (section 6)
 def create_commit(repo: Repository, tree: str, parents: Sequence[str], message: str) -> str  # writes object only (merge reuses)
 @dataclass
-class BranchInfo: name: str; sha: str; current: bool; remote: bool; subject: str
-def branch_list(repo: Repository, *, remotes: bool = False, all_: bool = False) -> list[BranchInfo]
-def format_branch_list(items: list[BranchInfo], verbose: bool) -> str
+class BranchInfo:
+    name: str; sha: str; current: bool; remote: bool; subject: str
+    upstream: str | None = None; ahead: int = 0; behind: int = 0; gone: bool = False   # filled by upstreams=True
+    def tracking(self) -> str | None                        # "[origin/main: ahead 2, behind 1]" | "[origin/main: gone]" | None
+def branch_list(repo: Repository, *, remotes: bool = False, all_: bool = False, upstreams: bool = False) -> list[BranchInfo]
+def format_branch_list(items: list[BranchInfo], verbose: bool) -> str              # items with tracking info give the -vv column
 def branch_create(repo: Repository, name: str, start: str | None = None) -> str     # sha
 def branch_delete(repo: Repository, name: str, *, force: bool = False) -> str       # "Deleted branch x (was abc1234)."
 def set_upstream(repo: Repository, branch: str, remote: str, merge_ref: str) -> None
 def get_upstream(repo: Repository, branch: str) -> tuple[str, str] | None           # (remote, "refs/heads/x")
+def set_upstream_to(repo: Repository, upstream: str, branch: str | None = None) -> str   # "branch 'x' set up to track 'origin/x'."
+def unset_upstream(repo: Repository, branch: str | None = None) -> None             # MinigitError when no upstream is set
 def switch(repo: Repository, target: str | None, *, create: str | None = None, start: str | None = None,
            detach: bool = False) -> str                     # "Switched to branch 'x'" | "Switched to a new branch 'x'" | "HEAD is now at abc1234 subject"
 def reset(repo: Repository, rev: str = "HEAD", mode: str = "mixed") -> str         # hard: "HEAD is now at abc1234 subject"; else ""
@@ -979,14 +1207,16 @@ def default_merge_message(repo: Repository, rev: str) -> str
 ```python
 # pack.py
 MAGIC = b"MGPK"
-def closure(store: ObjectStore, tips: Iterable[str], seen: set[str] | None = None) -> set[str]   # returns newly visited; updates seen
+def closure(store: ObjectStore, tips: Iterable[str], seen: set[str] | None = None) -> set[str]   # returns newly visited; updates seen; tags -> their object
+def peel_tips(store: ObjectStore, ref_values: Iterable[str]) -> tuple[list[str], set[str]]   # (commits named, tag objects passed) for the values present
 def objects_to_send(store: ObjectStore, tips: Iterable[str], exclude_tips: Iterable[str]) -> list[str]  # excludes not in store ignored
 def build_pack(store: ObjectStore, shas: Iterable[str]) -> bytes
 def pack_count(data: bytes) -> int
 def unpack(store: ObjectStore, data: bytes, max_object_size: int = 64 << 20) -> list[str]   # ObjectError on any defect
-def complete_commits(store: ObjectStore, ref_values: Iterable[str]) -> set[str]
+def complete_commits(store: ObjectStore, ref_values: Iterable[str]) -> set[str]   # tags peeled
 def check_connectivity(store: ObjectStore, tip: str, complete: set[str]) -> None           # ObjectError
-def fsck(repo: Repository) -> list[str]                  # problems; [] = healthy (hash check every object + ref connectivity)
+def fsck(repo: Repository) -> list[str]                  # problems; [] = healthy (hash check every object once, then ref
+                                                         # connectivity from the caches; "warning: ..." lines are informational)
 
 # auth.py
 def hash_token(token: str) -> str
@@ -1025,7 +1255,9 @@ def credentials_path() -> str
 def load_credentials(url: str) -> tuple[str, str] | None         # section 7.1 order (env, userinfo, file)
 def save_credentials(url: str, user: str, token: str, *, host_default: bool = False) -> None  # True: login
 @dataclass
-class RemoteRefs: head: str | None; refs: dict[str, str]
+class RemoteRefs:
+    head: str | None; refs: dict[str, str]; peeled: dict[str, str]   # peeled: annotated tag ref -> commit (7.2)
+    def commit_of(self, ref: str) -> str | None                      # refs[ref], peeled through peeled[]
 class HttpRemote:
     def __init__(self, url: str, timeout: float = 60.0, data_timeout: float | None = None) -> None   # strips userinfo, resolves credentials
     url: str
@@ -1042,11 +1274,13 @@ def remote_remove(repo: Repository, name: str) -> None
 def remote_list(repo: Repository) -> dict[str, str]
 def remote_url(repo: Repository, name: str) -> str              # MinigitError("no remote 'x' configured")
 def clone(url: str, directory: str | None, cwd: str) -> tuple[Repository, list[str]]   # (repo, messages)
-def fetch(repo: Repository, remote: str = "origin") -> list[RefChange]
+def fetch(repo: Repository, remote: str = "origin", *, all_tags: bool = False) -> list[RefChange]   # tag changes: ref "refs/tags/x", kind new | up-to-date | rejected
 def format_fetch(url: str, changes: list[RefChange]) -> str
-def pull(repo: Repository, remote: str | None = None, branch: str | None = None) -> tuple[list[RefChange], MergeOutcome]
+def pull(repo: Repository, remote: str | None = None, branch: str | None = None, *, allow_unrelated: bool = False,
+         rebase: bool = False) -> tuple[list[RefChange], MergeOutcome]   # rebase: kind "rebased" | "fast-forward" | "up-to-date" | "conflict"
 def push(repo: Repository, remote: str | None = None, refspec: str | None = None, *, set_upstream: bool = False,
-         force: bool = False, delete: bool = False) -> list[str]    # output lines; raises PushRejectedError
+         force: bool = False, delete: bool = False) -> list[str]    # output lines; raises PushRejectedError; SRC may be a tag
+def push_tags(repo: Repository, remote: str | None = None, *, force: bool = False) -> list[str]   # push --tags (7.5); PushRejectedError.accepted holds the lines of the tags that went up
 def format_push_rejection(err: PushRejectedError, src: str, dst: str) -> str   # section 7.5 text (contains "[rejected]" and "'minigit pull'")
 def login(url: str, user: str, token: str) -> None
 ```

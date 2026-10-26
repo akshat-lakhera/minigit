@@ -15,6 +15,15 @@ minigit {VERSION}: a small git clone with a multi-user HTTP server. Nothing else
 The executables are not code-signed. Windows SmartScreen and macOS Gatekeeper may ask once; choose "Run anyway"
 (Windows) or allow it under System Settings > Privacy & Security (macOS).
 
+## What is new in 0.2.0
+
+- Tags: `tag`, `tag -a -m`, `tag -d`, `tag -l`, pushed with `push origin v1` or `push --tags`, fetched and cloned, shown in `log` and the web UI.
+- `commit --amend`, `add -A`, `add -u`, `cherry-pick A..B`, `revert A..B`.
+- `log -- PATH`, `log --graph`, `--stat` for `diff`, `show` and `log`, `show` of a merge against its first parent (`-m` for each parent).
+- `branch -vv` with the upstream column, `branch -u` / `--unset-upstream`, `status` reports a gone upstream, `pull --rebase`.
+- `gc` removes orphan temporary objects and unreachable objects; `fsck` is about five times faster and `blame` twice as fast on long histories.
+- `rebase` replays commits below a merge in the same order as git, so the rebased commit ids match git's.
+
 ## First steps
 
 ```

@@ -399,6 +399,43 @@ class RoutingTests(RepoFixture):
         body = self.assert_page(self.request("/-/", "bob"))
         self.assertIn(b"empty", body)
 
+    def test_tags_page_and_log_decorations(self):
+        store = self.repo.objects
+        sig = objects.Signature("Tagger", "tag@example.com", TS + 300, 0)
+        ann = store.write("tag", objects.serialize_tag(objects.Tag(self.c2, "commit", "v1.0", sig,
+                                                                   "Release <1.0> & more\n\nbody\n")))
+        self.repo.refs.update("refs/tags/v1.0", ann)
+        self.repo.refs.update("refs/tags/v0.1", self.c1)
+        self.repo.refs.update("refs/tags/dangling", store.write(
+            "tag", objects.serialize_tag(objects.Tag("f" * 40, "commit", "dangling", sig, "gone\n"))))
+        rows = webui.list_tags(self.repo)
+        self.assertEqual([(r.name, r.commit_sha, r.annotated, r.message) for r in rows],
+                         [("dangling", None, True, "gone"), ("v0.1", self.c1, False, ""),
+                          ("v1.0", self.c2, True, "Release <1.0> & more")])
+        body = self.assert_page(self.request("/-/proj/tags", "alice"))
+        hrefs = links(body)
+        self.assertIn(b"Release &lt;1.0&gt; &amp; more", body)
+        self.assertNotIn(b"<1.0>", body)
+        self.assertIn(b"annotated", body)
+        self.assertIn(b"dangling", body)
+        self.assertTrue(has_link(hrefs, f"/-/proj/commit/{self.c2}"), "the annotated tag links its commit")
+        self.assertFalse(any(ann[:7] in h for h in hrefs), "never the tag object")
+        self.assertTrue(has_link(hrefs, "/-/proj/log", rev="v1.0"))
+        self.assertTrue(has_link(hrefs, "/-/proj/tree", rev="v0.1"))
+        # the summary counts and links the tags, every repo page has the Tags nav link
+        summary = self.assert_page(self.request("/-/proj/", "alice"))
+        self.assertIn(b"3 tags", summary)
+        self.assertTrue(has_link(links(summary), "/-/proj/tags"))
+        self.assertTrue(has_link(links(self.assert_page(self.request("/-/proj/branches", "alice"))), "/-/proj/tags"))
+        # log rows carry the tag decorations, and a tag is a valid rev (peeled)
+        log = self.assert_page(self.request("/-/proj/log?rev=v1.0", "alice"))
+        self.assertIn(b"(tag: v1.0)", log)
+        self.assertIn(b"Commits on v1.0", log)
+        self.assertIn(self.c2.encode(), log)
+        self.assertNotIn(self.c3.encode(), log)
+        self.assert_page(self.request(f"/-/proj/commit/v1.0", "alice"))
+        self.assertIn(b"No tags yet.", self.assert_page(self.request("/-/fresh/tags", "bob")))
+
     def test_missing_repo_directory_is_listed_as_unavailable(self):
         auth.create_repo(self.root, "lost", readers=["bob"], writers=["bob"])
         import shutil

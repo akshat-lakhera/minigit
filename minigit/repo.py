@@ -10,7 +10,7 @@ import os
 
 from .config import Config
 from .errors import MinigitError, NotARepositoryError
-from .objects import Commit, ObjectStore, Signature, parse_commit
+from .objects import Commit, ObjectStore, Signature
 from .refs import RefStore, check_ref_name
 from .trees import FlatTree, commit_flat
 from .util import atomic_write, now_with_tz, parse_tz, unlink_with_retry
@@ -140,7 +140,7 @@ class Repository:
         return commit_flat(self.objects, self.head_commit())
 
     def read_commit(self, sha: str) -> Commit:
-        return parse_commit(self.objects.read_typed(sha, "commit"))
+        return self.objects.commit(sha)
 
     def merge_head(self) -> str | None:
         return self.refs.read_special("MERGE_HEAD")

@@ -12,6 +12,7 @@ Pack format::
 from __future__ import annotations
 
 import hashlib
+import os
 import struct
 import zlib
 from typing import Iterable
@@ -25,7 +26,7 @@ _HEADER = struct.Struct(">4sII")
 _U32 = struct.Struct(">I")
 _ENTRY_HEAD = 20 + _U32.size
 _TRAILER = 20
-_VALID_TYPES = ("blob", "tree", "commit")
+_VALID_TYPES = ("blob", "tree", "commit", "tag")
 
 
 def _msg(exc: BaseException) -> str:
@@ -37,25 +38,34 @@ def _msg(exc: BaseException) -> str:
 # ---------------------------------------------------------------------------
 
 def _object_type(store, sha: str) -> str:
-    """Return the stored type of ``sha`` by inflating only its header."""
-    raw = store.read_raw(sha)
-    d = zlib.decompressobj()
+    """The stored type of ``sha`` (cached by the store, else from its header only); ``ObjectError`` when
+    the object is missing or its header is corrupt."""
+    return store.object_type(sha)
+
+
+def _type_of_present(store, sha: str) -> str:
+    """``_object_type``, with a missing object reported as ``missing object <sha>``."""
     try:
-        head = d.decompress(raw, 64)
-    except zlib.error as e:
-        raise errors.ObjectError(f"object {sha} is corrupt: {e}", sha=sha)
-    nul = head.find(b"\0")
-    if nul < 0:
-        raise errors.ObjectError(f"object {sha} has a corrupt header", sha=sha)
+        return store.object_type(sha)
+    except errors.ObjectError:
+        if not store.has(sha):
+            raise errors.ObjectError(f"missing object {sha}", sha=sha) from None
+        raise
+
+
+def _load_present(store, sha: str):
+    """``store.load`` (one hash-checked read, or the cached parse), a missing object reported as
+    ``missing object <sha>``."""
     try:
-        obj_type, _size = head[:nul].decode("ascii").split(" ", 1)
-    except (ValueError, UnicodeDecodeError):
-        raise errors.ObjectError(f"object {sha} has a corrupt header", sha=sha)
-    return obj_type
+        return store.load(sha)
+    except errors.ObjectError:
+        if not store.has(sha):
+            raise errors.ObjectError(f"missing object {sha}", sha=sha) from None
+        raise
 
 
 def closure(store, tips: Iterable[str], seen: set[str] | None = None, *, strict: bool = True) -> set[str]:
-    """Walk commit -> tree + parents and tree -> entries from ``tips``.
+    """Walk tag -> object, commit -> tree + parents and tree -> entries from ``tips``.
 
     Anything already in ``seen`` is skipped (and not descended into).
     Returns the set of newly visited shas and adds them to ``seen``.
@@ -73,7 +83,7 @@ def closure(store, tips: Iterable[str], seen: set[str] | None = None, *, strict:
         if not strict and not store.has(sha):
             continue
         try:
-            obj_type, data = store.read(sha)
+            obj_type, parsed = store.load(sha)   # hash-checked on the first read, cached afterwards
         except errors.ObjectError:
             if strict:
                 raise
@@ -81,12 +91,13 @@ def closure(store, tips: Iterable[str], seen: set[str] | None = None, *, strict:
         seen.add(sha)
         new.add(sha)
         if obj_type == "commit":
-            commit = objects.parse_commit(data)
-            stack.append(commit.tree)
-            stack.extend(commit.parents)
+            stack.append(parsed.tree)
+            stack.extend(parsed.parents)
         elif obj_type == "tree":
-            for entry in objects.parse_tree(data):
+            for entry in parsed:
                 stack.append(entry.sha)
+        elif obj_type == "tag":
+            stack.append(objects.parse_tag(parsed).object)
     return new
 
 
@@ -181,6 +192,8 @@ def unpack(store, data: bytes, max_object_size: int = 64 << 20) -> list[str]:
                 objects.parse_tree(content)
             elif obj_type == "commit":
                 objects.parse_commit(content)
+            elif obj_type == "tag":
+                objects.parse_tag(content)
         except errors.MinigitError as e:
             raise errors.ObjectError(f"pack entry {sha} is a malformed {obj_type}: {_msg(e)}", sha=sha)
         except (ValueError, UnicodeDecodeError, IndexError) as e:
@@ -196,54 +209,92 @@ def unpack(store, data: bytes, max_object_size: int = 64 << 20) -> list[str]:
 # connectivity
 # ---------------------------------------------------------------------------
 
+def peel_tips(store, ref_values: Iterable[str]) -> tuple[list[str], set[str]]:
+    """``(commits, tag objects)`` named by the ref values that exist in the store.
+
+    An annotated tag is followed to the commit it names (a chain of tags too); every tag object
+    on the way is returned in the second set. Values that are missing, corrupt or name something
+    other than a commit are skipped.
+    """
+    commits: list[str] = []
+    tags: set[str] = set()
+    for value in ref_values:
+        if not value or not store.has(value):
+            continue
+        sha = value
+        try:
+            for _ in range(objects.MAX_TAG_DEPTH):
+                obj_type, data = store.read(sha)
+                if obj_type == "commit":
+                    if sha not in commits:
+                        commits.append(sha)
+                    break
+                if obj_type != "tag":
+                    break
+                tags.add(sha)
+                sha = objects.parse_tag(data).object
+                if not store.has(sha):
+                    break
+        except errors.MinigitError:
+            continue
+    return commits, tags
+
+
 def complete_commits(store, ref_values: Iterable[str]) -> set[str]:
-    """Commit ancestors (inclusive) of every ref value that exists in the store."""
-    tips = [v for v in ref_values if v and store.has(v)]
+    """Commit ancestors (inclusive) of every ref value that exists in the store (tags are peeled)."""
+    tips, _tags = peel_tips(store, ref_values)
     if not tips:
         return set()
     return set(graph.ancestors(store, tips))
 
 
 def _check_tree(store, root: str, memo: set[str]) -> None:
+    """Every tree below ``root`` is read (hash-checked, unless the store already has it parsed) and every
+    blob must exist with the right type (checked on its header only); ``memo`` is shared across calls."""
     stack = [root]
     while stack:
         sha = stack.pop()
         if sha in memo:
             continue
-        if not store.has(sha):
-            raise errors.ObjectError(f"missing object {sha}", sha=sha)
-        obj_type, data = store.read(sha)
+        obj_type, entries = _load_present(store, sha)
         if obj_type != "tree":
             raise errors.ObjectError(f"object {sha} is a {obj_type}, expected a tree", sha=sha)
         memo.add(sha)
-        for entry in objects.parse_tree(data):
+        for entry in entries:
             if entry.mode == "40000":
                 stack.append(entry.sha)
                 continue
             if entry.sha in memo:
                 continue
-            if not store.has(entry.sha):
-                raise errors.ObjectError(f"missing object {entry.sha}", sha=entry.sha)
-            found = _object_type(store, entry.sha)
+            found = _type_of_present(store, entry.sha)
             if found != "blob":
                 raise errors.ObjectError(f"object {entry.sha} is a {found}, expected a blob", sha=entry.sha)
             memo.add(entry.sha)
 
 
 def _walk_commits(store, tip: str, complete: set[str], tree_memo: set[str]) -> set[str]:
-    """Walk commits from ``tip`` that are not in ``complete``; return the commits visited."""
+    """Walk commits from ``tip`` that are not in ``complete``; return the commits visited.
+
+    ``tip`` may be an annotated tag (or a chain of them): the tag objects must exist and are
+    peeled to the commit they name.
+    """
     visited: set[str] = set()
     stack = [tip]
+    depth = 0
     while stack:
         sha = stack.pop()
         if sha in complete or sha in visited:
             continue
-        if not store.has(sha):
-            raise errors.ObjectError(f"missing object {sha}", sha=sha)
-        obj_type, data = store.read(sha)
+        obj_type, payload = _load_present(store, sha)
+        if obj_type == "tag":
+            depth += 1
+            if depth > objects.MAX_TAG_DEPTH:
+                raise errors.ObjectError(f"tag chain too long at {sha}", sha=sha)
+            stack.append(objects.parse_tag(payload).object)
+            continue
+        commit = payload
         if obj_type != "commit":
             raise errors.ObjectError(f"object {sha} is a {obj_type}, expected a commit", sha=sha)
-        commit = objects.parse_commit(data)
         visited.add(sha)
         _check_tree(store, commit.tree, tree_memo)
         stack.extend(commit.parents)
@@ -251,14 +302,22 @@ def _walk_commits(store, tip: str, complete: set[str], tree_memo: set[str]) -> s
 
 
 def check_connectivity(store, tip: str, complete: set[str]) -> None:
-    """Every commit reachable from ``tip`` but not in ``complete`` must exist, with its full tree."""
+    """Every commit reachable from ``tip`` but not in ``complete`` must exist, with its full tree.
+
+    A ``tip`` that is an annotated tag is peeled first (the tag object itself must exist).
+    """
     _walk_commits(store, tip, complete, set())
 
 
 def fsck(repo) -> list[str]:
-    """Hash-check every object and verify ref connectivity. Returns problems ([] = healthy)."""
+    """Hash-check every object and verify ref connectivity. Returns problems ([] = healthy).
+
+    ``warning:`` lines (temporary files) are informational; the CLI exits 0 when there is nothing else.
+    """
     store = repo.objects
     problems: list[str] = []
+    # Pass 1 reads and hash-checks every object exactly once. The parsed commits and trees and every
+    # object's type stay in the store's caches, so the connectivity pass below needs no file access.
     for sha in sorted(store.iter_all()):
         try:
             obj_type, data = store.read(sha)
@@ -267,9 +326,11 @@ def fsck(repo) -> list[str]:
             continue
         try:
             if obj_type == "tree":
-                objects.parse_tree(data)
+                store.tree(sha, data)
             elif obj_type == "commit":
-                objects.parse_commit(data)
+                store.commit(sha, data)
+            elif obj_type == "tag":
+                objects.parse_tag(data)
             elif obj_type != "blob":
                 problems.append(f"object {sha} has unknown type '{obj_type}'")
         except errors.MinigitError as e:
@@ -301,4 +362,7 @@ def fsck(repo) -> list[str]:
             verified |= _walk_commits(store, sha, verified, tree_memo)
         except errors.MinigitError as e:
             problems.append(f"ref {name}: {_msg(e)}")
+    for path in store.temp_files():   # a writer that died mid-object; harmless, 'minigit gc' removes them
+        rel = "objects/%s/%s" % (os.path.basename(os.path.dirname(path)), os.path.basename(path))
+        problems.append(f"warning: temporary file {rel} (run 'minigit gc')")
     return problems

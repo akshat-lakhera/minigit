@@ -290,6 +290,39 @@ class RebaseCleanTests(_RebaseCase):
         self.assertEqual(self.get("o.txt"), b"o\n")
         self.assertEqual(self.porcelain(), "")
 
+    def test_replay_order_below_a_merge_is_git_topo_order(self):
+        # A -- C1 -- S1 (side)                    dates: C1 < S1 < C2 < M < D < E
+        #       \\-- C2 -- M -- D (topic)          M = merge of side into topic, parents (C2, S1)
+        # A -- E (main)
+        # Git orders the replay with a stack-driven topological sort (`--topo-order`): below the merge
+        # the first-parent lineage (C2) goes before the second-parent lineage (S1), although S1 is
+        # older. Committer-date order would replay C1, S1, C2, D instead.
+        def at(ts):
+            return dict(self.env, MINIGIT_AUTHOR_DATE=f"{ts} +0000")
+
+        self.commit("A", {"a.txt": "A\n"}, env=at(1700000000))
+        self.mg("switch", "-c", "topic")
+        self.commit("C1", {"c1.txt": "C1\n"}, env=at(1700000200))
+        self.mg("switch", "-c", "side")
+        self.commit("S1", {"s1.txt": "S1\n"}, env=at(1700000300))
+        self.mg("switch", "topic")
+        self.commit("C2", {"c2.txt": "C2\n"}, env=at(1700000400))
+        self.mg("merge", "--no-ff", "-m", "Merge side", "side", env=at(1700000500))
+        self.commit("D", {"d.txt": "D\n"}, env=at(1700000600))
+        self.mg("switch", "main")
+        upstream = self.commit("E", {"e.txt": "E\n"}, env=at(1700000700))
+        self.mg("switch", "topic")
+
+        self.mg("rebase", "main")   # committer: Test User, 1700000000 +0000 (make_env)
+        self.assertEqual(self.subjects(), ["D", "S1", "C2", "C1", "E", "A"])
+        self.assertEqual(self.sha("HEAD~4"), upstream)
+        for i in range(4):
+            self.assertEqual(self.parent_count(f"HEAD~{i}"), 1)
+        # The same history (same files, messages, author and committer dates) rebased by git 2.55 with
+        # `git rebase main` ends in this commit, so the replayed ids are git's.
+        self.assertEqual(self.sha("topic"), "b86088bbe3ee4584ad93500b4da6ec6a37828081")
+        self.assertEqual(self.porcelain(), "")
+
 
 # ===========================================================================
 # conflicts: stop, --continue, --skip, --abort
@@ -624,6 +657,125 @@ class RebaseCollaborationTests(unittest.TestCase):
         alice("pull")
         self.assertEqual(alice("rev-parse", "HEAD").out, bob("rev-parse", "HEAD").out)
         self.assertEqual(read(os.path.join(alice_dir, "bob.txt")), b"bob\n")
+
+    def test_pull_rebase_end_to_end(self):
+        alice, alice_dir = self.user("alice")
+        write(os.path.join(alice_dir, "a.txt"), "a\n")
+        alice("add", ".")
+        alice("commit", "-m", "base")
+        alice("push", "-u")
+        bob, bob_dir = self.user("bob")
+
+        # nothing to do
+        res = bob("pull", "--rebase")
+        self.assertEqual(res.out, "Already up to date.\n")
+        self.assertEqual(bob("branch", "-vv").out, f"* main {bob('rev-parse', '--short', 'HEAD').out.strip()} "
+                                                  "[origin/main] base\n")
+
+        # bob's own commit is replayed on top of alice's: linear history, no merge commit
+        write(os.path.join(alice_dir, "alice.txt"), "alice\n")
+        alice("add", ".")
+        alice("commit", "-m", "alice work")
+        alice("push")
+        write(os.path.join(bob_dir, "bob.txt"), "bob\n")
+        bob("add", ".")
+        bob("commit", "-m", "bob work")
+        bob("fetch")
+        self.assertIn("[origin/main: ahead 1, behind 1] bob work", bob("branch", "-vv").out)
+        res = bob("pull", "--rebase")
+        self.assertEqual(res.out.splitlines()[-1], "Successfully rebased and updated refs/heads/main.")
+        log = bob("log", "--oneline").out.splitlines()
+        self.assertEqual([_ONELINE.match(line).group(1) for line in log], ["bob work", "alice work", "base"])
+        self.assertNotIn("Merge", bob("log").out)
+        self.assertIn("[origin/main: ahead 1] bob work", bob("branch", "-vv").out)
+        self.assertEqual(bob("status").out.splitlines()[1], "Your branch is ahead of 'origin/main' by 1 commit.")
+        bob("push")
+
+        # no own commits: a fast-forward
+        res = alice("pull", "--rebase")
+        self.assertEqual(res.out.splitlines()[-1], "Fast-forwarded main to origin/main.")
+        self.assertEqual(alice("rev-parse", "HEAD").out, bob("rev-parse", "HEAD").out)
+        self.assertEqual(read(os.path.join(alice_dir, "bob.txt")), b"bob\n")
+
+        # a dirty tree is refused with rebase's message, before anything is fetched
+        write(os.path.join(alice_dir, "a.txt"), "alice\n")
+        alice("commit", "-a", "-m", "alice a")
+        alice("push")
+        write(os.path.join(bob_dir, "scratch.txt"), "s\n")
+        bob("add", "scratch.txt")
+        res = bob("pull", "--rebase", check=False)
+        self.assertEqual(res.returncode, 1, str(res))
+        self.assertIn("error: cannot rebase: your index contains uncommitted changes", res.err)
+        self.assertEqual(bob("rev-parse", "origin/main").out, bob("rev-parse", "HEAD").out)   # no fetch happened
+        bob("rm", "--cached", "scratch.txt")
+        os.unlink(os.path.join(bob_dir, "scratch.txt"))
+
+        # a conflict stops like 'rebase' does; status reports it; --continue finishes it
+        write(os.path.join(bob_dir, "a.txt"), "bob\n")
+        bob("commit", "-a", "-m", "bob a")
+        res = bob("pull", "--rebase", check=False)
+        self.assertEqual(res.returncode, 1, str(res))
+        self.assertIn("main -> origin/main", res.out)
+        self.assertIn("CONFLICT (content): Merge conflict in a.txt\n", res.out)
+        self.assertIn("Could not apply", res.out)
+        self.assertIn('then run "minigit rebase --continue".', res.out)
+        status = bob("status").out
+        self.assertIn("You are currently rebasing branch 'main' on", status)
+        self.assertIn("\tboth modified:   a.txt", status)
+        self.assertIn(b"<<<<<<< HEAD\nalice\n=======\nbob\n>>>>>>> ", read(os.path.join(bob_dir, "a.txt")))
+        res = bob("pull", "--rebase", check=False)
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("error: rebase in progress; finish it first", res.err)
+        write(os.path.join(bob_dir, "a.txt"), "both\n")
+        bob("add", "a.txt")
+        res = bob("rebase", "--continue")
+        self.assertEqual(res.out.splitlines()[-1], "Successfully rebased and updated refs/heads/main.")
+        self.assertEqual(bob("status").out.splitlines()[1], "Your branch is ahead of 'origin/main' by 1 commit.")
+        bob("push")
+        log = bob("log", "--oneline").out.splitlines()
+        self.assertEqual([_ONELINE.match(line).group(1) for line in log],
+                         ["bob a", "alice a", "bob work", "alice work", "base"])
+
+        # --no-rebase (the default) still merges
+        write(os.path.join(alice_dir, "alice2.txt"), "2\n")
+        alice("add", ".")
+        alice("commit", "-m", "alice two")
+        res = alice("pull", "--no-rebase")
+        self.assertIn("Merge made by the 'three-way' strategy.", res.out)
+        self.assertEqual(alice("cat-file", "-p", "HEAD").out.count("parent "), 2)
+
+    def test_status_and_branch_report_a_gone_upstream(self):
+        alice, alice_dir = self.user("alice")
+        write(os.path.join(alice_dir, "a.txt"), "a\n")
+        alice("add", ".")
+        alice("commit", "-m", "base")
+        alice("push", "-u")
+        alice("push", "origin", "main:feature")
+        bob, bob_dir = self.user("bob")
+        bob("switch", "feature")
+        alice("push", "--delete", "origin", "feature")
+        bob("fetch")
+        self.assertEqual(bob("status").out,
+                         "On branch feature\n"
+                         "Your branch is based on 'origin/feature', but the upstream is gone.\n"
+                         '  (use "minigit branch --unset-upstream" to fixup)\n'
+                         "\nnothing to commit, working tree clean\n")
+        self.assertEqual(bob("status", "--porcelain").out, "")
+        sha = bob("rev-parse", "--short", "HEAD").out.strip()
+        self.assertEqual(bob("branch", "-vv").out,
+                         f"* feature {sha} [origin/feature: gone] base\n  main    {sha} [origin/main] base\n")
+        res = bob("branch", "-u", "origin/nosuch", check=False)
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("error: the requested upstream branch 'origin/nosuch' does not exist", res.err)
+        self.assertEqual(bob("branch", "--unset-upstream").out, "")
+        self.assertEqual(bob("status").out, "On branch feature\nnothing to commit, working tree clean\n")
+        res = bob("branch", "--unset-upstream", check=False)
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("error: branch 'feature' has no upstream information", res.err)
+        self.assertEqual(bob("branch", "-u", "origin/main").out, "branch 'feature' set up to track 'origin/main'.\n")
+        self.assertEqual(bob("config", "branch.feature.merge").out.strip(), "refs/heads/main")
+        self.assertEqual(bob("branch", "-vv").out,
+                         f"* feature {sha} [origin/main] base\n  main    {sha} [origin/main] base\n")
 
 
 if __name__ == "__main__":  # pragma: no cover

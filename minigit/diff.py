@@ -326,7 +326,210 @@ def diff_flats(repo, old: FlatTree, new: FlatTree, *, new_from_worktree: bool = 
     return _render(repo, old, new, new_from_worktree, pathspecs, ())
 
 
-def diff_command(repo, cwd: str, *, staged: bool, revs: Sequence[str], pathspecs: Sequence[str]) -> bytes:
+# --------------------------------------------------------------------------- --stat
+
+@dataclass
+class FileStat:
+    """One ``--stat`` line. ``added``/``deleted`` count lines, or bytes (new/old size) for a binary file."""
+    name: str                    # the path, or ``dir/{old => new}`` for an exact rename
+    added: int
+    deleted: int
+    binary: bool = False
+    unmerged: bool = False
+
+
+def _rename_name(a: str, b: str) -> str:
+    """git's rename label: ``dir/{old => new}.txt``, ``{a => b}/x``, or ``old => new``."""
+    pfx = 0
+    i = 0
+    while i < len(a) and i < len(b) and a[i] == b[i]:
+        if a[i] == "/":
+            pfx = i + 1
+        i += 1
+    sfx = 0
+    ia, ib = len(a) - 1, len(b) - 1
+    low = pfx - (1 if pfx else 0)
+    while ia >= low and ib >= low and a[ia] == b[ib]:
+        if a[ia] == "/":
+            sfx = len(a) - ia
+        ia -= 1
+        ib -= 1
+    if not pfx and not sfx:
+        return f"{a} => {b}"
+    a_mid = max(0, len(a) - pfx - sfx)
+    b_mid = max(0, len(b) - pfx - sfx)
+    return f"{a[:pfx]}{{{a[pfx:pfx + a_mid]} => {b[pfx:pfx + b_mid]}}}{a[len(a) - sfx:]}"
+
+
+def _exact_renames(old: FlatTree, new: FlatTree, paths: Sequence[str]) -> dict[str, str]:
+    """new path -> old path for deleted/added pairs with the same blob (git's exact rename detection)."""
+    added: dict[str, list[str]] = {}
+    deleted: dict[str, list[str]] = {}
+    for p in paths:
+        if p not in old:
+            added.setdefault(new[p][1], []).append(p)
+        elif p not in new:
+            deleted.setdefault(old[p][1], []).append(p)
+    out: dict[str, str] = {}
+    for sha, news in added.items():
+        for n, o in zip(news, deleted.get(sha, ())):
+            out[n] = o
+    return out
+
+
+def count_changes(a: bytes, b: bytes) -> tuple[int, int]:
+    """``(insertions, deletions)`` between two text blobs."""
+    added = deleted = 0
+    for tag, a1, a2, b1, b2 in _opcodes(split_lines(a), split_lines(b)):
+        if tag != "equal":
+            deleted += a2 - a1
+            added += b2 - b1
+    return added, deleted
+
+
+def file_stats(repo, old: FlatTree, new: FlatTree, *, new_from_worktree: bool = False,
+               pathspecs: Sequence[str] = (), unmerged: Sequence[str] = ()) -> list[FileStat]:
+    """Per-file counts between two flat trees, in path order (an exact rename sits at its new path)."""
+    unmerged_set = {p for p in unmerged if _matches(p, pathspecs)}
+    paths = [p for p in changed_paths(old, new, pathspecs) if p not in unmerged_set]
+    renames = _exact_renames(old, new, paths)
+    sources = set(renames.values())
+    stats: list[FileStat] = []
+    for p in sorted(set(paths) | unmerged_set):
+        if p in unmerged_set:
+            stats.append(FileStat(p, 0, 0, unmerged=True))
+            continue
+        if p in sources:
+            continue
+        if p in renames:
+            stats.append(FileStat(_rename_name(renames[p], p), 0, 0))
+            continue
+        o, n = old.get(p), new.get(p)
+        if o is not None and n is not None and o[1] == n[1]:
+            stats.append(FileStat(p, 0, 0))  # mode-only change
+            continue
+        a = _version(repo, o, p, False).data if o is not None else b""
+        b = _version(repo, n, p, new_from_worktree).data if n is not None else b""
+        if is_binary(a) or is_binary(b):
+            stats.append(FileStat(p, len(b), len(a), binary=True))
+            continue
+        added, deleted = count_changes(a, b)
+        stats.append(FileStat(p, added, deleted))
+    return stats
+
+
+def format_shortstat(files: int, insertions: int, deletions: int) -> str:
+    """git's summary line: `` 2 files changed, 3 insertions(+), 1 deletion(-)``."""
+    out = f" {files} file changed" if files == 1 else f" {files} files changed"
+    if insertions or not deletions:
+        out += f", {insertions} insertion(+)" if insertions == 1 else f", {insertions} insertions(+)"
+    if deletions or not insertions:
+        out += f", {deletions} deletion(-)" if deletions == 1 else f", {deletions} deletions(-)"
+    return out
+
+
+def _scale(it: int, width: int, max_change: int) -> int:
+    if not it:
+        return 0
+    return 1 + it * (width - 1) // max_change
+
+
+def format_diffstat(stats: Sequence[FileStat], width: int = 80) -> str:
+    """git's ``--stat`` block (per-file lines and the summary), ``""`` when nothing changed.
+
+    Same layout rules as git for an 80-column terminal: the name column is as wide as the
+    longest name, the bar is scaled so a line fits in ``width``, and a too-long name is cut at
+    a directory boundary and prefixed with ``...``.
+    """
+    if not stats:
+        return ""
+    max_len = max(len(s.name) for s in stats)
+    max_change = 0
+    bin_width = 0
+    number_width = 0
+    for s in stats:
+        if s.unmerged:
+            bin_width = max(bin_width, 8)
+        elif s.binary:
+            bin_width = max(bin_width, 14 + len(str(s.added)) + len(str(s.deleted)))
+            number_width = 3
+        else:
+            max_change = max(max_change, s.added + s.deleted)
+    number_width = max(number_width, len(str(max_change)))
+    width = max(width, 16 + 6 + number_width)
+    graph_width = max_change if max_change + 4 > bin_width else bin_width - 4
+    name_width = max_len
+    if name_width + number_width + 6 + graph_width > width:
+        if graph_width > width * 3 // 8 - number_width - 6:
+            graph_width = max(6, width * 3 // 8 - number_width - 6)
+        if name_width > width - number_width - 6 - graph_width:
+            name_width = width - number_width - 6 - graph_width
+        else:
+            graph_width = width - number_width - 6 - name_width
+    lines: list[str] = []
+    files = insertions = deletions = 0
+    for s in stats:
+        files += 1
+        name = s.name
+        prefix = ""
+        room = name_width
+        if len(name) > name_width:
+            prefix = "..."
+            room -= 3
+            name = name[len(name) - room:]
+            slash = name.find("/")
+            if slash >= 0:
+                name = name[slash:]
+        label = f" {prefix}{name}{' ' * max(0, room - len(name))} | "
+        if s.unmerged:
+            lines.append(label + "Unmerged".rjust(number_width) + "\n")
+            continue
+        if s.binary:
+            line = label + "Bin".rjust(number_width)
+            if s.added or s.deleted:
+                line += f" {s.deleted} -> {s.added} bytes"
+            lines.append(line + "\n")
+            continue
+        insertions += s.added
+        deletions += s.deleted
+        add, delete = s.added, s.deleted
+        if graph_width <= max_change:
+            total = _scale(add + delete, graph_width, max_change)
+            if total < 2 and add and delete:
+                total = 2
+            if add < delete:
+                add = _scale(add, graph_width, max_change)
+                delete = total - add
+            else:
+                delete = _scale(delete, graph_width, max_change)
+                add = total - delete
+        n = s.added + s.deleted
+        lines.append(label + str(n).rjust(number_width) + (" " if n else "") + "+" * add + "-" * delete + "\n")
+    lines.append(format_shortstat(files, insertions, deletions) + "\n")
+    return "".join(lines)
+
+
+def diffstat(repo, old: FlatTree, new: FlatTree, *, new_from_worktree: bool = False,
+             pathspecs: Sequence[str] = (), unmerged: Sequence[str] = ()) -> bytes:
+    """The ``--stat`` block for two flat trees (see ``format_diffstat``), as UTF-8 bytes."""
+    stats = file_stats(repo, old, new, new_from_worktree=new_from_worktree, pathspecs=pathspecs,
+                       unmerged=unmerged)
+    return format_diffstat(stats).encode("utf-8", "surrogateescape")
+
+
+def diff_command(repo, cwd: str, *, staged: bool, revs: Sequence[str], pathspecs: Sequence[str],
+                 stat: bool = False) -> bytes:
+    """The patch (or, with ``stat``, the diffstat) for one of the ``diff`` forms of SPEC section 6."""
+    old, new, from_worktree, specs, unmerged = _diff_sides(repo, cwd, staged=staged, revs=revs,
+                                                           pathspecs=pathspecs)
+    if stat:
+        return diffstat(repo, old, new, new_from_worktree=from_worktree, pathspecs=specs, unmerged=unmerged)
+    return _render(repo, old, new, from_worktree, specs, unmerged)
+
+
+def _diff_sides(repo, cwd: str, *, staged: bool, revs: Sequence[str],
+                pathspecs: Sequence[str]) -> tuple[FlatTree, FlatTree, bool, list[str], list[str]]:
+    """``(old, new, new_from_worktree, repo-relative pathspecs, unmerged paths)`` for a diff form."""
     from minigit.index import read_index
     from minigit.revparse import resolve_rev
     from minigit.trees import commit_flat
@@ -346,7 +549,7 @@ def diff_command(repo, cwd: str, *, staged: bool, revs: Sequence[str], pathspecs
     if len(revs) == 2:
         old = commit_flat(store, resolve_rev(repo, revs[0]))
         new = commit_flat(store, resolve_rev(repo, revs[1]))
-        return diff_flats(repo, old, new, pathspecs=specs)
+        return old, new, False, specs, []
 
     repo.require_worktree()
     index = read_index(repo)
@@ -354,7 +557,7 @@ def diff_command(repo, cwd: str, *, staged: bool, revs: Sequence[str], pathspecs
     staged_flat = index.flat()
     if staged:
         old = commit_flat(store, resolve_rev(repo, revs[0])) if revs else repo.head_flat()
-        return _render(repo, old, staged_flat, False, specs, unmerged)
+        return old, staged_flat, False, specs, unmerged
     if revs:
         old = commit_flat(store, resolve_rev(repo, revs[0]))
         paths = set(old) | set(staged_flat)
@@ -368,4 +571,4 @@ def diff_command(repo, cwd: str, *, staged: bool, revs: Sequence[str], pathspecs
         e = worktree_entry(repo, index, p, head_mode=old[p][0] if p in old else None)
         if e is not None:
             new[p] = e
-    return _render(repo, old, new, True, specs, unmerged)
+    return old, new, True, specs, unmerged

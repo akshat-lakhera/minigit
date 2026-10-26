@@ -704,7 +704,7 @@ class EntryPointTests(CliCase):
         self.env = make_env(self.tmp)
 
     def test_help_version_and_exit_codes(self):
-        self.assertEqual(self.mg(self.tmp, "--version").out, "minigit 0.1.0\n")
+        self.assertEqual(self.mg(self.tmp, "--version").out, "minigit 0.2.0\n")
         res = self.mg(self.tmp, "--help")
         for command in ("init", "add", "commit", "merge", "clone", "push", "pull", "serve"):
             self.assertIn(command, res.out)
@@ -747,11 +747,11 @@ class EntryPointTests(CliCase):
 
         proc = subprocess.run([sys.executable, script, "--version"], cwd=work, env=env,
                               capture_output=True, timeout=60)
-        self.assertEqual((proc.returncode, proc.stdout.strip()), (0, b"minigit 0.1.0"), proc)
+        self.assertEqual((proc.returncode, proc.stdout.strip()), (0, b"minigit 0.2.0"), proc)
         if os.name == "nt" and not shutil.which("cmd"):  # pragma: no cover
             self.skipTest("cmd.exe is not available")
         proc = via_script("--version")
-        self.assertEqual((proc.returncode, proc.stdout.strip()), (0, b"minigit 0.1.0"), proc)
+        self.assertEqual((proc.returncode, proc.stdout.strip()), (0, b"minigit 0.2.0"), proc)
 
         self.assertEqual(via_script("init").returncode, 0)
         write(os.path.join(work, "a.txt"), "via the entry script\n")

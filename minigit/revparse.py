@@ -1,9 +1,10 @@
 """minigit.revparse -- owner: M1 core. See SPEC.md section 8 for the public API.
 
 Revision syntax (SPEC section 5): ``HEAD``, ``@``, ``ORIG_HEAD``, ``MERGE_HEAD``,
-a full sha, a ref name (``refs/x``, then ``refs/heads/x``, then
-``refs/remotes/x``), a hex prefix of >= 4 characters; suffixes ``~N``, ``^``,
-``^N`` applied left to right; and ``rev:path`` for a blob or tree.
+a full sha, a ref name (``refs/x``, then ``refs/tags/x``, then ``refs/heads/x``,
+then ``refs/remotes/x``), a hex prefix of >= 4 characters; suffixes ``~N``,
+``^``, ``^N`` applied left to right; and ``rev:path`` for a blob or tree.
+An annotated tag is peeled to the commit it names wherever a commit is required.
 """
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ from __future__ import annotations
 import re
 
 from .errors import ObjectError, RevisionError
-from .objects import parse_commit, parse_tree
+from .objects import parse_commit, parse_tree, peel
 from .refs import is_hex_sha
 from .repo import Repository
 
@@ -35,6 +36,7 @@ def resolve_ref(repo: Repository, name: str) -> str | None:
     candidates = []
     if name.startswith("refs/"):
         candidates.append(name)
+    candidates.append("refs/tags/" + name)  # git's order: tags shadow branches of the same name
     candidates.append("refs/heads/" + name)
     candidates.append("refs/remotes/" + name)
     for ref in candidates:
@@ -77,11 +79,25 @@ def _resolve_base(repo: Repository, base: str, spec: str) -> str:
     raise _unknown(spec)
 
 
+def peel_to_commit(repo: Repository, sha: str, label: str) -> str:
+    """``sha`` itself, or the commit an annotated tag (chain) names; ``RevisionError`` otherwise."""
+    try:
+        obj_type, peeled = peel(repo.objects, sha)
+    except ObjectError as e:
+        raise RevisionError(e.message) from None
+    if obj_type != "commit":
+        raise RevisionError("'%s' is not a commit" % label)
+    return peeled
+
+
 def _commit_of(repo: Repository, sha: str, label: str):
     try:
         obj_type, data = repo.objects.read(sha)
     except ObjectError:
         raise _unknown(label) from None
+    if obj_type == "tag":
+        sha = peel_to_commit(repo, sha, label)
+        obj_type, data = repo.objects.read(sha)
     if obj_type != "commit":
         raise RevisionError("'%s' is not a commit" % label)
     return parse_commit(data)
@@ -90,6 +106,7 @@ def _commit_of(repo: Repository, sha: str, label: str):
 def _apply_suffixes(repo: Repository, sha: str, base: str, suffix: str, spec: str) -> str:
     pos = 0
     label = base
+    sha = peel_to_commit(repo, sha, label)  # as in git, "v1~0" and "v1^0" name the tagged commit
     while pos < len(suffix):
         m = _SUFFIX_RE.match(suffix, pos)
         if not m:
@@ -118,6 +135,9 @@ def _apply_suffixes(repo: Repository, sha: str, base: str, suffix: str, spec: st
 
 def _resolve_path(repo: Repository, commitish: str, rev_label: str, path: str) -> str:
     obj_type, data = repo.objects.read(commitish)
+    if obj_type == "tag":
+        commitish = peel_to_commit(repo, commitish, rev_label)
+        obj_type, data = repo.objects.read(commitish)
     if obj_type == "commit":
         tree = parse_commit(data).tree
     elif obj_type == "tree":
@@ -143,7 +163,11 @@ def _resolve_path(repo: Repository, commitish: str, rev_label: str, path: str) -
 
 
 def resolve_object(repo: Repository, spec: str) -> str:
-    """Resolve ``spec`` to any object sha (blob, tree or commit), including ``rev:path``."""
+    """Resolve ``spec`` to any object sha (blob, tree, commit or tag), including ``rev:path``.
+
+    An annotated tag resolves to the tag object itself (as ``git rev-parse v1`` does);
+    ``resolve_rev`` peels it.
+    """
     if not isinstance(spec, str) or spec == "":
         raise _unknown(spec)
     path: str | None = None
@@ -169,12 +193,5 @@ def resolve_object(repo: Repository, spec: str) -> str:
 
 
 def resolve_rev(repo: Repository, spec: str) -> str:
-    """Resolve ``spec`` and require a commit."""
-    sha = resolve_object(repo, spec)
-    try:
-        obj_type, _ = repo.objects.read(sha)
-    except ObjectError as e:
-        raise RevisionError(e.message) from None
-    if obj_type != "commit":
-        raise RevisionError("'%s' is not a commit" % spec)
-    return sha
+    """Resolve ``spec`` and require a commit (an annotated tag is peeled to its commit)."""
+    return peel_to_commit(repo, resolve_object(repo, spec), spec)

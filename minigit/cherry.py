@@ -19,8 +19,11 @@ def _m(name: str):
 
 def add_parser(subparsers) -> None:
     """Register ``cherry-pick`` and ``revert`` on the CLI's subparsers action."""
+    range_help = ("a commit, or a range A..B (the commits reachable from B but not from A, applied oldest "
+                  "first; A^..B includes A); several may be mixed and are applied in order")
     help_ = "Apply the change of an existing commit on top of HEAD"
-    s = subparsers.add_parser("cherry-pick", help=help_, description=help_ + " (several revisions: in order)")
+    s = subparsers.add_parser("cherry-pick", help=help_,
+                              description=help_ + " (several revisions or A..B ranges: in order)")
     s.add_argument("-n", "--no-commit", dest="no_commit", action="store_true",
                    help="apply to the index and working tree, do not commit")
     s.add_argument("-x", dest="record_origin", action="store_true",
@@ -32,10 +35,11 @@ def add_parser(subparsers) -> None:
     s.add_argument("--continue", dest="continue_", action="store_true",
                    help="commit the resolved conflicts and go on")
     s.add_argument("--abort", action="store_true", help="cancel and restore the pre-operation state")
-    s.add_argument("revs", nargs="*", metavar="rev", help="commit(s) to apply")
+    s.add_argument("revs", nargs="*", metavar="rev", help="what to apply: " + range_help)
 
     help_ = "Record a new commit that undoes an existing commit"
-    s = subparsers.add_parser("revert", help=help_, description=help_ + " (several revisions: in order)")
+    s = subparsers.add_parser("revert", help=help_,
+                              description=help_ + " (several revisions or A..B ranges: in order)")
     s.add_argument("-n", "--no-commit", dest="no_commit", action="store_true",
                    help="apply to the index and working tree, do not commit")
     s.add_argument("-m", "--mainline", type=int, default=None, metavar="N",
@@ -43,7 +47,7 @@ def add_parser(subparsers) -> None:
     s.add_argument("--continue", dest="continue_", action="store_true",
                    help="commit the resolved conflicts and go on")
     s.add_argument("--abort", action="store_true", help="cancel and restore the pre-operation state")
-    s.add_argument("revs", nargs="*", metavar="rev", help="commit(s) to revert")
+    s.add_argument("revs", nargs="*", metavar="rev", help="what to revert: " + range_help)
 
 
 def _say(lines) -> None:

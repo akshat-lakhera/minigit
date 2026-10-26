@@ -7,6 +7,7 @@ date/timezone formatting. All file I/O here is binary.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import os
 import random
@@ -196,19 +197,10 @@ def is_binary(data: bytes) -> bool:
 
 def split_lines(data: bytes) -> list[bytes]:
     """Split on ``b"\\n"`` only, keeping line ends. ``b""`` gives ``[]``."""
-    if not data:
-        return []
-    out: list[bytes] = []
-    start = 0
-    n = len(data)
-    while start < n:
-        i = data.find(b"\n", start)
-        if i < 0:
-            out.append(data[start:])
-            break
-        out.append(data[start : i + 1])
-        start = i + 1
-    return out
+    return _LINE_RE.findall(data)
+
+
+_LINE_RE = re.compile(rb"[^\n]*\n|[^\n]+")   # a line with its "\n", or the unterminated last line
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +222,13 @@ def validate_name(name: str) -> None:
     """
     if not isinstance(name, str) or name == "":
         raise ObjectError("invalid tree entry name: empty")
+    _validate_name(name)
+
+
+@functools.lru_cache(maxsize=4096)
+def _validate_name(name: str) -> None:
+    """``validate_name`` for a non-empty str; valid names are remembered (the same names recur in
+    every tree of a history), invalid ones raise every time."""
     if name in (".", ".."):
         raise ObjectError("invalid tree entry name '%s'" % name)
     folded = name.rstrip(". ").lower()

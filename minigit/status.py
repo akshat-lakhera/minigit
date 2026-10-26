@@ -47,6 +47,7 @@ class StatusResult:
     cherry_picking: str | None = None   # sha from CHERRY_PICK_HEAD
     reverting: str | None = None        # sha from REVERT_HEAD
     rebasing: tuple[str | None, str] | None = None   # (branch or None if detached, onto sha) during a rebase
+    upstream_gone: bool = False         # branch.<b>.remote/merge are set but the tracking ref no longer exists
 
     def is_clean(self) -> bool:
         return not self.entries
@@ -83,12 +84,15 @@ def compute_status(repo) -> StatusResult:
     detached = branch is None
     unborn = head is None
     upstream = None
+    upstream_gone = False
     ahead = behind = 0
     if branch is not None:
         up = upstream_of(repo, branch)
-        if up is not None and up[1] is not None:
+        if up is not None:
             upstream = short_ref(up[0])
-            if head is not None:
+            if up[1] is None:
+                upstream_gone = True
+            elif head is not None:
                 ahead, behind = ahead_behind(repo.objects, head, up[1])
             else:
                 behind = len(ancestors(repo.objects, [up[1]]))
@@ -134,7 +138,7 @@ def compute_status(repo) -> StatusResult:
     from minigit.rebase import status_info
 
     return StatusResult(branch, head, detached, unborn, upstream, ahead, behind, merging, entries,
-                        repo.cherry_pick_head(), repo.revert_head(), status_info(repo))
+                        repo.cherry_pick_head(), repo.revert_head(), status_info(repo), upstream_gone)
 
 
 def _plural(n: int) -> str:
@@ -153,7 +157,10 @@ def format_status_long(st: StatusResult) -> str:
         lines.append("")
         lines.append("No commits yet")
     if st.upstream is not None and not st.detached:
-        if st.ahead and st.behind:
+        if st.upstream_gone:
+            lines.append(f"Your branch is based on '{st.upstream}', but the upstream is gone.")
+            lines.append('  (use "minigit branch --unset-upstream" to fixup)')
+        elif st.ahead and st.behind:
             lines.append(f"Your branch and '{st.upstream}' have diverged,")
             lines.append(f"and have {st.ahead} and {st.behind} different commits each, respectively.")
         elif st.ahead:

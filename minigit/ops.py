@@ -73,14 +73,25 @@ def _in_gitdir(rel: str) -> bool:
     return any(part.lower() == ".minigit" for part in rel.split("/"))
 
 
-def add(repo: Repository, pathspecs: Sequence[str], cwd: str, *, force: bool = False) -> list[str]:
+def add(repo: Repository, pathspecs: Sequence[str], cwd: str, *, force: bool = False,
+        all_: bool = False, update: bool = False) -> list[str]:
+    """Stage ``pathspecs``; returns the staged / removed paths.
+
+    ``all_`` (``-A``): with no pathspec, the whole work tree from the repository root (new, modified
+    and deleted files), whatever ``cwd`` is.  ``update`` (``-u``): only tracked files (modified or
+    deleted), never new ones; with no pathspec the whole tree, else the tracked files under them.
+    """
     from minigit.ignore import IgnoreMatcher
     from minigit.index import locked_index
     from minigit.worktree import canonical_path, normalize_rel, scan_files, stage_file, worktree_entry
 
     repo.require_worktree()
+    if all_ and update:
+        raise UsageError("add: -A and -u cannot be used together")
     if not pathspecs:
-        raise UsageError("nothing specified, nothing added (use 'minigit add <pathspec>')")
+        if not (all_ or update):
+            raise UsageError("nothing specified, nothing added (use 'minigit add <pathspec>')")
+        pathspecs, cwd = ["."], repo.worktree   # the whole tree, from the root
     ignore = IgnoreMatcher(repo.worktree)
     affected: set[str] = set()
     head_flat: FlatTree | None = None
@@ -119,7 +130,17 @@ def add(repo: Repository, pathspecs: Sequence[str], cwd: str, *, force: bool = F
                 raise MinigitError(f"invalid path '{rel}': the .minigit directory cannot be added")
             absp = repo.abspath(rel) if rel else repo.worktree
             tracked = [p for p in index.paths() if _under(p, rel)]
-            if rel == "" or os.path.isdir(absp):
+            if update:
+                # -u: tracked files only; a new file is never staged
+                if not tracked and rel != "":
+                    raise MinigitError(f"pathspec '{spec}' did not match any files")
+                for p in tracked:
+                    if os.path.isfile(repo.abspath(p)):
+                        stage_if_changed(p)
+                    else:
+                        index.remove(p)
+                        affected.add(p)
+            elif rel == "" or os.path.isdir(absp):
                 if rel and not force and not tracked and ignore.is_ignored(rel, is_dir=True):
                     raise MinigitError(f"path '{rel}' is ignored by .minigitignore (use -f)")
                 # As in git, -f also stages the ignored files below a named directory.
@@ -224,13 +245,33 @@ def _nothing_to_commit_message(repo: Repository, all_: bool) -> str:
     return "nothing to commit, working tree clean"
 
 
+def _check_amend(repo: Repository) -> Commit:
+    """The HEAD commit that ``--amend`` replaces; refuses on an unborn HEAD and during an operation."""
+    head = repo.head_commit()
+    if head is None:
+        raise MinigitError("you have nothing to amend")
+    op = repo.operation_in_progress()
+    if op is not None:
+        kind = op[0]
+        hint = ("finish it with 'minigit rebase --continue' or run 'minigit rebase --abort'" if kind == "rebase"
+                else f"commit the result, or run 'minigit {kind} --abort'")
+        raise MinigitError(f"you cannot amend during a {kind}", hint=hint)
+    return repo.read_commit(head)
+
+
 def commit(repo: Repository, messages: Sequence[str], *, all_: bool = False,
-           allow_empty: bool = False, stat: bool = False) -> tuple[str, str]:
-    """Commit the index; returns (sha, summary). ``stat`` adds the ``commit`` command's second line."""
+           allow_empty: bool = False, stat: bool = False, amend: bool = False) -> tuple[str, str]:
+    """Commit the index; returns (sha, summary). ``stat`` adds the ``commit`` command's second line.
+
+    ``amend`` replaces the HEAD commit: same parents, the index as tree, the original author and a
+    new committer; the message is the ``-m`` values or else the old message. The old HEAD goes to
+    ``ORIG_HEAD``. As in git, an amend that changes nothing is allowed without ``--allow-empty``.
+    """
     from minigit.index import locked_index
     from minigit.worktree import stage_file, worktree_entry
 
     repo.require_worktree()
+    old: Commit | None = _check_amend(repo) if amend else None
     with locked_index(repo) as index:
         if all_:
             for p, entry in sorted(index.flat().items()):
@@ -245,15 +286,20 @@ def commit(repo: Repository, messages: Sequence[str], *, all_: bool = False,
         tree = build_tree(repo.objects, index.flat())
         head = repo.head_commit()
         merge_head = repo.merge_head()
-        parents = [head] if head else []
-        if merge_head:
-            parents.append(merge_head)
-        if merge_head is None and not allow_empty:
+        if old is not None:
+            parents = list(old.parents)          # the amended commit keeps its parents
+        else:
+            parents = [head] if head else []
+            if merge_head:
+                parents.append(merge_head)
+        if merge_head is None and not allow_empty and old is None:
             parent_tree = commit_tree_sha(repo.objects, head) if head else EMPTY_TREE
             if tree == parent_tree:
                 raise NothingToCommit(_nothing_to_commit_message(repo, all_))
         if messages:
             message = "\n\n".join(messages)
+        elif old is not None:
+            message = old.message
         else:
             state_msg = _merge_msg_from_state(repo)
             if state_msg is None:
@@ -264,8 +310,13 @@ def commit(repo: Repository, messages: Sequence[str], *, all_: bool = False,
             raise MinigitError("aborting commit due to empty commit message")
         # identity errors surface here, before any object is written
         pick = repo.cherry_pick_head()   # a finished cherry-pick keeps the picked commit's author
-        sha = create_commit(repo, tree, parents, message,
-                            author=repo.read_commit(pick).author if pick else None)
+        if old is not None:
+            author = old.author              # an amend keeps the original author (name, email, date)
+        else:
+            author = repo.read_commit(pick).author if pick else None
+        sha = create_commit(repo, tree, parents, message, author=author)
+        if old is not None:
+            repo.refs.write_special("ORIG_HEAD", head)
         repo.refs.update_head(sha, expected=head)
         repo.clear_operation_state()
         new_flat = index.flat()
@@ -277,55 +328,26 @@ def commit(repo: Repository, messages: Sequence[str], *, all_: bool = False,
         prefix = f"[{branch} (root-commit) {_abbrev(sha)}]"
     else:
         prefix = f"[{branch} {_abbrev(sha)}]"
-    # like git, a merge commit (or a commit that changes nothing) gets no stat line
-    line = _shortstat(repo, commit_flat(repo.objects, head), new_flat) if stat and len(parents) < 2 else None
+    # like git, a merge commit (or a commit that changes nothing) gets no stat line; an amend is
+    # compared with the (kept) parent, like the commit it replaces
+    base = parents[0] if (old is not None and parents) else (None if old is not None else head)
+    line = _shortstat(repo, commit_flat(repo.objects, base), new_flat) if stat and len(parents) < 2 else None
     return sha, f"{prefix} {subject}" + (f"\n{line}" if line else "")
 
 
 def _shortstat(repo: Repository, old: dict, new: dict) -> str | None:
     """git's ' N files changed, X insertions(+), Y deletions(-)' between two flat trees, or None.
 
-    Exact renames (a deleted and an added path with the same blob) count as one file with no
-    lines, as with git's rename detection; binary files count as changed with no lines.
+    The counting lives in ``diff.file_stats`` (shared with ``--stat``): exact renames count as one
+    file with no lines, as with git's rename detection; binary files count as changed with no lines.
     """
-    from minigit.diff import _opcodes
-    from minigit.util import is_binary, split_lines
+    from minigit.diff import file_stats, format_shortstat
 
-    paths = sorted(p for p in set(old) | set(new) if old.get(p) != new.get(p))
-    if not paths:
+    stats = file_stats(repo, old, new)
+    if not stats:
         return None
-    added: dict[str, list[str]] = {}
-    deleted: dict[str, list[str]] = {}
-    for p in paths:
-        if p not in old:
-            added.setdefault(new[p][1], []).append(p)
-        elif p not in new:
-            deleted.setdefault(old[p][1], []).append(p)
-    files, skip = len(paths), set()
-    for sha, ps in added.items():
-        k = min(len(ps), len(deleted.get(sha, ())))
-        skip.update(ps[:k])
-        skip.update(deleted.get(sha, [])[:k])
-        files -= k
-    insertions = deletions = 0
-    for p in paths:
-        o, n = old.get(p), new.get(p)
-        if p in skip or (o is not None and n is not None and o[1] == n[1]):
-            continue
-        a = repo.objects.read_typed(o[1], "blob") if o is not None else b""
-        b = repo.objects.read_typed(n[1], "blob") if n is not None else b""
-        if is_binary(a) or is_binary(b):
-            continue
-        for tag, a1, a2, b1, b2 in _opcodes(split_lines(a), split_lines(b)):
-            if tag != "equal":
-                deletions += a2 - a1
-                insertions += b2 - b1
-    out = f" {files} file changed" if files == 1 else f" {files} files changed"
-    if insertions or not deletions:
-        out += f", {insertions} insertion(+)" if insertions == 1 else f", {insertions} insertions(+)"
-    if deletions or not insertions:
-        out += f", {deletions} deletion(-)" if deletions == 1 else f", {deletions} deletions(-)"
-    return out
+    return format_shortstat(len(stats), sum(s.added for s in stats if not s.binary),
+                            sum(s.deleted for s in stats if not s.binary))
 
 
 # --------------------------------------------------------------------------- branches
@@ -337,9 +359,31 @@ class BranchInfo:
     current: bool
     remote: bool
     subject: str
+    upstream: str | None = None   # "origin/main" (only filled in by branch_list(upstreams=True))
+    ahead: int = 0
+    behind: int = 0
+    gone: bool = False            # the upstream is configured but its tracking ref does not exist
+
+    def tracking(self) -> str | None:
+        """git's ``-vv`` column: ``[origin/main]``, ``[origin/main: ahead 2, behind 1]``, ``[origin/main: gone]``."""
+        if self.upstream is None:
+            return None
+        if self.gone:
+            state = "gone"
+        else:
+            parts = [f"ahead {self.ahead}"] if self.ahead else []
+            if self.behind:
+                parts.append(f"behind {self.behind}")
+            state = ", ".join(parts)
+        return f"[{self.upstream}: {state}]" if state else f"[{self.upstream}]"
 
 
-def branch_list(repo: Repository, *, remotes: bool = False, all_: bool = False) -> list[BranchInfo]:
+def branch_list(repo: Repository, *, remotes: bool = False, all_: bool = False,
+                upstreams: bool = False) -> list[BranchInfo]:
+    """The branches to list; with ``upstreams`` each local branch also carries its tracking state (``-vv``)."""
+    from minigit.graph import ahead_behind
+    from minigit.status import upstream_of
+
     current = repo.refs.current_branch()
     items: list[BranchInfo] = []
     if not remotes or all_:
@@ -350,7 +394,16 @@ def branch_list(repo: Repository, *, remotes: bool = False, all_: bool = False) 
                                     _subject(repo, head)))
         for name, sha in sorted(repo.refs.list("refs/heads/").items()):
             short = short_ref(name)
-            items.append(BranchInfo(short, sha, short == current, False, _subject(repo, sha)))
+            info = BranchInfo(short, sha, short == current, False, _subject(repo, sha))
+            if upstreams:
+                up = upstream_of(repo, short)
+                if up is not None:
+                    info.upstream = short_ref(up[0])
+                    if up[1] is None:
+                        info.gone = True
+                    else:
+                        info.ahead, info.behind = ahead_behind(repo.objects, sha, up[1])
+            items.append(info)
     if remotes or all_:
         # as in git: 'branch -r' shows origin/main, 'branch -a' shows remotes/origin/main
         prefix = "remotes/" if all_ else ""
@@ -360,6 +413,8 @@ def branch_list(repo: Repository, *, remotes: bool = False, all_: bool = False) 
 
 
 def format_branch_list(items: list[BranchInfo], verbose: bool) -> str:
+    """``-v`` lines; an item with tracking information (``branch_list(upstreams=True)``) gets the
+    ``-vv`` column between the sha and the subject."""
     if not items:
         return ""
     width = max(len(i.name) for i in items) if verbose else 0
@@ -367,7 +422,9 @@ def format_branch_list(items: list[BranchInfo], verbose: bool) -> str:
     for i in items:
         marker = "* " if i.current else "  "
         if verbose:
-            lines.append(f"{marker}{i.name:<{width}} {_abbrev(i.sha)} {i.subject}")
+            tracking = i.tracking()
+            middle = f" {tracking}" if tracking else ""
+            lines.append(f"{marker}{i.name:<{width}} {_abbrev(i.sha)}{middle} {i.subject}")
         else:
             lines.append(f"{marker}{i.name}")
     return "\n".join(lines) + "\n"
@@ -454,6 +511,52 @@ def get_upstream(repo: Repository, branch: str) -> tuple[str, str] | None:
     if not remote or not merge:
         return None
     return remote, merge
+
+
+def _upstream_target(repo: Repository, branch: str | None) -> str:
+    """The branch ``-u``/``--unset-upstream`` act on: BRANCH, else the current one."""
+    if branch is None:
+        branch = repo.refs.current_branch()
+        if branch is None:
+            raise MinigitError("HEAD does not point to a branch")
+    return branch
+
+
+def set_upstream_to(repo: Repository, upstream: str, branch: str | None = None) -> str:
+    """``branch -u REMOTE/BRANCH [BRANCH]``: configure the upstream; the tracking ref must exist.
+
+    ``upstream`` is ``origin/main`` (or ``refs/remotes/origin/main``); a local branch name makes
+    the branch track that branch (remote ``.``). Returns ``branch 'x' set up to track 'origin/main'.``
+    """
+    branch = _upstream_target(repo, branch)
+    if repo.refs.resolve(f"refs/heads/{branch}") is None:
+        raise MinigitError(f"branch '{branch}' not found")
+    spec = upstream[len("refs/remotes/"):] if upstream.startswith("refs/remotes/") else upstream
+    if repo.refs.resolve(f"refs/remotes/{spec}") is not None:
+        # split at a configured remote's name when one matches, else at the first '/'
+        names = sorted(repo.config.subsections("remote"), key=len, reverse=True)
+        remote = next((n for n in names if spec.startswith(n + "/")), None)
+        if remote is None:
+            remote = spec.split("/", 1)[0]
+        set_upstream(repo, branch, remote, f"refs/heads/{spec[len(remote) + 1:]}")
+    elif not upstream.startswith("refs/") and repo.refs.resolve(f"refs/heads/{spec}") is not None:
+        set_upstream(repo, branch, ".", f"refs/heads/{spec}")
+    else:
+        raise MinigitError(f"the requested upstream branch '{spec}' does not exist",
+                           hint="run 'minigit fetch' first, or push the branch with 'minigit push -u'")
+    return f"branch '{branch}' set up to track '{spec}'."
+
+
+def unset_upstream(repo: Repository, branch: str | None = None) -> None:
+    """``branch --unset-upstream [BRANCH]``: drop ``branch.<b>.remote`` and ``branch.<b>.merge``."""
+    branch = _upstream_target(repo, branch)
+    cfg = repo.config
+    if cfg.get(f"branch.{branch}.remote") is None and cfg.get(f"branch.{branch}.merge") is None:
+        raise MinigitError(f"branch '{branch}' has no upstream information")
+    cfg.unset(f"branch.{branch}.remote")
+    cfg.unset(f"branch.{branch}.merge")
+    if not any(k.startswith(f"branch.{branch}.") for k, _v in cfg.items("local")):
+        cfg.remove_section("branch", branch)   # no empty [branch "x"] left behind
 
 
 # --------------------------------------------------------------------------- switch / checkout
@@ -558,7 +661,12 @@ def switch(repo: Repository, target: str | None, *, create: str | None = None, s
     except MinigitError:
         raise MinigitError(f"invalid reference: {target}") from None
     ref = resolve_ref(repo, target)
-    kind = "remote branch" if ref and ref.startswith("refs/remotes/") else "commit"
+    if ref and ref.startswith("refs/remotes/"):
+        kind = "remote branch"
+    elif ref and ref.startswith("refs/tags/"):
+        kind = "tag"
+    else:
+        kind = "commit"
     raise MinigitError(f"a branch is expected, got {kind} '{target}'",
                        hint=f"use 'minigit switch --detach {target}' to look at it with a detached HEAD")
 
