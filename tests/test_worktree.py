@@ -480,7 +480,9 @@ class StageTests(TmpCase):
         self.assertEqual(e.path, "sub/x")
         self.assertEqual(list(ix.flat()), ["sub/x"])
         self.assertEqual(ix.serialize().count(b"sub/x"), 1)
-        self.assertNotIn(b"\\", ix.serialize()[12:-20])
+        # the stored path is the POSIX spelling (the binary sha/mtime fields may contain any byte)
+        self.assertEqual(ix.paths(), ["sub/x"])
+        self.assertNotIn(b"sub\\x", ix.serialize())
 
     def test_stage_file_clears_conflict_stages_and_keeps_mode(self) -> None:
         self.write("c.sh", b"resolved")
