@@ -96,8 +96,15 @@ def _ids_from_state(repo: Repository, name: str) -> list[str]:
 def roots(repo: Repository) -> list[str]:
     """Every object id a prune must keep (duplicates removed, in a stable order)."""
     is_hex_sha = _m("refs").is_hex_sha
-    ids: list[str] = list(repo.refs.list("refs/").values())
-    head = repo.refs.resolve("HEAD")
+    refs = repo.refs.list("refs/")
+    bad = _m("pack")._bad_ref_files(repo, refs)
+    if bad:  # a damaged ref still protects its history: pruning now could delete all of it
+        raise _refuse(bad[0])
+    ids: list[str] = list(refs.values())
+    try:
+        head = repo.refs.resolve("HEAD")
+    except _m("errors").MinigitError as e:
+        raise _refuse(e.message) from None
     if head is not None:
         ids.append(head)
     for name in _SPECIAL_REFS:

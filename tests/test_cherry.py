@@ -106,7 +106,7 @@ class EngineEdgeCaseTests(CherryCase):
         index_before = read_index(self.repo).flat()
         env = {k: v for k, v in os.environ.items() if k not in ("MINIGIT_AUTHOR_NAME", "MINIGIT_AUTHOR_EMAIL")}
         with mock.patch.dict(os.environ, env, clear=True):
-            with self.assertRaisesRegex(MinigitError, "please set your identity"):
+            with self.assertRaisesRegex(MinigitError, "author identity unknown"):
                 cherry.cherry_pick(self.repo, feat)
         self.assertFalse(self.exists("new.txt"))
         self.assertEqual(read_index(self.repo).flat(), index_before)
@@ -237,7 +237,8 @@ class ConflictStateTests(CherryCase):
         self.write("f.txt", b"a\nb\nBOTH\n")
         ops.add(self.repo, ["f.txt"], self.root)
         lines = cherry.continue_(self.repo, "cherry-pick")
-        self.assertEqual(len(lines), 1)
+        self.assertEqual(len([line for line in lines if line.startswith("[")]), 1)
+        self.assertIn(" Author: Other Author <other@example.com>", lines)   # as git: author differs
         c = self.repo.read_commit(self.head())
         self.assertEqual(c.parents, (main,))
         self.assertEqual(c.author.name, "Other Author")
@@ -371,7 +372,7 @@ class SequenceTests(CherryCase):
         self.write("f.txt", b"a\nb\nRESOLVED\n")
         ops.add(self.repo, ["f.txt"], self.root)
         lines = cherry.continue_(self.repo, "cherry-pick")
-        self.assertEqual(len(lines), 2)
+        self.assertEqual(len([line for line in lines if line.startswith("[")]), 2)
         self.assertTrue(self.exists("three.txt"))
         self.assertEqual(self.repo.read_commit(self.head()).message, "three\n")
         self.assertIsNone(self.repo.read_state(cherry.SEQUENCER_FILE))
@@ -437,13 +438,17 @@ class CliSequenceTests(CherryCase):
         self.commit("main edits f", {"f.txt": b"a\nb\nMAIN\n"})
         p = self.run_cli("cherry-pick", c1, c2, c3)
         self.assertEqual(p.returncode, 1, p)
-        self.assertRegex(p.stdout, r"\[main [0-9a-f]{7}\] one\nCONFLICT \(content\): Merge conflict in f.txt\n")
+        self.assertRegex(p.stdout, r"\[main [0-9a-f]{7}\] one\n Date: .*\n 1 file changed, 1 insertion\(\+\)\n"
+                                   r" create mode 100644 one.txt\nAuto-merging f.txt\n"
+                                   r"CONFLICT \(content\): Merge conflict in f.txt\n")
         self.assertIn(f"error: could not apply {c2[:7]}... two", p.stderr)
         self.write("f.txt", b"a\nb\nX\n")
         ops.add(self.repo, ["f.txt"], self.root)
         p = self.run_cli("cherry-pick", "--continue")
         self.assertEqual(p.returncode, 0, p)
-        self.assertRegex(p.stdout, r"^\[main [0-9a-f]{7}\] two\n\[main [0-9a-f]{7}\] three\n$")
+        self.assertRegex(p.stdout, r"^\[main [0-9a-f]{7}\] two\n Date: .*\n 1 file changed, 1 insertion\(\+\), "
+                                   r"1 deletion\(-\)\n\[main [0-9a-f]{7}\] three\n Date: .*\n"
+                                   r" 1 file changed, 1 insertion\(\+\)\n create mode 100644 three.txt\n$")
 
 
 if __name__ == "__main__":  # pragma: no cover

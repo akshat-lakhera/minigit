@@ -147,7 +147,7 @@ def build_fixture(wt: str, env: dict) -> dict:
     run(["commit", "-m", "third"], wt, as_author(env, CAROL, "1700000200 +0530"))
 
     res = run(["merge", "feature"], wt, as_author(env, ALICE, "1700000300 +0000"))
-    assert "three-way" in res.out, str(res)
+    assert "'ort'" in res.out, str(res)
 
     def rev(spec: str) -> str:
         sha = run(["rev-parse", spec], wt, env).out.strip()
@@ -269,7 +269,7 @@ class BlameGrepAcceptance(unittest.TestCase):
         self.assertIn("has only 12 lines", res.err)
         self.assertEqual(res.stdout, b"")
         for bad in ("0,2", "3,2", "x", ",1", "2,+0", "2,+"):
-            res = self.fail_mg("blame", "-L", bad, "a.txt", code=2)
+            res = self.fail_mg("blame", "-L", bad, "a.txt", code=129)
             self.assertIn("-L", res.err, str(res))
 
     def test_blame_suppress_and_email(self):
@@ -383,28 +383,28 @@ class BlameGrepAcceptance(unittest.TestCase):
     # ======================================================================
 
     def test_blame_errors(self):
-        res = self.fail_mg("blame", "missing.txt")
+        res = self.fail_mg("blame", "missing.txt", code=128)   # git: fatal
         self.assertIn("does not exist in 'HEAD'", res.err)
-        res = self.fail_mg("blame", "sub")                 # a directory
+        res = self.fail_mg("blame", "sub", code=128)       # a directory (git: fatal)
         self.assertIn("does not exist in 'HEAD'", res.err)
-        res = self.fail_mg("blame", "HEAD~2", "bin.dat")   # not in that commit
+        res = self.fail_mg("blame", "HEAD~2", "bin.dat", code=128)   # not in that commit
         self.assertIn("does not exist in 'HEAD~2'", res.err)
         res = self.fail_mg("blame", "bin.dat")
         self.assertIn("binary", res.err)
-        res = self.fail_mg("blame", "nosuchrev", "a.txt")
+        res = self.fail_mg("blame", "nosuchrev", "a.txt", code=128)
         self.assertIn("unknown revision", res.err)
         # usage
-        self.fail_mg("blame", code=2)
-        self.fail_mg("blame", "HEAD", "a.txt", "sub/b.txt", code=2)
-        self.fail_mg("blame", "--", "a.txt", "sub/b.txt", code=2)
+        self.fail_mg("blame", code=129)
+        self.fail_mg("blame", "HEAD", "a.txt", "sub/b.txt", code=129)
+        self.fail_mg("blame", "--", "a.txt", "sub/b.txt", code=129)
 
     def test_blame_untracked_and_unborn(self):
         wt = self.copy()
         write(os.path.join(wt, "new.txt"), "x\n")
-        res = self.fail_mg("blame", "new.txt", cwd=wt)
+        res = self.fail_mg("blame", "new.txt", cwd=wt, code=128)   # git: fatal
         self.assertIn("does not exist in 'HEAD'", res.err)
         self.mg("add", "new.txt", cwd=wt)                   # staged but never committed
-        res = self.fail_mg("blame", "new.txt", cwd=wt)
+        res = self.fail_mg("blame", "new.txt", cwd=wt, code=128)   # git: fatal
         self.assertIn("does not exist in 'HEAD'", res.err)
 
         empty = tempfile.mkdtemp(prefix="empty-", dir=self.root)
@@ -483,12 +483,17 @@ class BlameGrepAcceptance(unittest.TestCase):
         self.assertEqual(self.mg("grep", "last").stdout, b"nonl.txt:last\n")
         self.assertEqual(self.mg("grep", "-n", "line").stdout, b"crlf.txt:2:line\r\n")
 
-    def test_grep_paths_are_repo_relative_from_subdirectory(self):
+    def test_grep_from_subdirectory_searches_below_it_with_relative_paths(self):
+        # as git: only the files under the current directory, printed relative to it
         sub = os.path.join(self.fixture, "sub")
-        self.assertEqual(self.mg("grep", "alpha", cwd=sub).lines, ["sub/b.txt:alpha"])
-        self.assertEqual(self.mg("-C", "sub", "grep", "-n", "beta").lines, ["sub/b.txt:2:beta"])
-        # a relative pathspec is resolved against the cwd
-        self.assertEqual(self.mg("grep", "-l", "a", "--", "b.txt", cwd=sub).lines, ["sub/b.txt"])
+        self.assertEqual(self.mg("grep", "alpha", cwd=sub).lines, ["b.txt:alpha"])
+        self.assertEqual(self.mg("-C", "sub", "grep", "-n", "beta").lines, ["b.txt:2:beta"])
+        self.fail_mg("grep", "ONE", cwd=sub, code=1)                       # a.txt is outside sub/
+        # a relative pathspec is resolved against the cwd; '..' reaches the rest of the tree
+        self.assertEqual(self.mg("grep", "-l", "a", "--", "b.txt", cwd=sub).lines, ["b.txt"])
+        self.assertEqual(self.mg("grep", "-l", "ONE", "--", "..", cwd=sub).lines, ["../a.txt"])
+        self.assertEqual(self.mg("grep", "-c", "beta", "HEAD", cwd=sub).lines, ["HEAD:b.txt:1"])
+        self.assertEqual(self.mg("grep", "alpha").lines, ["sub/b.txt:alpha"])  # the top: repo paths
 
     # ======================================================================
     # grep: worktree vs index vs untracked
@@ -537,13 +542,13 @@ class BlameGrepAcceptance(unittest.TestCase):
         self.assertEqual((res.stdout, res.stderr), (b"", b""))
 
     def test_grep_usage_errors(self):
-        self.fail_mg("grep", code=2)
-        res = self.fail_mg("grep", "(", code=2)
+        self.fail_mg("grep", code=129)
+        res = self.fail_mg("grep", "(", code=129)
         self.assertIn("invalid regular expression", res.err)
-        self.fail_mg("grep", "-l", "-c", "two", code=2)
-        self.fail_mg("grep", "--cached", "two", "HEAD", code=2)
-        self.fail_mg("grep", "two", "HEAD", "HEAD~1", code=2)
-        res = self.fail_mg("grep", "two", "nosuchrev")
+        self.fail_mg("grep", "-l", "-c", "two", code=129)
+        self.fail_mg("grep", "--cached", "two", "HEAD", code=129)
+        self.fail_mg("grep", "two", "HEAD", "HEAD~1", code=129)
+        res = self.fail_mg("grep", "two", "nosuchrev", code=128)   # unknown revision: git's fatal
         self.assertIn("unknown revision", res.err)
 
     def test_help_mentions_both_commands(self):

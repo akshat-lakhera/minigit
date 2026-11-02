@@ -18,7 +18,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TIMEOUT = 60
 
 BASE = b"a\nb\nc\n"
-SUMMARY_RE = r"^\[main [0-9a-f]{7}\] "
+SUMMARY_RE = r"(?m)^\[main [0-9a-f]{7}\] "
 
 
 # ---------------------------------------------------------------------------
@@ -324,7 +324,7 @@ class CherryPickCleanTests(SequencerCase):
 
         res = r.run("cherry-pick", "feat")
         self.assertEqual(res.returncode, 0, res)
-        self.assertRegex(res.out.strip(), r"^\[detached HEAD [0-9a-f]{7}\] feat change$")
+        self.assertRegex(res.out.strip(), r"(?m)^\[detached HEAD [0-9a-f]{7}\] feat change$")
         head = r.sha("HEAD")
         self.assertEqual(r.parents(head), [base])
         self.assertEqual(r.read("new.txt"), b"n\n")
@@ -451,20 +451,20 @@ class CherryPickEmptyAndMainlineTests(SequencerCase):
         r = self.repo
         self.seed()
         res = r.run("cherry-pick", "nope", check=False)
-        self.assertEqual(res.returncode, 1, res)
+        self.assertEqual(res.returncode, 128, res)   # git: fatal
         self.assertIn("unknown revision 'nope'", res.err, res)
         res = r.run("cherry-pick", "HEAD:f.txt", check=False)
-        self.assertEqual(res.returncode, 1, res)
+        self.assertEqual(res.returncode, 128, res)
         self.assertIn("'HEAD:f.txt' is not a commit", res.err, res)
 
-    def test_usage_errors_exit_2(self):
+    def test_usage_errors_exit_129(self):
         r = self.repo
         self.seed()
         for args in (["cherry-pick"], ["cherry-pick", "--abort", "HEAD"], ["cherry-pick", "--continue", "HEAD"],
                      ["cherry-pick", "--continue", "--abort"], ["revert"], ["revert", "--abort", "HEAD"],
                      ["cherry-pick", "-m", "x", "HEAD"]):
             res = r.run(*args, check=False)
-            self.assertEqual(res.returncode, 2, res)
+            self.assertEqual(res.returncode, 129, res)
         # --help works and names the options
         helptext = r.run("cherry-pick", "--help").out
         for opt in ("--no-commit", "--continue", "--abort", "--mainline", "--allow-empty", "-x"):
@@ -557,8 +557,8 @@ class CherryPickConflictTests(SequencerCase):
         self.assertEqual(r.porcelain(), ["M  f.txt"])
         res = r.run("commit")                                   # no -m: MERGE_MSG is used
         self.assertEqual(res.returncode, 0, res)
-        self.assertRegex(res.out.strip(), SUMMARY_RE + "feat change\n 1 file changed, 1 insertion\\(\\+\\), "
-                                          "1 deletion\\(-\\)$")
+        self.assertRegex(res.out.strip(), SUMMARY_RE + "feat change\n Author: Feat Author <feat@example.com>\n"
+                                          " 1 file changed, 1 insertion\\(\\+\\), 1 deletion\\(-\\)$")
         self.assertEqual(r.message(), "feat change\n")
         self.assertEqual(r.parents(), [main])
         self.assertEqual(r.header("HEAD", "author"), [f"{FEAT_AUTHOR[0]} <{FEAT_AUTHOR[1]}> {FEAT_AUTHOR[2]}"])
@@ -633,8 +633,8 @@ class CherryPickConflictTests(SequencerCase):
         self.assertEqual(res.returncode, 1, res)
         self.assertIn("cherry-pick in progress", res.err, res)
         res = r.run("reset", "--soft", "HEAD", check=False)
-        self.assertEqual(res.returncode, 1, res)
-        self.assertIn("cannot do a soft reset in the middle of a cherry-pick", res.err, res)
+        self.assertEqual(res.returncode, 128, res)
+        self.assertIn("fatal: Cannot do a soft reset in the middle of a cherry-pick.", res.err, res)
         res = r.run("commit", "-m", "try", check=False)
         self.assertEqual(res.returncode, 1, res)
         self.assertIn("cannot commit: unresolved conflicts in: f.txt", res.err, res)
@@ -763,7 +763,8 @@ class CherryPickConflictTests(SequencerCase):
         # commit without -m takes the prepared message; the author is the current identity
         res = r.run("commit")
         self.assertEqual(res.returncode, 0, res)
-        self.assertRegex(res.out.strip(), SUMMARY_RE + "feat change\n 2 files changed, 2 insertions\\(\\+\\)$")
+        self.assertRegex(res.out.strip(), SUMMARY_RE + "feat change\n( Author: .*\n)? 2 files changed, "
+                                          "2 insertions\\(\\+\\)\n create mode 100644 new.txt$")
         self.assertEqual(r.message(), "feat change\n")
         self.assertEqual(r.parents(), [main])
         self.assertEqual(r.header("HEAD", "author"), ["QA Tester <qa@example.com> 1700000000 +0000"])
@@ -915,8 +916,8 @@ class RevertTests(SequencerCase):
         self.assertEqual(res.returncode, 1, res)
         self.assertIn("revert in progress", res.err, res)
         res = r.run("reset", "--soft", "HEAD", check=False)
-        self.assertEqual(res.returncode, 1, res)
-        self.assertIn("cannot do a soft reset in the middle of a revert", res.err, res)
+        self.assertEqual(res.returncode, 128, res)
+        self.assertIn("fatal: Cannot do a soft reset in the middle of a revert.", res.err, res)
         res = r.run("cherry-pick", "--abort", check=False)
         self.assertEqual(res.returncode, 1, res)
         self.assertIn("there is no cherry-pick to abort (CHERRY_PICK_HEAD missing)", res.err, res)
@@ -982,7 +983,7 @@ class RevertTests(SequencerCase):
         c1, c2, c3 = self.three_commits()
         res = r.run("revert", "-n", c2)
         self.assertEqual(res.returncode, 0, res)
-        self.assertEqual(res.out, "", res)
+        self.assertEqual(res.out, "Auto-merging f.txt\n", res)   # as git: no commit, no summary
         self.assertEqual(r.sha("HEAD"), c3)
         self.assertEqual(sorted(r.porcelain()), ["D  n.txt", "M  f.txt"])
         self.assertEqual(r.read("f.txt"), b"1\n2\n3\n4\nFIVE\n")
@@ -1057,7 +1058,7 @@ class RevertTests(SequencerCase):
         r.run("checkout", c3)
         res = r.run("revert", c2[:7])
         self.assertEqual(res.returncode, 0, res)
-        self.assertRegex(res.out.strip(), r'^\[detached HEAD [0-9a-f]{7}\] Revert "c2 edits line one and adds n"$')
+        self.assertRegex(res.out.strip(), r'(?m)^\[detached HEAD [0-9a-f]{7}\] Revert "c2 edits line one and adds n"$')
         self.assertEqual(r.parents(), [c3])
         self.assertEqual(r.sha("main"), c3, "the branch left behind does not move")
         self.assertEqual(r.read("f.txt"), b"1\n2\n3\n4\nFIVE\n")

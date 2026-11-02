@@ -96,17 +96,17 @@ class InitAddCommitLogTests(LocalBase):
         self.assertIn("Changes to be committed:", status)
         self.assertIn("\tnew file:   a.txt", status)
 
-        res = self.fail_mg("commit", code=2)
+        res = self.fail_mg("commit", code=129)
         self.assertIn("commit message required", res.err)
 
         res = self.mg("commit", "-m", "first")
-        self.assertRegex(res.out, rf"^\[main \(root-commit\) {HEX7}\] first\n 1 file changed, 1 insertion\(\+\)\n$")
+        self.assertRegex(res.out, rf"^\[main \(root-commit\) {HEX7}\] first\n 1 file changed, 1 insertion\(\+\)\n create mode 100644 a.txt\n$")
         first = self.head()
 
         self.mg("add", ".")
         self.assertEqual(self.porcelain(), "A  sub/b.txt\n")
         res = self.mg("commit", "-m", "second")
-        self.assertRegex(res.out, rf"^\[main {HEX7}\] second\n 1 file changed, 1 insertion\(\+\)\n$")
+        self.assertRegex(res.out, rf"^\[main {HEX7}\] second\n 1 file changed, 1 insertion\(\+\)\n create mode 100644 sub/b.txt\n$")
         second = self.head()
         self.assertNotEqual(first, second)
 
@@ -127,7 +127,7 @@ class InitAddCommitLogTests(LocalBase):
         self.assertIn("nothing to commit, working tree clean", self.mg("status").out)
         self.assertEqual(self.porcelain(), "")
         res = self.fail_mg("commit", "-m", "empty")
-        self.assertIn("nothing to commit", res.err)
+        self.assertIn("nothing to commit", res.out)   # git prints the status on stdout
         self.assertRegex(self.mg("commit", "--allow-empty", "-m", "empty ok").out, rf"^\[main {HEX7}\] empty ok\n$")
 
         self.assertEqual(self.mg("cat-file", "-t", "HEAD").out.strip(), "commit")
@@ -142,8 +142,8 @@ class InitAddCommitLogTests(LocalBase):
         self.mg("init", env=env)
         self.write("a.txt", "x\n")
         self.mg("add", "a.txt", env=env)
-        res = self.fail_mg("commit", "-m", "x", env=env)
-        self.assertIn("please set your identity", res.err)
+        res = self.fail_mg("commit", "-m", "x", env=env, code=128)
+        self.assertIn("author identity unknown", res.err)
         self.mg("config", "--global", "user.name", "Config User", env=env)
         self.mg("config", "--global", "user.email", "config@example.com", env=env)
         self.assertEqual(self.mg("config", "user.name", env=env).out.strip(), "Config User")
@@ -156,17 +156,17 @@ class InitAddCommitLogTests(LocalBase):
         self.assertEqual(self.mg("config", "user.name", env=env).out.strip(), "Config User")
 
     def test_outside_repository_and_usage(self):
-        res = self.fail_mg("status")
-        self.assertIn("not a minigit repository", res.err)
+        res = self.fail_mg("status", code=128)   # git: fatal
+        self.assertIn("fatal: not a minigit repository", res.err)
         self.init()
         res = self.fail_mg("log")
         self.assertIn("does not have any commits yet", res.err)
-        res = self.fail_mg("frobnicate", code=2)
-        self.assertIn("error:", res.err)
-        self.assertIn("minigit 0.2.0", self.mg("--version").out)
+        res = self.fail_mg("frobnicate", code=1)
+        self.assertIn("is not a minigit command", res.err)
+        self.assertIn("minigit 0.3.0", self.mg("--version").out)
         self.assertIn("usage: minigit commit", self.mg("commit", "--help").out)
-        res = self.fail_mg("add", "nope")
-        self.assertIn("pathspec 'nope' did not match any files", res.err)
+        res = self.fail_mg("add", "nope", code=128)
+        self.assertIn("fatal: pathspec 'nope' did not match any files", res.err)
 
     def test_entry_scripts(self):
         env = dict(self.env)
@@ -174,7 +174,7 @@ class InitAddCommitLogTests(LocalBase):
         proc = subprocess.run([sys.executable, script, "--version"], capture_output=True, timeout=30,
                               env=env, cwd=self.wt)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn(b"minigit 0.2.0", proc.stdout)
+        self.assertIn(b"minigit 0.3.0", proc.stdout)
         proc = subprocess.run([sys.executable, script, "init"], capture_output=True, timeout=30,
                               env=env, cwd=self.wt)
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -184,7 +184,7 @@ class InitAddCommitLogTests(LocalBase):
             proc = subprocess.run([cmd, "--version"], capture_output=True, timeout=30, env=env,
                                   cwd=self.wt, shell=False)
             self.assertEqual(proc.returncode, 0, proc.stderr)
-            self.assertIn(b"minigit 0.2.0", proc.stdout)
+            self.assertIn(b"minigit 0.3.0", proc.stdout)
 
 
 class DiffTests(LocalBase):
@@ -262,12 +262,12 @@ class RmIgnoreTests(LocalBase):
 
         self.write("b.txt", "modified\n")
         res = self.fail_mg("rm", "b.txt")
-        self.assertIn("has staged or local changes", res.err)
+        self.assertIn("the following file has local modifications:\n    b.txt", res.err)
         self.assertTrue(self.exists("b.txt"))
         self.mg("rm", "-f", "b.txt")
         self.assertFalse(self.exists("b.txt"))
 
-        self.fail_mg("rm", "sub")
+        self.fail_mg("rm", "sub", code=128)
         self.assertTrue(self.exists("sub/c.txt"))
         self.mg("rm", "-r", "sub")
         self.assertFalse(self.exists("sub"))
@@ -276,7 +276,7 @@ class RmIgnoreTests(LocalBase):
         self.assertTrue(self.exists("d.txt"))
         # entries are sorted by (path, XY): "??" sorts before "D "
         self.assertEqual(self.porcelain(), "D  b.txt\n?? d.txt\nD  d.txt\nD  sub/c.txt\n")
-        self.fail_mg("rm", "nope")
+        self.fail_mg("rm", "nope", code=128)
 
     def test_ignore(self):
         self.init()
@@ -295,7 +295,7 @@ class RmIgnoreTests(LocalBase):
         self.assertEqual(self.mg("ls-files").out, ".minigitignore\nkeep.log\nkeep.txt\n"
                                                    "sub/.minigitignore\nsub/visible\n")
         res = self.fail_mg("add", "x.log")
-        self.assertIn("ignored by .minigitignore (use -f)", res.err)
+        self.assertIn("ignored by one of your .minigitignore files:\nx.log\nhint: Use -f", res.err)
         self.mg("add", "-f", "x.log")
         self.assertIn("x.log\n", self.mg("ls-files").out)
         self.mg("commit", "-m", "base")
@@ -315,11 +315,11 @@ class BranchMergeTests(LocalBase):
         self.assertEqual(self.mg("branch").out, "* main\n")
         self.mg("branch", "feature")
         self.assertEqual(self.mg("branch").out, "  feature\n* main\n")
-        res = self.fail_mg("branch", "feature")
-        self.assertIn("a branch named 'feature' already exists", res.err)
+        res = self.fail_mg("branch", "feature", code=128)   # git: fatal
+        self.assertIn("fatal: a branch named 'feature' already exists", res.err)
         self.assertRegex(self.mg("branch", "-v").out, rf"\* main +{HEX7} c1")
 
-        self.assertEqual(self.mg("switch", "feature").out, "Switched to branch 'feature'\n")
+        self.assertEqual(self.mg("switch", "feature").err, "Switched to branch 'feature'\n")  # git: stderr
         self.assertIn("On branch feature", self.mg("status").out)
         self.commit("a.txt", "feature\n", "feature change")
         self.mg("switch", "main")
@@ -331,13 +331,13 @@ class BranchMergeTests(LocalBase):
         self.assertEqual(len(self.oneline()), 2)
         self.assertEqual(self.mg("merge", "feature").out, "Already up to date.\n")
 
-        self.assertIn("Switched to a new branch 'topic'", self.mg("switch", "-c", "topic").out)
+        self.assertIn("Switched to a new branch 'topic'", self.mg("switch", "-c", "topic").err)
         self.commit("t.txt", "t\n", "t")
         self.mg("switch", "main")
         self.assertFalse(self.exists("t.txt"))
         self.commit("m.txt", "m\n", "m")
         res = self.mg("merge", "topic")
-        self.assertIn("Merge made by the 'three-way' strategy.", res.out)
+        self.assertIn("Merge made by the 'ort' strategy.", res.out)
         self.assertTrue(self.exists("t.txt") and self.exists("m.txt"))
         self.assertIn("Merge: ", self.mg("log", "-n", "1").out)
         self.assertIn("Merge branch 'topic'", self.oneline()[0])
@@ -358,10 +358,10 @@ class BranchMergeTests(LocalBase):
         self.mg("switch", "-c", "noff")
         self.commit("n.txt", "n\n", "n")
         self.mg("switch", "main")
-        self.assertIn("Merge made by the 'three-way' strategy.", self.mg("merge", "--no-ff", "noff").out)
+        self.assertIn("Merge made by the 'ort' strategy.", self.mg("merge", "--no-ff", "noff").out)
         self.assertIn("Merge: ", self.mg("log", "-n", "1").out)
-        res = self.fail_mg("switch", "nope")
-        self.assertIn("error:", res.err)
+        res = self.fail_mg("switch", "nope", code=128)
+        self.assertIn("fatal: invalid reference: nope", res.err)
 
     def test_switch_refuses_to_clobber(self):
         self.init()
@@ -510,7 +510,8 @@ class ResetRestoreDetachedTests(LocalBase):
         c1 = self.commit("a.txt", "v1\n", "c1")
         c2 = self.commit("a.txt", "v2\n", "c2")
         res = self.mg("checkout", c1)
-        self.assertIn("HEAD is now at", res.out)
+        self.assertIn("HEAD is now at", res.err)
+        self.assertIn("You are in 'detached HEAD' state", res.err)
         self.assertEqual(self.gitfile("HEAD"), c1 + "\n")
         self.assertIn(f"HEAD detached at {c1[:7]}", self.mg("status").out)
         self.assertEqual(self.read("a.txt"), b"v1\n")
@@ -520,7 +521,12 @@ class ResetRestoreDetachedTests(LocalBase):
         d = self.commit("d.txt", "d\n", "detached commit")
         self.assertRegex(self.mg("log", "-n", "1", "--oneline").out, rf"^{HEX7} \(HEAD\) detached commit")
         res = self.mg("switch", "main")
-        self.assertEqual(res.out, "Switched to branch 'main'\n")
+        self.assertEqual(res.out, "")
+        # git's warning: the detached commit is reachable from no ref any more
+        self.assertTrue(res.err.startswith("Warning: you are leaving 1 commit behind, not connected to\n"), res.err)
+        self.assertIn(f"  {d[:7]} detached commit\n", res.err)
+        self.assertIn(f" minigit branch <new-branch-name> {d[:7]}\n", res.err)
+        self.assertTrue(res.err.endswith("\nSwitched to branch 'main'\n"), res.err)
         self.assertEqual(self.head(), c2)
         self.assertFalse(self.exists("d.txt"))
         self.assertEqual(self.gitfile("HEAD"), "ref: refs/heads/main\n")
@@ -528,7 +534,7 @@ class ResetRestoreDetachedTests(LocalBase):
         self.mg("switch", "--detach", "HEAD~1")
         self.assertIn("HEAD detached at", self.mg("status").out)
         self.assertEqual(self.head(), c1)
-        self.assertIn("Switched to a new branch 'fromdetached'", self.mg("switch", "-c", "fromdetached").out)
+        self.assertIn("Switched to a new branch 'fromdetached'", self.mg("switch", "-c", "fromdetached").err)
         self.assertIn("On branch fromdetached", self.mg("status").out)
         self.mg("branch", "saved", d)
         self.assertIn("  saved\n", self.mg("branch").out)

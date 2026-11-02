@@ -221,6 +221,8 @@ def _parse_updates(req: dict) -> tuple[list[dict], bool]:
         new = _sha_or_null(item.get("new"), "new")
         if old is None and new is None:
             raise HttpError(400, "bad_request", f"update for '{ref}' has neither old nor new")
+        if ref == HEADS + "HEAD" and new is not None:  # deleting one made by an older version stays possible
+            raise HttpError(400, "bad_request", "bad ref name: 'HEAD' is not a valid branch name")
         updates.append({"ref": ref, "old": old, "new": new})
     return updates, force
 

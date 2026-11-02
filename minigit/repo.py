@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 
 from .config import Config
-from .errors import MinigitError, NotARepositoryError
+from .errors import FatalError, MinigitError, NotARepositoryError
 from .objects import Commit, ObjectStore, Signature
 from .refs import RefStore, check_ref_name
 from .trees import FlatTree, commit_flat
@@ -136,8 +136,8 @@ class Repository:
     def head_commit(self) -> str | None:
         return self.refs.resolve("HEAD")
 
-    def head_flat(self) -> FlatTree:
-        return commit_flat(self.objects, self.head_commit())
+    def head_flat(self, known: FlatTree | None = None) -> FlatTree:
+        return commit_flat(self.objects, self.head_commit(), known)
 
     def read_commit(self, sha: str) -> Commit:
         return self.objects.commit(sha)
@@ -178,9 +178,13 @@ class Repository:
             name = name or cfg.get("user.name")
             email = email or cfg.get("user.email")
         if not name or not email:
-            raise MinigitError(
-                "please set your identity: minigit config --global user.name \"You\"; "
-                "minigit config --global user.email you@example.com"
+            missing = " and ".join(k for k, v in (("user.name", name), ("user.email", email)) if not v)
+            raise FatalError(
+                f"author identity unknown ({missing} not set)",
+                hint="tell minigit who you are, once for all your repositories:\n"
+                     "  minigit config --global user.name \"Your Name\"\n"
+                     "  minigit config --global user.email you@example.com\n"
+                     "(leave out --global to set it for this repository only)",
             )
         date = os.environ.get("MINIGIT_AUTHOR_DATE")
         if date:

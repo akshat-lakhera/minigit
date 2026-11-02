@@ -74,7 +74,7 @@ def _unborn_error(repo) -> MinigitError:
 
 
 class PathFilter:
-    """``log -- path...``: does a commit's tree differ from its first parent's at one of the paths?
+    """``log -- path...``: which commits change one of the paths, with git's history simplification.
 
     Each path matches itself and everything under it (a directory prefix). The two trees are
     walked only along the path components, so a commit costs a few tree reads, not a flatten.
@@ -85,7 +85,7 @@ class PathFilter:
         self.parts = [[x for x in p.replace("\\", "/").split("/") if x] for p in paths]
         self._trees: dict[str, dict[str, tuple[str, str]]] = {}
         self._commit_trees: dict[str, str] = {}
-        self._verdict: dict[str, bool] = {}
+        self._verdict: dict[str, tuple[bool, tuple[str, ...]]] = {}
 
     def _entries(self, tree_sha: str) -> dict[str, tuple[str, str]]:
         t = self._trees.get(tree_sha)
@@ -117,34 +117,60 @@ class PathFilter:
             t = self._commit_trees[sha] = parse_commit(self.store.read_typed(sha, "commit")).tree
         return t
 
-    def matches(self, sha: str, commit: Commit | None = None) -> bool:
+    def _same(self, tree: str, other: str | None) -> bool:
+        return all(self._lookup(tree, parts) == self._lookup(other, parts) for parts in self.parts)
+
+    def simplify(self, sha: str, commit: Commit | None = None) -> tuple[bool, tuple[str, ...]]:
+        """git's default history simplification: ``(shown, parents the walk follows)``.
+
+        A commit is hidden when it is TREESAME (no change at the paths) to one of its parents; a
+        merge that is TREESAME to a parent follows only that parent, so a side branch that
+        brought nothing for the paths is not walked (and a merge whose side branch brought the
+        whole change is hidden, as in git). A root commit is shown when the paths exist in it.
+        """
         v = self._verdict.get(sha)
         if v is None:
             if commit is None:
-                commit = parse_commit(self.store.read_typed(sha, "commit"))
+                commit = self.store.commit(sha)
             self._commit_trees[sha] = commit.tree
-            parent_tree = self.tree_of(commit.parents[0]) if commit.parents else None
-            v = self._verdict[sha] = any(
-                self._lookup(commit.tree, parts) != self._lookup(parent_tree, parts) for parts in self.parts)
+            v = (True, tuple(commit.parents))
+            if not commit.parents:
+                v = (not self._same(commit.tree, None), ())
+            for p in commit.parents:
+                if self._same(commit.tree, self.tree_of(p)):
+                    v = (False, (p,))
+                    break
+            self._verdict[sha] = v
         return v
 
-    def rewrite_parents(self, commit: Commit) -> list[str]:
-        """Each parent replaced by its nearest first-parent ancestor that matches (dropped if none)."""
+    def matches(self, sha: str, commit: Commit | None = None) -> bool:
+        return self.simplify(sha, commit)[0]
+
+    def parents_of(self, sha: str, commit: Commit) -> tuple[str, ...]:
+        """The walk edges (``graph.topo_walk(parents_of=...)``)."""
+        return self.simplify(sha, commit)[1]
+
+    def rewrite_parents(self, sha: str, commit: Commit | None = None) -> list[str]:
+        """Each followed parent replaced by its nearest shown ancestor along the simplified
+        history (dropped if there is none): the lines ``log --graph -- path`` draws."""
         out: list[str] = []
-        for p in commit.parents:
-            sha: str | None = p
-            while sha is not None and not self.matches(sha):
-                c = parse_commit(self.store.read_typed(sha, "commit"))
-                sha = c.parents[0] if c.parents else None
-            if sha is not None and sha not in out:
-                out.append(sha)
+        for p in self.simplify(sha, commit)[1]:
+            cur: str | None = p
+            while cur is not None and not self.matches(cur):
+                followed = self.simplify(cur)[1]
+                cur = followed[0] if followed else None
+            if cur is not None and cur not in out:
+                out.append(cur)
         return out
 
 
 def log_entries(repo, revs: Sequence[str] | None, max_count: int | None,
-                all_refs: bool = False, paths: Sequence[str] = ()) -> list[tuple[str, Commit]]:
-    """The commits ``log`` prints, newest first. ``paths`` keeps only commits that change one of them."""
-    from minigit.graph import topo_walk
+                all_refs: bool = False, paths: Sequence[str] = (),
+                topo: bool = False) -> list[tuple[str, Commit]]:
+    """The commits ``log`` prints, newest first. ``paths`` keeps only commits that change one of
+    them (``PathFilter``). ``topo`` is git's ``--topo-order``, which ``--graph`` implies: a merge's
+    second-parent lineage is listed before its first parent instead of interleaving by date."""
+    from minigit.graph import topo_order, topo_walk
     from minigit.revparse import resolve_rev
 
     starts: list[str] = []
@@ -170,8 +196,10 @@ def log_entries(repo, revs: Sequence[str] | None, max_count: int | None,
         if chain is not None:
             return chain
     filt = PathFilter(repo.objects, paths) if paths else None
+    edges = filt.parents_of if filt is not None else None
+    walk = topo_order(repo.objects, starts, parents_of=edges) if topo else topo_walk(repo.objects, starts, edges)
     entries: list[tuple[str, Commit]] = []
-    for sha, commit in topo_walk(repo.objects, starts):
+    for sha, commit in walk:
         if filt is not None and not filt.matches(sha, commit):
             continue
         entries.append((sha, commit))
@@ -214,9 +242,25 @@ def format_commit_header(sha: str, commit: Commit, decor: dict[str, list[str]],
     lines.append(f"Author: {commit.author.name} <{commit.author.email}>")
     lines.append(f"Date:   {format_date(commit.author.timestamp, commit.author.tz_offset)}")
     lines.append("")
-    for line in commit.message.rstrip("\n").split("\n"):
-        lines.append(f"    {line}" if line else "")
+    body = commit.message.rstrip("\n").split("\n")
+    while body and not body[0].strip():
+        body.pop(0)   # git skips blank lines before the subject
+    for line in body:
+        lines.append("    " + line.rstrip())   # git indents blank lines too and drops trailing blanks
     return lines
+
+
+def oneline_subject(message: str) -> str:
+    """git's ``--oneline`` subject: the first paragraph, its lines joined with spaces."""
+    out: list[str] = []
+    for line in message.split("\n"):
+        line = line.rstrip()
+        if not line:
+            if out:
+                break
+            continue
+        out.append(line)
+    return " ".join(out)
 
 
 def _stat_lines(repo, sha: str, commit: Commit) -> list[str]:
@@ -261,7 +305,7 @@ def format_log(repo, entries: list[tuple[str, Commit]], oneline: bool, *, graph:
     out: list[str] = []
     for n, (sha, commit) in enumerate(entries):
         if oneline:
-            lines = [f"{sha[:7]}{_decor_suffix(decor, sha)} {commit.subject}"]
+            lines = [f"{sha[:7]}{_decor_suffix(decor, sha)} {oneline_subject(commit.message)}"]
         else:
             lines = format_commit_header(sha, commit, decor)
             if stat:
@@ -270,7 +314,7 @@ def format_log(repo, entries: list[tuple[str, Commit]], oneline: bool, *, graph:
                     lines.append("")
                     lines.extend(block)
         if drawer is not None:
-            parents = filt.rewrite_parents(commit) if filt is not None else commit.parents
+            parents = filt.rewrite_parents(sha, commit) if filt is not None else commit.parents
             drawer.update(sha, parents)
         if n and not oneline:
             out.append(drawer.padding_line() if drawer else "")  # the blank line between commits

@@ -427,7 +427,10 @@ def _run(repo: Repository, st: State, lines: list[str]) -> Result:
         _save(repo, st)
         if out is None:
             continue
-        lines.extend(out.messages)
+        if out.kind == "conflict":
+            lines.extend(out.messages)
+        else:   # git shows a replayed commit's merge output only when it stops there
+            lines.extend(m for m in out.messages if not m.startswith("Auto-merging "))
         if out.kind == "conflict":
             lines.extend(_conflict_lines(sha, repo.read_commit(sha).subject))
             return Result(lines, stopped=True)
@@ -493,6 +496,15 @@ def continue_(repo: Repository) -> Result:
         repo.refs.write_special(REBASE_HEAD, None)
         repo.remove_state("MERGE_MSG")
         lines.append(f"[detached HEAD {new[:7]}] {picked.subject}")
+        # like the commit git makes here: its shortstat and create/delete/mode lines
+        from .merge import mode_summary
+        from .ops import _shortstat
+        from .trees import commit_flat
+        old_flat, new_flat = commit_flat(store, head), commit_flat(store, new)
+        stat = _shortstat(repo, old_flat, new_flat)
+        if stat:
+            lines.append(stat)
+        lines.extend(mode_summary(old_flat, new_flat))
     elif tree != head_tree:
         raise errors.MinigitError("cannot continue: you have staged changes",
                                   hint="commit them (or unstage them), then run 'minigit rebase --continue'")

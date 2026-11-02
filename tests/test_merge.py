@@ -66,10 +66,37 @@ class Merge3Tests(unittest.TestCase):
                          b"a\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> feature\nc\n")
 
     def test_multiple_conflicts_counted(self):
-        base = "a\nb\nc\nd\ne\n"
-        r = merge_lines(L(base), L("A1\nb\nc\nd\nE1\n"), L("A2\nb\nc\nd\nE2\n"))
+        base = "a\nb\nc\nd\ne\nf\n"
+        r = merge_lines(L(base), L("A1\nb\nc\nd\ne\nF1\n"), L("A2\nb\nc\nd\ne\nF2\n"))
         self.assertEqual(r.conflicts, 2)
         self.assertEqual(b"".join(r.lines).count(b"<<<<<<< HEAD\n"), 2)
+
+    def test_conflicts_at_most_three_lines_apart_are_joined(self):
+        # git (XDL_MERGE_ZEALOUS): the unchanged lines between two close conflicts move into one conflict
+        base = "a\nb\nc\nd\ne\n"
+        r = merge_lines(L(base), L("A1\nb\nc\nd\nE1\n"), L("A2\nb\nc\nd\nE2\n"))
+        self.assertEqual(r.conflicts, 1)
+        self.assertEqual(b"".join(r.lines),
+                         b"<<<<<<< HEAD\nA1\nb\nc\nd\nE1\n=======\nA2\nb\nc\nd\nE2\n>>>>>>> theirs\n")
+
+    def test_common_lines_of_a_conflict_move_out_of_the_markers(self):
+        # both sides changed the same base lines, partly the same way (git's zealous refinement)
+        r = merge_lines(L("a\nb\nc\nd\ne\n"), L("a\nX\nY\nd\ne\n"), L("a\nX\nZ\nd\ne\n"), "HEAD", "topic")
+        self.assertEqual(b"".join(r.lines), b"a\nX\n<<<<<<< HEAD\nY\n=======\nZ\n>>>>>>> topic\nd\ne\n")
+        # add/add: only the differing middle is in conflict
+        r = merge_lines([], L("a\nb\nc\n"), L("a\nB\nc\n"), "HEAD", "topic")
+        self.assertEqual(b"".join(r.lines), b"a\n<<<<<<< HEAD\nb\n=======\nB\n>>>>>>> topic\nc\n")
+
+    def test_histogram_diff_alignment(self):
+        # git's histogram diff (what 'git merge' uses); expected scripts checked with 'git diff --histogram'
+        from minigit.merge3 import diff_changes
+        a = L("b\nc\na\nb\nc\na\nb\nc\n")
+        b = L("b\na\nc\na\na\nb\nc\n")
+        # histogram picks 'a b c' at the end; the re-diff of the moved group keeps the edit minimal
+        self.assertEqual(diff_changes(a, b), [(1, 0, 1, 1), (3, 2, 4, 0)])
+        a = L("a\nb\na\na\nb\nb\na\n")
+        b = L("a\nb\nb\nb\na\n")
+        self.assertEqual(diff_changes(a, b), [(2, 2, 2, 0)])
 
     def test_adjacent_edits_conflict(self):
         r = merge_lines(L("a\nb\nc\nd\n"), L("a\nB\nc\nd\n"), L("a\nb\nC\nd\n"))
@@ -231,14 +258,16 @@ class TreeMergeTests(unittest.TestCase):
         r = self.run_merge({"f": b}, {"f": o}, {})
         self.assertEqual(r.stages, {"f": {1: b, 2: o}})
         self.assertEqual(r.worktree["f"], (FILE, b"changed\n"))
-        self.assertEqual(r.messages, ["CONFLICT (modify/delete): f deleted in feature and modified in HEAD."])
+        self.assertEqual(r.messages, ["CONFLICT (modify/delete): f deleted in feature and modified in HEAD.  "
+                                      "Version HEAD of f left in tree."])
 
     def test_modify_delete_ours_deleted(self):
         b, t = self.e(b"base\n"), self.e(b"changed\n", EXE)
         r = self.run_merge({"f": b}, {}, {"f": t})
         self.assertEqual(r.stages, {"f": {1: b, 3: t}})
         self.assertEqual(r.worktree["f"], (EXE, b"changed\n"))
-        self.assertEqual(r.messages, ["CONFLICT (modify/delete): f deleted in HEAD and modified in feature."])
+        self.assertEqual(r.messages, ["CONFLICT (modify/delete): f deleted in HEAD and modified in feature.  "
+                                      "Version feature of f left in tree."])
 
     def test_mode_only_change(self):
         x = self.e(b"x\n")
@@ -318,7 +347,7 @@ class TreeMergeTests(unittest.TestCase):
         r = M.merge_trees(self.store, {"f": b}, {"f": o}, {"f": t}, "X", "Y", virtual=True)
         self.assertEqual(r.stages, {})
         self.assertEqual(self.store.read_typed(r.merged["f"][1], "blob"),
-                         b"<<<<<<< X\na\n=======\nb\n>>>>>>> Y\n")
+                         b"<<<<<<<<< X\na\n=========\nb\n>>>>>>>>> Y\n")   # git: 2 more per depth
         # modify/delete falls back to the base version
         r = M.merge_trees(self.store, {"f": b}, {"f": o}, {}, "X", "Y", virtual=True)
         self.assertEqual(r.merged, {"f": b})
@@ -462,7 +491,10 @@ class MergeCommandTests(RepoCase):
         out = M.merge(self.repo, "feature")
         self.assertEqual(out.kind, "fast-forward")
         self.assertEqual((out.commit, out.old_head), (c1, c0))
-        self.assertEqual(out.messages, [f"Updating {c0[:7]}..{c1[:7]}", "Fast-forward"])
+        self.assertEqual(out.messages, [f"Updating {c0[:7]}..{c1[:7]}", "Fast-forward",
+                                        " a.txt | 2 +-", " b.txt | 1 +",
+                                        " 2 files changed, 2 insertions(+), 1 deletion(-)",
+                                        " create mode 100644 b.txt"])
         self.assertEqual(self.head(), c1)
         self.assertEqual(self.repo.refs.current_branch(), "main")
         self.assertEqual(self.read("b.txt"), b"b\n")
@@ -490,7 +522,10 @@ class MergeCommandTests(RepoCase):
                                   {"f.txt": b"1\n2\n3\n4\n5\nSIX\n", "feat.txt": b"f\n", "gone.txt": None})
         out = M.merge(self.repo, "feature")
         self.assertEqual(out.kind, "merged")
-        self.assertEqual(out.messages, ["Merge made by the 'three-way' strategy."])
+        self.assertEqual(out.messages, ["Auto-merging f.txt", "Merge made by the 'ort' strategy.",
+                                        " f.txt    | 2 +-", " feat.txt | 1 +", " gone.txt | 1 -",
+                                        " 3 files changed, 2 insertions(+), 2 deletions(-)",
+                                        " create mode 100644 feat.txt", " delete mode 100644 gone.txt"])
         self.assertEqual(out.old_head, cm)
         self.assertEqual(self.head(), out.commit)
         self.assertEqual(self.parents(out.commit), (cm, cf))
@@ -544,7 +579,7 @@ class MergeCommandTests(RepoCase):
         self.assertEqual(out.kind, "conflict")
         self.assertIsNone(out.commit)
         self.assertEqual(out.conflicts, ["f.txt"])
-        self.assertEqual(out.messages, ["CONFLICT (content): Merge conflict in f.txt",
+        self.assertEqual(out.messages, ["Auto-merging f.txt", "CONFLICT (content): Merge conflict in f.txt",
                                         "Automatic merge failed; fix conflicts and then commit the result."])
         self.assertEqual(self.read("f.txt"), b"a\n<<<<<<< HEAD\nmain\n=======\nfeature\n>>>>>>> feature\nc\n")
         self.assertEqual(self.read("other"), b"o2\n")
@@ -642,7 +677,7 @@ class MergeCommandTests(RepoCase):
         self.assertEqual(ctx.exception.paths, ["new.txt"])
         self.assertEqual(ctx.exception.message,
                          "The following untracked working tree files would be overwritten by merge:\n"
-                         "\tnew.txt\nPlease move or remove them before you merge.")
+                         "\tnew.txt\nPlease move or remove them before you merge.\nAborting")
         self.assertEqual(self.read("new.txt"), b"untracked\n")
         self.assertIsNone(self.repo.merge_head())
         self.assert_index_matches_head()
@@ -679,7 +714,8 @@ class MergeCommandTests(RepoCase):
             M.merge(self.repo, "feature")
         self.assertEqual(ctx.exception.paths, ["thing"])
         self.assertEqual(ctx.exception.message,
-                         "Updating the following directories would lose untracked files in them:\n\tthing\n")
+                         "Updating the following directories would lose untracked files in them:\n\tthing\n"
+                         "\nAborting")
         self.assertEqual(self.read("thing/inner.txt"), b"u\n")
 
     def test_dirty_conflicting_file_refused(self):
@@ -739,7 +775,7 @@ class MergeCommandTests(RepoCase):
         self.assertEqual(cm.exception.paths, ["a.txt", "f.txt"])
         self.assertEqual(cm.exception.message,
                          "Your local changes to the following files would be overwritten by merge:\n"
-                         "\ta.txt\n\tf.txt\nPlease commit your changes or restore them before you merge.")
+                         "\ta.txt\n\tf.txt\nPlease commit your changes or stash them before you merge.\nAborting")
         self.assertEqual(self.head(), before)
         self.assertEqual(self.read("a.txt"), b"mine\n")
 
@@ -792,7 +828,8 @@ class MergeCommandTests(RepoCase):
         c0, cm, cf = self.diverge({"f": b"base\n", "g": b"g\n"}, {"f": b"modified\n"}, {"f": None})
         out = M.merge(self.repo, "feature")
         self.assertEqual(out.kind, "conflict")
-        self.assertEqual(out.messages[0], "CONFLICT (modify/delete): f deleted in feature and modified in HEAD.")
+        self.assertEqual(out.messages[0], "CONFLICT (modify/delete): f deleted in feature and modified in HEAD.  "
+                                          "Version HEAD of f left in tree.")
         self.assertEqual(self.read("f"), b"modified\n")
         self.assertEqual(sorted(read_index(self.repo).unmerged()["f"]), [1, 2])
         # resolve by keeping the file
@@ -803,7 +840,8 @@ class MergeCommandTests(RepoCase):
     def test_delete_modify_through_merge_writes_theirs(self):
         self.diverge({"f": b"base\n", "g": b"g\n"}, {"f": None}, {"f": b"theirs\n"})
         out = M.merge(self.repo, "feature")
-        self.assertEqual(out.messages[0], "CONFLICT (modify/delete): f deleted in HEAD and modified in feature.")
+        self.assertEqual(out.messages[0], "CONFLICT (modify/delete): f deleted in HEAD and modified in feature.  "
+                                          "Version feature of f left in tree.")
         self.assertEqual(self.read("f"), b"theirs\n")
         self.assertEqual(sorted(read_index(self.repo).unmerged()["f"]), [1, 3])
         M.merge_abort(self.repo)
@@ -813,7 +851,7 @@ class MergeCommandTests(RepoCase):
     def test_binary_conflict_keeps_ours_in_worktree(self):
         self.diverge({"img": b"\x00base"}, {"img": b"\x00main"}, {"img": b"\x00feat"})
         out = M.merge(self.repo, "feature")
-        self.assertEqual(out.messages[0], "CONFLICT (binary): Merge conflict in img")
+        self.assertEqual(out.messages[:2], ["Auto-merging img", "CONFLICT (binary): Merge conflict in img"])
         self.assertEqual(self.read("img"), b"\x00main")
 
     def test_file_dir_clash_is_a_resolvable_conflict(self):

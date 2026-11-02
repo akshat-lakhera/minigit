@@ -51,8 +51,8 @@ minigit revert --abort
   `add`-ed. It is exactly `minigit commit` with no `-m` (the message comes from `MERGE_MSG`).
 - `--abort`: cancel the open conflicted operation and restore index + working tree to HEAD, keeping
   unrelated local changes (same rule as `merge --abort`).
-- `--continue`/`--abort` take no revision; `--continue` with `--abort` is a usage error (exit 2).
-  A missing `<rev>` is a usage error (exit 2).
+- `--continue`/`--abort` take no revision; `--continue` with `--abort` is a usage error (exit 129).
+  A missing `<rev>` is a usage error (exit 129).
 
 Help lines (argparse `help=`): cherry-pick: "Apply the change of an existing commit on top of HEAD";
 revert: "Record a new commit that undoes an existing commit".
@@ -71,10 +71,13 @@ revert: "Record a new commit that undoes an existing commit".
 | `--abort` ok | *(nothing)* | | 0 |
 | `--continue` ok | `[main abc1234] <subject>` (the `commit` summary line) | | 0 |
 | any refusal (section 1.5) | | `error: <message>` [+ `hint:`] | 1 |
-| usage error | | argparse usage + `error: ...` | 2 |
+| usage error | | argparse usage + `error: ...` | 129 |
 
-The summary line is the one `commit` prints (`ops.commit`'s format). Mode-change warnings from
-`merge_trees` are printed to stdout before the summary, like merge.
+The summary line is the one `commit` prints (`ops.commit`'s format); below it, as in git, come
+` Author: <name> <email>` (only when the author differs from the committer), ` Date: <author date>`,
+the shortstat and the `create mode` / `delete mode` / `mode change` lines (`PickOutcome.details`).
+`Auto-merging <path>` lines and mode-change warnings from `merge_trees` are printed to stdout before
+the summary, like merge.
 
 ### 1.3 Commit contents
 
@@ -370,7 +373,7 @@ command list; extend it.
 | `-x` | message gets the `(cherry picked from commit ...)` paragraph (also inside `MERGE_MSG` on conflict) |
 | second `-n` without committing | refused by the `I == H` rule |
 | during an open merge/pick/revert | `merge`, `pull`, `cherry-pick`, `revert`, `switch`, `reset --soft` refuse; `reset`/`reset --hard` clear the state |
-| `rev` is a blob/tree (`HEAD:p`) or unknown | `'HEAD:p' is not a commit` / `unknown revision 'x'`, exit 1 |
+| `rev` is a blob/tree (`HEAD:p`) or unknown | `'HEAD:p' is not a commit` / `unknown revision 'x'`, exit 128 (`fatal:`) |
 | `--abort`/`--continue` without state, with a rev, together | errors of 1.4 / usage errors of 1.1 |
 | missing identity | surfaces before anything is written (step 5 of `_apply`) (*unit*) |
 | bare repo | `this operation must be run in a work tree` (*unit*) |

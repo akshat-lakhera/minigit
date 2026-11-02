@@ -309,6 +309,29 @@ def check_connectivity(store, tip: str, complete: set[str]) -> None:
     _walk_commits(store, tip, complete, set())
 
 
+def _bad_ref_files(repo, good: dict[str, str]) -> list[str]:
+    """Ref files ``RefStore.list`` skipped because they hold neither a commit id nor ``ref: ...``."""
+    out: list[str] = []
+    root = os.path.join(repo.gitdir, "refs")
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames.sort()
+        rel_dir = os.path.relpath(dirpath, repo.gitdir).replace(os.sep, "/")
+        for fn in sorted(filenames):
+            name = rel_dir + "/" + fn
+            if fn.endswith(".lock") or ".tmp-" in fn or name in good:
+                continue
+            try:
+                raw = repo.refs.read_raw(name)
+            except OSError as e:
+                out.append(f"ref {name}: cannot be read: {e.strerror or e}")
+                continue
+            if raw is None:
+                out.append(f"ref {name}: the file is empty")
+            elif not raw.startswith("ref:"):
+                out.append(f"ref {name}: {raw[:60]!r} is not a commit id")
+    return out
+
+
 def fsck(repo) -> list[str]:
     """Hash-check every object and verify ref connectivity. Returns problems ([] = healthy).
 
@@ -322,7 +345,9 @@ def fsck(repo) -> list[str]:
         try:
             obj_type, data = store.read(sha)
         except errors.MinigitError as e:
-            problems.append(f"corrupt object {sha}: {_msg(e)}")
+            why = _msg(e)
+            prefix = f"object {sha} is corrupt: "
+            problems.append(f"corrupt object {sha}: {why[len(prefix):] if why.startswith(prefix) else why}")
             continue
         try:
             if obj_type == "tree":
@@ -338,6 +363,7 @@ def fsck(repo) -> list[str]:
         except (ValueError, UnicodeDecodeError, IndexError) as e:
             problems.append(f"malformed {obj_type} {sha}: {e}")
     tips: dict[str, str] = dict(repo.refs.list("refs/"))
+    problems.extend(_bad_ref_files(repo, tips))
     try:
         if repo.refs.head_target() is None:
             head = repo.refs.resolve("HEAD")

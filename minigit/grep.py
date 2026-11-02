@@ -143,8 +143,15 @@ def grep_command(repo, cwd: str, *, opts: GrepOptions, rev: str | None, cached: 
     regex = compile_patterns(opts)
     if rev is None:
         repo.require_worktree()
+    base = ""   # the current directory, repo-relative ("" at the top or in a bare repository)
     if repo.worktree is not None:
         specs = [repo.relpath(s, cwd) for s in pathspecs]
+        try:
+            base = repo.relpath(".", cwd)
+        except MinigitError:
+            base = ""
+        if base and not specs:
+            specs = [base]   # as git: from a subdirectory, search only below it
     else:
         specs = [normalize_rel(s) for s in pathspecs]
     prefix = ""
@@ -157,6 +164,11 @@ def grep_command(repo, cwd: str, *, opts: GrepOptions, rev: str | None, cached: 
         matches = grep_flat(repo, flat, regex, specs)
     else:
         matches = grep_worktree(repo, read_index(repo), regex, specs)
+    if base:   # as git (and `status`): paths relative to the current directory
+        import dataclasses
+        import posixpath
+
+        matches = [dataclasses.replace(m, path=posixpath.relpath(m.path, base)) for m in matches]
     out = format_grep(matches, prefix=prefix, line_numbers=line_numbers,
                       names_only=names_only, count=count)
     return out, bool(matches)

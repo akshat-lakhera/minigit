@@ -27,7 +27,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TIMEOUT = 60
 
 OVERWRITE_HEAD = "Your local changes to the following files would be overwritten by checkout:"
-OVERWRITE_TAIL = "Please commit your changes or restore them before you switch branches."
+OVERWRITE_TAIL = "Please commit your changes or stash them before you switch branches."
 UNTRACKED_HEAD = "The following untracked working tree files would be overwritten by checkout:"
 UNTRACKED_TAIL = "Please move or remove them before you switch branches."
 UNTRACKED_HEAD = "The following untracked working tree files would be overwritten by checkout:"
@@ -286,11 +286,11 @@ class BranchCreateListTests(MinigitCase):
         for argv in (["branch", "topic"], ["branch", "topic", "HEAD"], ["switch", "-c", "topic"],
                      ["checkout", "-b", "topic"]):
             with self.subTest(argv=argv):
-                res = self.mg_fail(*argv)
+                res = self.mg_fail(*argv, code=128)
                 self.assertIn("a branch named 'topic' already exists", res.err)
                 self.assertEqual(self.rev("topic"), c1, "existing branch was moved")
                 self.assertOnBranch("main")
-        res = self.mg_fail("branch", "main")
+        res = self.mg_fail("branch", "main", code=128)
         self.assertIn("a branch named 'main' already exists", res.err)
         self.assertEqual(self.rev("main"), c2)
 
@@ -302,11 +302,11 @@ class BranchCreateListTests(MinigitCase):
             with self.subTest(name=name):
                 res = self.run_mg("branch", name)
                 self.assertNoCrash(res)
-                self.assertEqual(res.code, 1, f"bad branch name {name!r} accepted\n{res}")
+                self.assertEqual(res.code, 128, f"bad branch name {name!r} accepted\n{res}")
                 self.assertEqual(self.ref_files(), {"main"}, f"{name!r} left ref/lock files behind")
         for name in ("a b", "x.lock", "a..b"):
             with self.subTest(switch_c=name):
-                self.mg_fail("switch", "-c", name)
+                self.mg_fail("switch", "-c", name, code=128)
                 self.assertOnBranch("main")
         self.assertEqual(self.ref_files(), {"main"})
 
@@ -318,7 +318,7 @@ class BranchCreateListTests(MinigitCase):
                 self.mg("branch", name, c1)
                 self.assertIn(f"  {name}\n", self.mg("branch").out)
                 res = self.mg("switch", name)
-                self.assertIn(f"Switched to branch '{name}'", res.out)
+                self.assertIn(f"Switched to branch '{name}'", res.err)
                 self.assertOnBranch(name)
                 self.assertEqual(self.r("a.txt"), b"v1\n")
                 self.mg("switch", "main")
@@ -330,14 +330,14 @@ class BranchCreateListTests(MinigitCase):
     def test_unborn_head_branch_operations(self):
         res = self.mg("branch")  # git prints nothing; must not crash
         self.assertNotIn("feature", res.out)
-        self.mg_fail("branch", "feature")
+        self.mg_fail("branch", "feature", code=128)
         self.assertEqual(self.ref_files(), set(), "branch on unborn HEAD created a ref")
         self.assertOnBranch("main")
         # switch -c on an unborn HEAD only retargets HEAD and keeps the index.
         self.w("a.txt", "hello\n")
         self.mg("add", "a.txt")
         res = self.mg("switch", "-c", "dev")
-        self.assertIn("Switched to a new branch 'dev'", res.out)
+        self.assertIn("Switched to a new branch 'dev'", res.err)
         self.assertOnBranch("dev")
         self.assertEqual(self.porcelain(), "A  a.txt\n")
         out = self.mg("commit", "-m", "root").out
@@ -347,14 +347,14 @@ class BranchCreateListTests(MinigitCase):
     def test_bad_start_point_refused(self):
         self.linear()
         blob = self.mg("rev-parse", "HEAD:a.txt").out.strip()
-        res = self.mg_fail("branch", "x", "no-such-rev")
+        res = self.mg_fail("branch", "x", "no-such-rev", code=128)
         self.assertIn("unknown revision", res.err)
-        self.mg_fail("branch", "y", "HEAD:a.txt")
-        res = self.mg_fail("branch", "z", blob)
+        self.mg_fail("branch", "y", "HEAD:a.txt", code=128)
+        res = self.mg_fail("branch", "z", blob, code=128)
         self.assertIn("is not a commit", res.err)
-        self.mg_fail("branch", "q", "HEAD~5")
-        self.mg_fail("switch", "-c", "w", "no-such-rev")
-        self.mg_fail("checkout", "-b", "v", blob)
+        self.mg_fail("branch", "q", "HEAD~5", code=128)
+        self.mg_fail("switch", "-c", "w", "no-such-rev", code=128)
+        self.mg_fail("checkout", "-b", "v", blob, code=128)
         self.assertEqual(self.ref_files(), {"main"})
         self.assertOnBranch("main")
 
@@ -376,7 +376,7 @@ class BranchCreateListTests(MinigitCase):
         c1, c2 = self.linear()
         with self.subTest("case-only different name aliases on NTFS"):
             self.mg("branch", "feature", c1)
-            self.mg_fail("branch", "Feature")
+            self.mg_fail("branch", "Feature", code=128)
             self.assertEqual(self.rev("feature"), c1, "creating 'Feature' moved 'feature'")
         with self.subTest("reserved device name 'nul'"):
             res = self.run_mg("branch", "nul")
@@ -402,7 +402,7 @@ class BranchDeleteTests(MinigitCase):
         self.mg("switch", "feature")
         res = self.mg("branch", "-d", "done")            # C1 is an ancestor of HEAD (F1)
         self.assertIn(f"Deleted branch done (was {c1[:7]}).", res.out)
-        self.mg_fail("rev-parse", "done")
+        self.mg_fail("rev-parse", "done", code=128)
         self.mg("switch", "main")
         # feature (F1) is not in HEAD (C1) but is in its upstream origin/feature.
         self.write_ref("refs/remotes/origin/feature", f1)
@@ -425,7 +425,7 @@ class BranchDeleteTests(MinigitCase):
     def test_delete_unmerged_needs_force_and_missing_branch_errors(self):
         c1, f1 = self.two_branches()
         res = self.mg_fail("branch", "-d", "feature")
-        self.assertIn("the branch 'feature' is not fully merged (use -D)", res.err)
+        self.assertIn("the branch 'feature' is not fully merged\nhint: If you are sure you want to delete it, run 'minigit branch -D feature'", res.err)
         self.assertEqual(self.rev("feature"), f1)
         res = self.mg("branch", "-D", "feature")
         self.assertIn(f"Deleted branch feature (was {f1[:7]}).", res.out)
@@ -457,7 +457,7 @@ class BranchDeleteTests(MinigitCase):
         for argv in (["branch", "-d"], ["branch", "-D"], ["switch"], ["switch", "a", "b"],
                      ["checkout"], ["switch", "-c"], ["checkout", "-b"]):
             with self.subTest(argv=argv):
-                self.mg_fail(*argv, code=2)
+                self.mg_fail(*argv, code=128 if argv == ["switch"] else 129)
         self.assertOnBranch("main")
         self.assertEqual(self.ref_files(), {"main"})
 
@@ -470,7 +470,7 @@ class SwitchCheckoutTests(MinigitCase):
     def test_switch_updates_head_worktree_and_index(self):
         c1, f1 = self.two_branches()
         res = self.mg("switch", "feature")
-        self.assertIn("Switched to branch 'feature'", res.out)
+        self.assertIn("Switched to branch 'feature'", res.err)
         self.assertOnBranch("feature")
         self.assertEqual(self.r("diff.txt"), b"feature\n")
         self.assertEqual(self.r("new.txt"), b"feature new\n")
@@ -490,7 +490,7 @@ class SwitchCheckoutTests(MinigitCase):
     def test_switch_c_and_checkout_b(self):
         c1, c2 = self.linear()
         res = self.mg("switch", "-c", "topic")
-        self.assertIn("Switched to a new branch 'topic'", res.out)
+        self.assertIn("Switched to a new branch 'topic'", res.err)
         self.assertOnBranch("topic")
         self.assertEqual(self.rev("topic"), c2)
         self.w("a.txt", "topic\n")
@@ -498,7 +498,7 @@ class SwitchCheckoutTests(MinigitCase):
         self.assertTrue(out.startswith("[topic "), out)
         self.assertEqual(self.rev("main"), c2, "commit on topic moved main")
         res = self.mg("checkout", "-b", "old", c1)
-        self.assertIn("Switched to a new branch 'old'", res.out)
+        self.assertIn("Switched to a new branch 'old'", res.err)
         self.assertOnBranch("old")
         self.assertEqual(self.rev("old"), c1)
         self.assertEqual(self.r("a.txt"), b"v1\n")
@@ -507,13 +507,13 @@ class SwitchCheckoutTests(MinigitCase):
 
     def test_switch_unknown_or_broken_target(self):
         c1, c2 = self.linear()
-        self.mg_fail("switch", "nosuch")
+        self.mg_fail("switch", "nosuch", code=128)
         self.mg_fail("checkout", "nosuch")
         self.assertOnBranch("main")
         self.assertEqual(self.ref_files(), {"main"})
         # A branch whose commit object is missing: clean error, nothing touched.
         self.write_ref("refs/heads/broken", "0123456789abcdef0123456789abcdef01234567")
-        self.mg_fail("switch", "broken")
+        self.mg_fail("switch", "broken", code=128)
         self.assertOnBranch("main")
         self.assertEqual(self.r("a.txt"), b"v2\n")
         self.assertEqual(self.porcelain(), "")
@@ -535,7 +535,7 @@ class SwitchCheckoutTests(MinigitCase):
     def test_detach_commit_and_reattach(self):
         c1, c2 = self.linear()
         res = self.mg("switch", "--detach", "HEAD~1")
-        self.assertIn(f"HEAD is now at {c1[:7]} first", res.out)
+        self.assertIn(f"HEAD is now at {c1[:7]} first", res.err)
         self.assertEqual(self.head(), c1)
         self.assertEqual(self.r("a.txt"), b"v1\n")
         self.assertFalse(self.exists("b.txt"))
@@ -554,11 +554,11 @@ class SwitchCheckoutTests(MinigitCase):
         self.assertEqual(self.rev("main"), c2, "detached commit moved main")
         self.assertEqual(self.rev("fromdetached"), c1, "detached commit moved a branch")
         res = self.mg("checkout", "main")
-        self.assertIn("Switched to branch 'main'", res.out)
+        self.assertIn("Switched to branch 'main'", res.err)
         self.assertOnBranch("main")
         self.assertEqual(self.r("a.txt"), b"v2\n")
         res = self.mg("checkout", c1[:7])
-        self.assertIn(f"HEAD is now at {c1[:7]}", res.out)
+        self.assertIn(f"HEAD is now at {c1[:7]}", res.err)
         self.assertEqual(self.head(), c1, "checkout <short sha> must store the full sha in HEAD")
         self.mg("switch", "--detach")  # defaults to HEAD
         self.assertEqual(self.head(), c1)
@@ -658,7 +658,7 @@ class SwitchCheckoutTests(MinigitCase):
         c1, c2 = self.linear()
         self.write_ref("refs/remotes/origin/topic", c1)
         res = self.mg("switch", "topic")
-        self.assertIn("topic", res.out)
+        self.assertIn("topic", res.err)
         self.assertOnBranch("topic")
         self.assertEqual(self.rev("refs/heads/topic"), c1)
         self.assertEqual(self.r("a.txt"), b"v1\n")
@@ -836,7 +836,7 @@ class DirtyWorktreeTests(MinigitCase):
         with self.subTest(lock="index.lock"):
             lock = os.path.join(gitdir, "index.lock")
             open(lock, "wb").close()
-            res = self.mg_fail("switch", "feature")
+            res = self.mg_fail("switch", "feature", code=128)
             self.assertIn("unable to lock", res.err)
             self.assertTrue(os.path.exists(lock), "someone else's index.lock was deleted")
             self.assertOnBranch("main")
@@ -848,7 +848,7 @@ class DirtyWorktreeTests(MinigitCase):
             lock = os.path.join(gitdir, "refs", "heads", "topic.lock")
             open(lock, "wb").close()
             for argv in (["branch", "topic"], ["switch", "-c", "topic"]):
-                res = self.mg_fail(*argv)
+                res = self.mg_fail(*argv, code=128)
                 self.assertIn("unable to lock", res.err)
             self.assertTrue(os.path.exists(lock), "someone else's ref lock was deleted")
             self.assertEqual(self.ref_files(), {"main", "feature", "topic.lock"})

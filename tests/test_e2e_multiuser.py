@@ -140,7 +140,7 @@ class MultiUserTests(unittest.TestCase):
         # Step 3: alice pulls (merge commit) and pushes; bob fast-forwards.
         res = self.mg(alice, a_env, "pull")
         self.assertIn("main -> origin/main", res.out)
-        self.assertIn("Merge made by the 'three-way' strategy.", res.out)
+        self.assertIn("Merge made by the 'ort' strategy.", res.out)
         self.assertEqual(self.read(alice, "b.txt"), b"bob\n")
         self.assertIn("Merge: ", self.mg(alice, a_env, "log", "-n", "1").out)
         self.assertIn(f"Merge branch 'main' of {self.server.url}/{repo}",
@@ -291,7 +291,7 @@ class MultiUserTests(unittest.TestCase):
             if i in winners:
                 continue
             res = self.mg(dest, env, "pull")
-            self.assertIn("Merge made by the 'three-way' strategy.", res.out)
+            self.assertIn("Merge made by the 'ort' strategy.", res.out)
             self.mg(dest, env, "push")
         final = self.head(self.server_repo_dir(repo))
         self.mg(alice, a_env, "pull")
@@ -317,8 +317,8 @@ class MultiUserTests(unittest.TestCase):
         self.assertEqual(self.read(bob, "a.txt"), b"a\n")
         self.assertFalse(os.path.exists(os.path.join(bob, "f.txt")))
         res = self.mg(bob, b_env, "switch", "feature")  # DWIM from origin/feature
-        self.assertIn("Switched to", res.out)
-        self.assertIn("'feature'", res.out)
+        self.assertIn("Switched to", res.err)
+        self.assertIn("'feature'", res.err)
         self.assertEqual(self.mg(bob, b_env, "branch").out, "* feature\n  main\n")
         self.assertEqual(self.read(bob, "f.txt"), b"f\n")
         self.assertIn("up to date with 'origin/feature'", self.mg(bob, b_env, "status").out)
@@ -358,7 +358,7 @@ class MultiUserTests(unittest.TestCase):
         self.mg(alice, a_env, "tag", "-a", "v1.0", "-m", "First release")
         self.assertEqual(self.mg(alice, a_env, "tag").out, "v0.1\nv1.0\n")
         self.assertEqual(self.mg(alice, a_env, "tag", "-n").out, "v0.1            init\nv1.0            First release\n")
-        res = self.fail_mg(alice, a_env, "tag", "v1.0")
+        res = self.fail_mg(alice, a_env, "tag", "v1.0", code=128)
         self.assertIn("tag 'v1.0' already exists", res.err)
         self.assertIn("(HEAD -> main, tag: v1.0)", self.mg(alice, a_env, "log", "--oneline").out)
         self.assertEqual(self.mg(alice, a_env, "cat-file", "-t", "v1.0").out, "tag\n")
@@ -379,7 +379,7 @@ class MultiUserTests(unittest.TestCase):
         self.assertIn("First release", self.mg(bob, b_env, "show", "v1.0").out)
         self.assertEqual(self.mg(bob, b_env, "branch").out, "* main\n")
         res = self.mg(bob, b_env, "checkout", "v0.1")
-        self.assertIn("HEAD is now at " + c1[:7], res.out)
+        self.assertIn("HEAD is now at " + c1[:7], res.err)
         self.assertFalse(os.path.exists(os.path.join(bob, "b.txt")))
         self.mg(bob, b_env, "switch", "main")
         # a tag made later arrives with the next fetch; a retag is refused by the server

@@ -129,6 +129,8 @@ class RefStore:
         for hop in range(6):
             raw = self.read_raw(name)
             if raw is None:
+                if hop > 0 and os.path.isfile(self.path(name)):
+                    raise self._corrupt(name, "the file is empty")
                 return None
             if raw.startswith("ref:"):
                 name = raw[4:].strip()
@@ -139,8 +141,17 @@ class RefStore:
                 raise MinigitError("HEAD is corrupt: %r is neither 'ref: refs/heads/<branch>' nor a commit id"
                                    % raw[:60],
                                    hint="write e.g. 'ref: refs/heads/main' into .minigit/HEAD")
+            if hop > 0:
+                # the current branch: looking unborn would let the next commit replace its history
+                raise self._corrupt(name, "%r is not a commit id" % raw[:60])
             return None
         return None
+
+    @staticmethod
+    def _corrupt(name: str, why: str) -> MinigitError:
+        return MinigitError(f"{name} is corrupt: {why}",
+                            hint=f"write the commit id it should name into .minigit/{name} "
+                                 "(or delete that file to make the branch unborn)")
 
     def head_target(self) -> str | None:
         raw = self.read_raw("HEAD")

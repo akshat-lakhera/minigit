@@ -624,7 +624,8 @@ class CheckoutTests(TmpCase):
             str(cm.exception.message),
             "Your local changes to the following files would be overwritten by checkout:\n"
             "\tchange.txt\n"
-            "Please commit your changes or restore them before you switch branches.")
+            "Please commit your changes or stash them before you switch branches.\n"
+            "Aborting")
         self.assertEqual(self.snapshot(), before)
         self.assertEqual(self.index.serialize(), before_index)
 
@@ -656,7 +657,8 @@ class CheckoutTests(TmpCase):
             cm.exception.message,
             "The following untracked working tree files would be overwritten by checkout:\n"
             "\tadded.txt\n"
-            "Please move or remove them before you switch branches.")
+            "Please move or remove them before you switch branches.\n"
+            "Aborting")
         self.assertEqual(self.read("added.txt"), b"my untracked\n")
         self.assertEqual(self.read("change.txt"), b"v1\n")
 
@@ -670,10 +672,11 @@ class CheckoutTests(TmpCase):
             cm.exception.message,
             "Your local changes to the following files would be overwritten by rebase:\n"
             "\tchange.txt\n"
-            "Please commit your changes or restore them before you rebase.\n"
+            "Please commit your changes or stash them before you rebase.\n"
             "error: The following untracked working tree files would be overwritten by rebase:\n"
             "\tadded.txt\n"
-            "Please move or remove them before you rebase.")
+            "Please move or remove them before you rebase.\n"
+            "Aborting")
 
     def test_untracked_identical_file_is_adopted(self) -> None:
         self.write("added.txt", b"hi\n")

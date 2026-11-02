@@ -17,12 +17,13 @@ from __future__ import annotations
 import os
 import re
 
-from .errors import MinigitError
+from .errors import FatalError, MinigitError
 from .util import atomic_write
 
 # (section, subsection|None) -> [(key, value), ...] ; dict keeps file order
 _Sections = dict[tuple[str, str | None], list[tuple[str, str]]]
 
+_KEY_RE = re.compile(r"^[a-z0-9_-]+$")
 _SECTION_RE = re.compile(r'^\[([A-Za-z0-9_.-]+)(?:\s+"((?:[^"\\]|\\.)*)")?\]\s*$')
 
 
@@ -61,10 +62,12 @@ def _escape(s: str) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def parse_config_text(text: str) -> _Sections:
+def parse_config_text(text: str, path: str | None = None) -> _Sections:
+    """Parse config text; a line that is not a section header or ``key = value`` is refused
+    (as git does) rather than skipped, because rewriting the file would then lose or mangle it."""
     sections: _Sections = {}
     current: list[tuple[str, str]] | None = None
-    for raw in text.splitlines():
+    for n, raw in enumerate(text.splitlines(), 1):
         line = raw.strip()
         if not line or line[0] in "#;":
             continue
@@ -80,10 +83,12 @@ def parse_config_text(text: str) -> _Sections:
             v = v.strip()
         else:
             k, v = line.lower(), "true"
-        if not k:
-            continue
-        if current is None:
-            current = sections.setdefault(("", None), [])
+        if current is None or line.startswith("[") or not _KEY_RE.match(k):
+            where = f" in file {path}" if path else ""
+            raise FatalError(f"bad config line {n}{where}",
+                             hint=f"fix or remove that line in a text editor: {line[:80]!r}"
+                                  + ("" if current is not None or line.startswith("[")
+                                     else " (every key must come after a [section] header)"))
         current.append((k, v))
     return sections
 
@@ -112,7 +117,7 @@ def read_config_file(path: str | None) -> _Sections:
         return {}
     if data.startswith(b"\xef\xbb\xbf"):  # UTF-8 BOM (e.g. PowerShell 5.1 Out-File): skipped, as git does
         data = data[3:]
-    return parse_config_text(data.decode("utf-8", "surrogateescape"))
+    return parse_config_text(data.decode("utf-8", "surrogateescape"), path)
 
 
 class Config:

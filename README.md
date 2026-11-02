@@ -256,7 +256,7 @@ a pull request database `pulls.json` lives inside the bare repository). Details 
 python -m unittest discover -s tests -t .
 ```
 
-920 tests in `tests/` (counted as `def test_`): unit tests per module, CLI tests, and end-to-end tests that start a
+968 tests in `tests/` (counted as `def test_`): unit tests per module, CLI tests, and end-to-end tests that start a
 live `minigit serve` and drive clones, pushes, conflicts and concurrent pushes through real subprocesses.
 `tests_blackbox/` holds another 425 tests, independent QA suites written against `SPEC.md` only (they drive the CLI
 as a user would); run them with `python -m unittest discover -s tests_blackbox -t .`.

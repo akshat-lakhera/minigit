@@ -497,11 +497,11 @@ class PullRequestsLiteTests(_PullRequestBase):
         self.assertIn("push", res.err)
         # usage errors
         res = run(["pr", "open", "--head", "feature", "--base", "main"], cwd=alice, env=a_env, check=False)
-        self.assertEqual(res.returncode, 2, str(res))
+        self.assertEqual(res.returncode, 129, str(res))
         res = run(["pr", "show", "abc"], cwd=alice, env=a_env, check=False)
-        self.assertEqual(res.returncode, 2, str(res))
+        self.assertEqual(res.returncode, 129, str(res))
         res = run(["pr"], cwd=alice, env=a_env, check=False)
-        self.assertEqual(res.returncode, 2, str(res))
+        self.assertEqual(res.returncode, 129, str(res))
         res = self.fail_pr(alice, a_env, "open", "--title", "two\nlines", "--head", "feature", "--base", "main")
         self.assertIn("single line", res.err)
         self.assertEqual(self.pr(alice, a_env, "list").out, "", "every refused open leaves no PR behind")
@@ -532,7 +532,7 @@ class PullRequestsLiteTests(_PullRequestBase):
 
         # outside a repository / without the remote
         res = run(["pr", "list"], cwd=self.work, env=a_env, check=False)
-        self.assertEqual(res.returncode, 1, str(res))
+        self.assertEqual(res.returncode, 128, str(res))   # git: fatal: not a ... repository
         self.assertIn("not a minigit repository", res.err)
         loner = os.path.join(self.work, "loner")
         run(["init", loner], cwd=self.work, env=a_env)

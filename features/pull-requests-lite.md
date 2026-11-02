@@ -102,7 +102,7 @@ minigit pr close N [--remote NAME]
   Credentials follow section 7.1 of the SPEC exactly as for `fetch`/`push`. Order inside `cmd_pr`:
   discover the repo first (so outside a repo the error is `not a minigit repository`), then resolve the
   remote, then talk to the server.
-- `N` is parsed as an `int` by argparse (so `pr show abc` is a usage error, exit 2).
+- `N` is parsed as an `int` by argparse (so `pr show abc` is a usage error, exit 129).
 - **open**
   - `--title/-t` is required (usage error without it). The title must be one line of at most 256
     characters after `strip()`; otherwise the server answers 400 and the CLI exits 1.
@@ -494,7 +494,7 @@ def format_close_result(pull: dict) -> str              # "Closed pull request #
 3. Head already contained in base at open time → 409 `nothing_to_compare`.
 4. A second open PR with the same head and base → 409 `duplicate` (payload `number`); the CLI
    message contains `#1` and `already open`. After the first is merged or closed, a new one may be opened.
-5. Missing `--title` → exit 2; multi-line or over-long title → exit 1.
+5. Missing `--title` → exit 129; multi-line or over-long title → exit 1.
 6. `pr show 99` → `pull request #99 not found`, exit 1. `/pulls/0`, `/pulls/01`, `/pulls/abc`,
    `/pulls/1/bogus` → 404.
 7. Merging or closing a merged/closed PR → 409 `not_open`, exit 1 with `not open` in the message.
@@ -517,7 +517,7 @@ def format_close_result(pull: dict) -> str              # "Closed pull request #
     Wrong token → `authentication failed`, exit 1.
 16. Local head branch ahead of the remote when opening → the PR uses the server's tip; the CLI prints
     the `warning: your local ... differs` line and `show` counts only the pushed commits.
-17. `pr` outside a repository → `not a minigit repository`, exit 1; inside a repo without the remote
+17. `pr` outside a repository → `not a minigit repository`, exit 128; inside a repo without the remote
     → `no remote 'origin' configured`, exit 1.
 18. Server restarts lose nothing: all state is in `pulls.json` and the object store.
 19. `pulls.json` lock held by a stuck process → 503 `busy` after 5 s (same as `server.json`). *unit*
@@ -528,7 +528,7 @@ def format_close_result(pull: dict) -> str              # "Closed pull request #
     leak; malformed paths (`/pulls/abc`) and wrong methods (`DELETE /pulls/1`) are 401 too, because the
     repository check comes first. The 404 / 405 appear with credentials or on a public repository.
 23. JSON body over 1 MiB → 413 `too_large`; no `Content-Length` → 411 (existing `_read_body`).
-24. `pr show -1` / `pr merge 0` → usage error, exit 2 (never reaches the server).
+24. `pr show -1` / `pr merge 0` → usage error, exit 129 (never reaches the server).
 25. The base ref is rewritten out of band between the trial merge and the CAS → 409 `base_moved`, PR
     stays open, nothing else changes. *unit* (monkeypatch `refs.update` or write the ref file directly)
 26. The 409 `merge_conflict` payload names `head` and `base`, and the CLI hint uses them.

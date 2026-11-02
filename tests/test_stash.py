@@ -176,8 +176,8 @@ class StashPushTests(_StashCase):
         env.pop("MINIGIT_AUTHOR_NAME")
         env.pop("MINIGIT_AUTHOR_EMAIL")
         self.put("a.txt", b"changed\n")
-        res = self.git_fail("stash", env=env)
-        self.assertIn("please set your identity", res.err)
+        res = self.git_fail("stash", env=env, code=128)
+        self.assertIn("author identity unknown", res.err)
         self.assertEqual(self.get("a.txt"), b"changed\n")
         self.assertEqual(self.porcelain(), [" M a.txt"])
         self.assertEqual(self.stash_list(), [])
@@ -275,12 +275,25 @@ class StashApplyPopDropTests(_StashCase):
         self.assertEqual(self.get("a.txt"), b"staged then edited\n")
         self.assertEqual(self.porcelain(), [" M a.txt"])
 
+    def test_show_prints_the_diffstat_and_with_p_the_patch(self):
+        self.put("a.txt", b"a change\n")
+        self.git("stash")
+        self.assertEqual(self.git("stash", "show").out,
+                         " a.txt | 4 +---\n 1 file changed, 1 insertion(+), 3 deletions(-)\n")   # git's default
+        patch = self.git("stash", "show", "-p").out
+        self.assertTrue(patch.startswith("diff --git a/a.txt b/a.txt\n"), patch)
+        self.assertIn("+a change\n", patch)
+        self.assertIn("-p/--patch only works with 'stash show'", self.git_fail("stash", "pop", "-p", code=129).err)
+
     def test_apply_keeps_the_entry_and_references_select_entries(self):
         self.put("a.txt", b"a change\n")
         self.git("stash", "-m", "a-change")
         self.put("b.txt", b"b change\n")
         self.git("stash", "-m", "b-change")
-        self.assertEqual(self.git("stash", "apply").out, "")  # newest entry, nothing printed
+        out = self.git("stash", "apply").out   # newest entry; like git, the status is printed
+        self.assertTrue(out.startswith("On branch main\n"), out)
+        self.assertIn("modified:   b.txt", out)
+        self.assertNotIn("Dropped", out)
         self.assertEqual(self.get("b.txt"), b"b change\n")
         self.assertEqual(self.get("a.txt"), BASE_A)
         self.assertEqual(len(self.stash_list()), 2)
@@ -334,7 +347,7 @@ class StashApplyPopDropTests(_StashCase):
             ("stash", "push", "--", "a.txt"),
         ]
         for args in usage:
-            res = self.git_fail(*args, code=2)
+            res = self.git_fail(*args, code=129)
             self.assertIn("error:", res.err, args)
         self.assertEqual(self.stash_list(), [f"stash@{{0}}: {self.wip}"])
         self.assertEqual(self.get("a.txt"), BASE_A)

@@ -111,7 +111,7 @@ class TestCliArgs(unittest.TestCase):
             self.run_cli("server", "init", "R", cwd=tmp)
             for port in ("70000", "-1", "65536", "abc"):
                 res = self.run_cli("serve", "--root", "R", "--port", port, "--quiet", cwd=tmp)
-                self.assertEqual(res.returncode, 2, res)
+                self.assertEqual(res.returncode, 129, res)
                 self.assertNotIn("internal error", res.err)
                 self.assertIn("port", res.err)
 
@@ -193,9 +193,9 @@ class TestCliCollab(unittest.TestCase):
         d = self.clone_with_commit()
         self.cli("push", "-u", "origin", "main", cwd=d)
         for dst in ("CON", "aux.txt"):
-            # The CLI now refuses the name before contacting the server (QA bug 5): exit 2, no request.
+            # The CLI now refuses the name before contacting the server (QA bug 5): exit 129, no request.
             res = self.cli("push", "origin", f"main:{dst}", cwd=d, check=False)
-            self.assertEqual(res.returncode, 2, res)
+            self.assertEqual(res.returncode, 129, res)
             self.assertIn("reserved device name", res.err, res)
             self.assertNotIn("internal server error", res.err, res)
         # A client without that check still gets a clean 409 from the server: covered at the HTTP level by

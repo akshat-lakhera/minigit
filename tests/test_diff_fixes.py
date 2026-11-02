@@ -128,6 +128,45 @@ class CliTest(unittest.TestCase):
         self.assertEqual(self.m("diff").out, "* Unmerged path au.txt\n* Unmerged path ua.txt\n")
         write(os.path.join(self.wt, "au.txt"), "x\nmore\n")
         self.assertIn("* Unmerged path au.txt\ndiff --git a/au.txt b/au.txt\n", self.m("diff").out)
+        # --stat: the Unmerged line is not counted; the diff against stage 2 gets its own line (git)
+        self.assertEqual(self.m("diff", "--stat").out,
+                         " au.txt | Unmerged\n au.txt | 1 +\n ua.txt | Unmerged\n"
+                         " 1 file changed, 1 insertion(+)\n")
+        write(os.path.join(self.wt, "au.txt"), "x\n")
+        self.assertEqual(self.m("diff", "--stat").out,
+                         " au.txt | Unmerged\n ua.txt | Unmerged\n 0 files changed\n")
+
+
+class FuncNameTest(unittest.TestCase):
+    """The text after a hunk's ``@@ ... @@``: git's default function-name heuristic."""
+
+    def headers(self, a: str, b: str) -> list[str]:
+        out = diffmod.render_hunks(a.encode(), b.encode()).decode()
+        return [line for line in out.split("\n") if line.startswith("@@")]
+
+    def test_nearest_line_starting_with_a_letter_above_the_hunk(self):
+        old = ["def alpha():\n"] + [f"    x{i}\n" for i in range(20)] + ["\n", "class Beta:\r\n"] + \
+              [f"    y{i}\n" for i in range(20)]
+        new = list(old)
+        new[1] = "    X0\n"      # the hunk starts at line 1: nothing above it
+        new[12] = "    X11\n"    # "def alpha():" is above the hunk's first context line
+        new[35] = "    Y12\n"    # "class Beta:" (its CR trimmed) is the nearest
+        self.assertEqual(self.headers("".join(old), "".join(new)),
+                         ["@@ -1,5 +1,5 @@", "@@ -10,7 +10,7 @@ def alpha():", "@@ -33,7 +33,7 @@ class Beta:"])
+
+    def test_kept_from_the_previous_hunk_and_whitespace_trimmed(self):
+        old = ["_start  \t\n"] + [f" {i}\n" for i in range(30)]
+        new = list(old)
+        new[10] = " ten\n"
+        new[25] = " twenty-five\n"   # no candidate between the hunks: the last one carries over
+        self.assertEqual(self.headers("".join(old), "".join(new)),
+                         ["@@ -8,7 +8,7 @@ _start", "@@ -23,7 +23,7 @@ _start"])
+
+    def test_cut_to_80_bytes(self):
+        old = ["$" + "x" * 100 + "\r\n"] + [f" {i}\r\n" for i in range(8)]
+        new = list(old)
+        new[7] = " seven\r\n"
+        self.assertEqual(self.headers("".join(old), "".join(new)), ["@@ -5,5 +5,5 @@ $" + "x" * 79])
 
 
 if __name__ == "__main__":

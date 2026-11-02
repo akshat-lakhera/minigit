@@ -8,14 +8,13 @@ zlib-compressed under ``objects/ab/<38 hex>``. Blob, tree, commit and
 from __future__ import annotations
 
 import os
-import random
 import re
 import zlib
 from dataclasses import dataclass
 from typing import Iterable, Iterator
 
 from .errors import ObjectError
-from .util import _O_BINARY, _write_all, format_tz, parse_tz, replace_with_retry, sha1_hex, validate_name
+from .util import _O_BINARY, _write_all, format_tz, parse_tz, random_hex8, replace_with_retry, sha1_hex, validate_name
 
 EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
@@ -26,6 +25,8 @@ TREE_MODES = ("100644", "100755", "40000")
 # use the same limit, so anything that was stored can always be read back.
 MAX_OBJECT_SIZE = 256 << 20
 _HEX_RE = re.compile(r"[0-9a-f]+\Z")
+CORRUPT_HINT = ("run 'minigit fsck' to list every damaged object; a good copy of one can be put back from "
+                "another clone (same path under .minigit/objects/)")
 
 
 def _is_hex(s: str) -> bool:
@@ -136,7 +137,7 @@ class ObjectStore:
             return sha
         d = os.path.dirname(dst)
         os.makedirs(d, exist_ok=True)
-        tmp = os.path.join(d, "tmp-%d-%08x" % (os.getpid(), random.getrandbits(32)))
+        tmp = os.path.join(d, "tmp-%d-%s" % (os.getpid(), random_hex8()))
         fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY | _O_BINARY, 0o644)
         try:
             try:
@@ -179,9 +180,11 @@ class ObjectStore:
             full = _inflate(raw)
             obj_type, content = decode_object(full)
         except ObjectError as e:
-            raise ObjectError("object %s is corrupt: %s" % (sha, e.message), sha=sha) from None
+            why = e.message[len("corrupt object: "):] if e.message.startswith("corrupt object: ") else e.message
+            raise ObjectError("object %s is corrupt: %s" % (sha, why), sha=sha, hint=CORRUPT_HINT) from None
         if sha1_hex(full) != sha:
-            raise ObjectError("object %s is corrupt: hash mismatch" % sha, sha=sha)
+            raise ObjectError("object %s is corrupt: hash mismatch (its content does not match its id)" % sha,
+                              sha=sha, hint=CORRUPT_HINT)
         self._remember(self._types, sha, obj_type)
         return obj_type, content
 

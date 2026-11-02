@@ -355,6 +355,9 @@ class RebaseConflictTests(_RebaseCase):
         self.assertIn('(all conflicts fixed: run "minigit rebase --continue")', self.status())
         res = self.mg("rebase", "--continue")
         self.assertIn("Successfully rebased and updated refs/heads/feature.", res.out)
+        # the commit of the resolution is reported like git's: summary line, then its shortstat
+        self.assertRegex(res.out, r"\[detached HEAD [0-9a-f]{7}\] feature edit\n"
+                                  r" 1 file changed, 1 insertion\(\+\), 1 deletion\(-\)\n")
         self.assertEqual(self.subjects(), ["feature extra", "feature edit", "main edit", "base"])
         self.assertEqual(self.sha("HEAD~2"), main_tip)
         self.assertEqual(self.sha("ORIG_HEAD"), extra)
@@ -363,7 +366,7 @@ class RebaseConflictTests(_RebaseCase):
         self.assertIn("On branch feature", self.status())
         self.assertEqual(self.porcelain(), "")
         self.assert_no_rebase()
-        self.assertIn("unknown revision 'REBASE_HEAD'", self.fail("rev-parse", "REBASE_HEAD").err)
+        self.assertIn("unknown revision 'REBASE_HEAD'", self.fail("rev-parse", "REBASE_HEAD", code=128).err)
 
     def test_continue_refuses_unresolved_paths_and_unstaged_changes(self):
         self.conflicting()
@@ -591,10 +594,10 @@ class RebaseRefusalTests(_RebaseCase):
 
     def test_usage_errors(self):
         self.diverged()
-        self.fail("rebase", "--continue", "main", code=2)
-        self.fail("rebase", "--skip", "--abort", code=2)
-        self.fail("rebase", "--abort", "--onto", "main", code=2)
-        res = self.fail("rebase", "nosuch")
+        self.fail("rebase", "--continue", "main", code=129)
+        self.fail("rebase", "--skip", "--abort", code=129)
+        self.fail("rebase", "--abort", "--onto", "main", code=129)
+        res = self.fail("rebase", "nosuch", code=128)   # unknown revision: git's fatal
         self.assertIn("unknown revision 'nosuch'", res.err)
         self.assert_no_rebase()
         helptext = self.mg("rebase", "--help").text
@@ -741,7 +744,7 @@ class RebaseCollaborationTests(unittest.TestCase):
         alice("add", ".")
         alice("commit", "-m", "alice two")
         res = alice("pull", "--no-rebase")
-        self.assertIn("Merge made by the 'three-way' strategy.", res.out)
+        self.assertIn("Merge made by the 'ort' strategy.", res.out)
         self.assertEqual(alice("cat-file", "-p", "HEAD").out.count("parent "), 2)
 
     def test_status_and_branch_report_a_gone_upstream(self):

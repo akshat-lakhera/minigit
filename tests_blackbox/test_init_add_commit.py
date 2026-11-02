@@ -269,7 +269,8 @@ class InitTests(Base):
         self.assertFalse(os.path.exists(os.path.join(gitdir, "index")), "index is absent until something is staged")
         self.assertEqual(self.ls_files(), [])
         status = self.mg("status").out
-        self.assertEqual(status, "On branch main\n\nNo commits yet\n\nnothing to commit, working tree clean\n")
+        self.assertEqual(status, "On branch main\n\nNo commits yet\n\n"
+                                 'nothing to commit (create/copy files and use "minigit add" to track)\n')
         self.assertEqual(self.porcelain(), "")
         res = self.fail_mg("log")
         self.assertIn("does not have any commits yet", res.err)
@@ -300,7 +301,7 @@ class InitTests(Base):
         write(os.path.join(target, "f.txt"), "f\n")
         self.mg("add", "f.txt", cwd=target)
         res = self.mg("commit", "-m", "root on dev", cwd=target)
-        self.assertRegex(res.out, rf"^\[dev \(root-commit\) {HEX7}\] root on dev\n( \d+ files? changed.*\n)?$")
+        self.assertRegex(res.out, rf"^\[dev \(root-commit\) {HEX7}\] root on dev\n( \d+ files? changed.*\n( (create|delete) mode \d+ .*\n| mode change .*\n| rename .*\n)*)?$")
         self.assertIn("On branch dev", self.mg("status", cwd=target).out)
         self.assertRegex(self.mg("log", "--oneline", cwd=target).out, rf"^{HEX7} \(HEAD -> dev\) root on dev\n$")
         # a relative directory argument resolves against cwd
@@ -350,9 +351,9 @@ class InitTests(Base):
         write(self.path("a.txt"), "a\n")
         for args in (["status"], ["add", "a.txt"], ["commit", "-m", "x"], ["rm", "a.txt"], ["ls-files"], ["log"]):
             with self.subTest(args=args):
-                res = self.fail_mg(*args)
+                res = self.fail_mg(*args, code=128)   # git: fatal, exit 128
                 self.assertEqual(res.out, "")
-                self.assertIn("error: not a minigit repository (or any parent): ", res.err)
+                self.assertIn("fatal: not a minigit repository (or any parent): ", res.err)
                 self.assertIn(os.path.normcase(self.wt), os.path.normcase(res.err))
         # discovery walks up: a deep subdirectory of a repo is inside it
         self.init()
@@ -378,7 +379,9 @@ class AddTests(Base):
         self.assertEqual(stage, {"a.txt": ("100644", HELLO_BLOB, "0"), "empty.txt": ("100644", EMPTY_BLOB, "0")})
         self.assertEqual(self.porcelain(), "A  a.txt\nA  empty.txt\n")
         status = self.mg("status").out
-        self.assertIn("Changes to be committed:\n\tnew file:   a.txt\n\tnew file:   empty.txt\n", status)
+        self.assertIn("Changes to be committed:\n"
+                      '  (use "minigit rm --cached <file>..." to unstage)\n'
+                      "\tnew file:   a.txt\n\tnew file:   empty.txt\n", status)
         # the blob is a git-identical loose object
         raw = read(self.object_path(HELLO_BLOB))
         self.assertEqual(zlib.decompress(raw), b"blob 6\0hello\n")
@@ -450,7 +453,7 @@ class AddTests(Base):
         self.assertEqual(self.mg("status", "--porcelain", cwd=sub).out,
                          "A  a.txt\nA  c.txt\nA  other/x.txt\nA  sub/b.txt\nA  sub/c.txt\n")
         res = self.mg("commit", "-m", "from sub", cwd=sub)
-        self.assertRegex(res.out, rf"^\[main \(root-commit\) {HEX7}\] from sub\n( \d+ files? changed.*\n)?$")
+        self.assertRegex(res.out, rf"^\[main \(root-commit\) {HEX7}\] from sub\n( \d+ files? changed.*\n( (create|delete) mode \d+ .*\n| mode change .*\n| rename .*\n)*)?$")
         # adding an unchanged tracked file from its own directory is a silent no-op
         res = self.mg("add", "x.txt", cwd=self.path("other"))
         self.assertEqual((res.rc, res.out, res.err), (0, "", ""))
@@ -487,15 +490,16 @@ class AddTests(Base):
     def test_add_is_all_or_nothing(self):
         self.write("good.txt", "g\n")
         self.write("also.txt", "a\n")
-        res = self.fail_mg("add", "good.txt", "nope", "also.txt")
-        self.assertEqual(res.err, "error: pathspec 'nope' did not match any files\n")
+        res = self.fail_mg("add", "good.txt", "nope", "also.txt", code=128)
+        self.assertEqual(res.err, "fatal: pathspec 'nope' did not match any files\n")
         self.assertEqual(res.out, "")
         self.assertEqual(self.ls_files(), [], "a failed add must not stage anything")
         self.assertFalse(os.path.exists(self.path(".minigit/index")), "index must not be written")
         self.assertEqual(self.lock_files(), [])
         self.assertEqual(self.porcelain(), "?? also.txt\n?? good.txt\n")
-        res = self.fail_mg("add", code=2)
-        self.assertIn("error: ", res.err)
+        res = self.mg("add")   # as git: a note on stderr, exit 0, nothing staged
+        self.assertEqual(res.out, "")
+        self.assertTrue(res.err.startswith("Nothing specified, nothing added.\n"), str(res))
         self.assertEqual(self.ls_files(), [])
         self.mg("add", "good.txt", "also.txt")
         self.assertEqual(self.ls_files(), ["also.txt", "good.txt"])
@@ -545,7 +549,8 @@ class AddTests(Base):
         for spec in ("x.log", "build/out.txt", "rooted.txt", "sub/secret", "sub/deep/also.log"):
             with self.subTest(spec=spec):
                 res = self.fail_mg("add", spec)
-                self.assertEqual(res.err, f"error: path '{spec}' is ignored by .minigitignore (use -f)\n")
+                self.assertEqual(res.err, "The following paths are ignored by one of your .minigitignore files:\n"
+                                          f"{spec}\nhint: Use -f if you really want to add them.\n")
         self.assertEqual(len(self.ls_files()), 5)
         self.mg("add", "-f", "x.log", "sub/secret")
         self.assertIn("x.log", self.ls_files())
@@ -570,7 +575,8 @@ class AddTests(Base):
         self.write("objs/b.o", "b\n")
         self.write("src/main.c", "m\n")
         res = self.fail_mg("add", "build")
-        self.assertEqual(res.err, "error: path 'build' is ignored by .minigitignore (use -f)\n")
+        self.assertEqual(res.err, "The following paths are ignored by one of your .minigitignore files:\n"
+                                  "build\nhint: Use -f if you really want to add them.\n")
         res = self.mg("add", "-f", "build")
         self.assertEqual(res.rc, 0, str(res))
         self.assertIn("build/out.txt", self.ls_files(),
@@ -623,7 +629,7 @@ class AddTests(Base):
             self.mg("add", n)  # by explicit name too
         self.assertEqual(len(self.ls_files()), len(names))
         res = self.mg("commit", "-m", "ünïcode ✓")
-        self.assertRegex(res.out, rf"^\[main \(root-commit\) {HEX7}\] ünïcode ✓\n( \d+ files? changed.*\n)?$")
+        self.assertRegex(res.out, rf"^\[main \(root-commit\) {HEX7}\] ünïcode ✓\n( \d+ files? changed.*\n( (create|delete) mode \d+ .*\n| mode change .*\n| rename .*\n)*)?$")
         for n in names:
             self.assertEqual(self.mg("cat-file", "-p", f"HEAD:{n}").stdout, (n + "\n").encode("utf-8"), n)
         self.assertEqual(self.porcelain(), "")
@@ -700,8 +706,8 @@ class AddTests(Base):
         self.write("a.txt", "a\n")
         lock = self.path(".minigit/index.lock")
         write(lock, b"")
-        res = self.fail_mg("add", "a.txt")
-        self.assertIn("error: unable to lock", res.err)
+        res = self.fail_mg("add", "a.txt", code=128)
+        self.assertIn("fatal: unable to lock", res.err)
         self.assertIn("index.lock exists", res.err)
         self.assertIn("If no other minigit process is running, delete it.", res.err)
         self.assertTrue(os.path.exists(lock), "a failing process must not delete somebody else's lock")
@@ -771,15 +777,17 @@ class RmTests(Base):
         self.assertFalse(self.exists("a.txt"))
         self.assertNotIn("a.txt", self.ls_files())
         self.assertEqual(self.porcelain(), "D  a.txt\n")
-        self.assertIn("Changes to be committed:\n\tdeleted:    a.txt\n", self.mg("status").out)
+        self.assertIn("Changes to be committed:\n"
+                      '  (use "minigit restore --staged <file>..." to unstage)\n'
+                      "\tdeleted:    a.txt\n", self.mg("status").out)
         # a tracked file that is already gone from disk can still be rm'ed
         os.remove(self.path("b.txt"))
         self.assertEqual(self.porcelain(), "D  a.txt\n D b.txt\n")
         self.assertEqual(self.mg("rm", "b.txt").out, "rm 'b.txt'\n")
         self.assertEqual(self.porcelain(), "D  a.txt\nD  b.txt\n")
         self.mg("commit", "-m", "rm a b")
-        res = self.fail_mg("cat-file", "-p", "HEAD:a.txt")
-        self.assertEqual(res.err, "error: path 'a.txt' does not exist in 'HEAD'\n")
+        res = self.fail_mg("cat-file", "-p", "HEAD:a.txt", code=128)
+        self.assertEqual(res.err, "fatal: path 'a.txt' does not exist in 'HEAD'\n")
         self.assertEqual(sorted(r[3] for r in self.tree_listing("HEAD:")), ["d.txt", "sub"])
         self.assertEqual(self.porcelain(), "")
         # several paths at once, output sorted by path
@@ -796,12 +804,14 @@ class RmTests(Base):
         self.assertEqual(self.porcelain(), "?? d.txt\nD  d.txt\n", "a staged deletion whose file remains shows D and ??")
         status = self.mg("status").out
         self.assertIn("\tdeleted:    d.txt\n", status)
-        self.assertIn("Untracked files:\n\td.txt\n", status)
+        self.assertIn("Untracked files:\n"
+                      '  (use "minigit add <file>..." to include in what will be committed)\n'
+                      "\td.txt\n", status)
         # a newly staged (not yet committed) file: plain rm refuses, --cached is fine since I == W
         self.write("new.txt", "n\n")
         self.mg("add", "new.txt")
         res = self.fail_mg("rm", "new.txt")
-        self.assertEqual(res.err, "error: 'new.txt' has staged or local changes (use -f)\n")
+        self.assertEqual(res.err, "error: the following file has changes staged in the index:\n    new.txt\n(use --cached to keep the file, or -f to force removal)\n")
         self.assertTrue(self.exists("new.txt"))
         self.assertIn("new.txt", self.ls_files())
         self.assertEqual(self.mg("rm", "--cached", "new.txt").out, "rm 'new.txt'\n")
@@ -815,7 +825,7 @@ class RmTests(Base):
     def test_rm_refuses_staged_or_local_changes_unless_forced(self):
         self.write("a.txt", "modified\n")
         res = self.fail_mg("rm", "a.txt")
-        self.assertEqual(res.err, "error: 'a.txt' has staged or local changes (use -f)\n")
+        self.assertEqual(res.err, "error: the following file has local modifications:\n    a.txt\n(use --cached to keep the file, or -f to force removal)\n")
         self.assertEqual(self.read("a.txt"), b"modified\n")
         self.assertIn("a.txt", self.ls_files())
         # --cached is allowed when the index still matches HEAD (only the worktree changed)
@@ -826,9 +836,9 @@ class RmTests(Base):
         self.mg("add", "b.txt")
         self.write("b.txt", "and modified again\n")
         res = self.fail_mg("rm", "--cached", "b.txt")
-        self.assertEqual(res.err, "error: 'b.txt' has staged or local changes (use -f)\n")
+        self.assertEqual(res.err, "error: the following file has staged content different from both the\nfile and the HEAD:\n    b.txt\n(use -f to force removal)\n")
         res = self.fail_mg("rm", "b.txt")
-        self.assertEqual(res.err, "error: 'b.txt' has staged or local changes (use -f)\n")
+        self.assertEqual(res.err, "error: the following file has staged content different from both the\nfile and the HEAD:\n    b.txt\n(use -f to force removal)\n")
         self.assertEqual(self.read("b.txt"), b"and modified again\n")
         self.assertEqual(self.mg("rm", "-f", "b.txt").out, "rm 'b.txt'\n")
         self.assertFalse(self.exists("b.txt"))
@@ -841,12 +851,12 @@ class RmTests(Base):
         self.assertEqual(self.porcelain(), "?? a.txt\nD  a.txt\nD  b.txt\nD  d.txt\n")
 
     def test_rm_directory_needs_recursive_and_prunes_empty_dirs(self):
-        res = self.fail_mg("rm", "sub")
-        self.assertEqual(res.err, "error: not removing 'sub' recursively without -r\n")
+        res = self.fail_mg("rm", "sub", code=128)
+        self.assertEqual(res.err, "fatal: not removing 'sub' recursively without -r\n")
         self.assertTrue(self.exists("sub/c.txt") and self.exists("sub/deep/e.txt"))
         self.assertEqual(len(self.ls_files()), 5)
-        res = self.fail_mg("rm", ".")
-        self.assertEqual(res.err, "error: not removing '.' recursively without -r\n")
+        res = self.fail_mg("rm", ".", code=128)
+        self.assertEqual(res.err, "fatal: not removing '.' recursively without -r\n")
         self.assertEqual(len(self.ls_files()), 5)
         self.write("sub/untracked.txt", "u\n")
         # read-only files (a common Windows trap) are removed too
@@ -870,18 +880,18 @@ class RmTests(Base):
 
     def test_rm_is_all_or_nothing_and_rejects_untracked(self):
         self.write("untracked.txt", "u\n")
-        res = self.fail_mg("rm", "a.txt", "nope")
-        self.assertEqual(res.err, "error: pathspec 'nope' did not match any files\n")
+        res = self.fail_mg("rm", "a.txt", "nope", code=128)
+        self.assertEqual(res.err, "fatal: pathspec 'nope' did not match any files\n")
         self.assertEqual(res.out, "")
         self.assertTrue(self.exists("a.txt"))
         self.assertIn("a.txt", self.ls_files())
-        res = self.fail_mg("rm", "untracked.txt")
-        self.assertEqual(res.err, "error: pathspec 'untracked.txt' did not match any files\n")
+        res = self.fail_mg("rm", "untracked.txt", code=128)
+        self.assertEqual(res.err, "fatal: pathspec 'untracked.txt' did not match any files\n")
         self.assertTrue(self.exists("untracked.txt"))
-        res = self.fail_mg("rm", "a.txt", "untracked.txt")
+        res = self.fail_mg("rm", "a.txt", "untracked.txt", code=128)
         self.assertTrue(self.exists("a.txt"))
-        res = self.fail_mg("rm", code=2)
-        self.assertIn("error: ", res.err)
+        res = self.fail_mg("rm", code=128)
+        self.assertEqual(res.err, "fatal: No pathspec was given. Which files should I remove?\n")
         res = self.fail_mg("rm", "../outside")
         self.assertRegex(res.err, r"^error: '\.\./outside' is outside repository\n$")
         self.assertEqual(self.porcelain(), "?? untracked.txt\n")
@@ -926,7 +936,7 @@ class CommitTests(Base):
         self.assertEqual(self.mg("cat-file", "-t", "HEAD:a").out, "tree\n")
         self.assertEqual(self.mg("cat-file", "-t", "HEAD:a/y").out, "tree\n")
         self.assertEqual(self.mg("cat-file", "-p", "HEAD:a/y/z").stdout, b"5\n")
-        res = self.fail_mg("cat-file", "-p", "HEAD:a/x/nothing")
+        res = self.fail_mg("cat-file", "-p", "HEAD:a/x/nothing", code=128)
         self.assertIn("does not exist in 'HEAD'", res.err)
         # exactly 5 blobs + 3 trees + 1 commit on disk, each at objects/xx/<38 hex>
         objs = self.object_files()
@@ -964,7 +974,11 @@ class CommitTests(Base):
              "# looks like a comment but -m keeps it"),
             (["-m", "ünïcode 🚀 message"], "ünïcode 🚀 message\n", "ünïcode 🚀 message"),
             (["-m", "a", "-m", ""], "a\n", "a"),
-            (["-m", "multi\nline\nsubject only first"], "multi\nline\nsubject only first\n", "multi"),
+            # git's subject is the first paragraph, its lines joined by spaces
+            (["-m", "multi\nline\nsubject only first"], "multi\nline\nsubject only first\n",
+             "multi line subject only first"),
+            # git's cleanup: trailing blanks per line, one blank line between paragraphs, none around
+            (["-m", "\n\nspaced   \n\n\n\nout  \n\n"], "spaced\n\nout\n", "spaced"),
         ]
         for args, expected_msg, subject in cases:
             with self.subTest(args=args):
@@ -975,18 +989,18 @@ class CommitTests(Base):
                 head, _, msg = text.partition(b"\n\n")
                 self.assertEqual(msg.decode("utf-8"), expected_msg)
                 self.assertIn(b"\ncommitter " + f"{AUTHOR_NAME} <{AUTHOR_EMAIL}> {AUTHOR_DATE}".encode(), head)
-                self.assertIn(f"\n    {subject}\n", self.mg("log", "-n", "1").out)
+                self.assertIn(f"\n    {expected_msg.splitlines()[0]}\n", self.mg("log", "-n", "1").out)
 
     def test_commit_requires_a_message_and_rejects_an_empty_one(self):
         self.write("a.txt", "a\n")
         self.mg("add", "a.txt")
-        res = self.fail_mg("commit", code=2)
+        res = self.fail_mg("commit", code=129)
         self.assertEqual(res.err.splitlines()[-1], "error: commit message required: use -m")
         self.assertFalse(self.exists(".minigit/refs/heads/main"))
         for args in (["-m", ""], ["-m", "   "], ["-m", "\n\n"], ["-m", "", "-m", ""], ["-m", " \t \n "]):
             with self.subTest(args=args):
                 res = self.fail_mg("commit", *args)
-                self.assertEqual(res.err, "error: aborting commit due to empty commit message\n")
+                self.assertEqual(res.err, "Aborting commit due to empty commit message.\n")  # git's line
                 self.assertEqual(res.out, "")
         self.assertFalse(self.exists(".minigit/refs/heads/main"), "no commit may be created")
         self.assertIn("No commits yet", self.mg("status").out)
@@ -997,7 +1011,10 @@ class CommitTests(Base):
 
     def test_nothing_to_commit_and_allow_empty(self):
         res = self.fail_mg("commit", "-m", "nothing staged on an unborn branch")
-        self.assertEqual(res.err, "error: nothing to commit, working tree clean\n")
+        # as git: the status goes to stdout, ending with why nothing was committed
+        self.assertEqual(res.err, "")
+        self.assertEqual(res.out, "On branch main\n\nInitial commit\n\n"
+                                  'nothing to commit (create/copy files and use "minigit add" to track)\n')
         self.assertFalse(self.exists(".minigit/refs/heads/main"))
         res = self.mg("commit", "--allow-empty", "-m", "empty root")
         root = self.head()
@@ -1012,12 +1029,17 @@ class CommitTests(Base):
         self.write("untracked.txt", "u\n")
         res = self.fail_mg("commit", "-m", "clean index")
         # git's wording when only untracked files are present
-        self.assertEqual(res.err, "error: nothing added to commit but untracked files present (use \"minigit add\" to track)\n")
+        self.assertEqual(res.err, "")
+        self.assertIn("Untracked files:\n", res.out)
+        self.assertTrue(res.out.endswith("\n\nnothing added to commit but untracked files present "
+                                         "(use \"minigit add\" to track)\n"), res.out)
         self.assertEqual(self.head(), base)
         self.write("a.txt", "dirty but unstaged\n")
         res = self.fail_mg("commit", "-m", "unstaged change is not a commit")
         # git's wording when a tracked file is modified but not staged
-        self.assertEqual(res.err, 'error: no changes added to commit (use "minigit add" and/or "minigit commit -a")\n')
+        self.assertIn("Changes not staged for commit:\n", res.out)
+        self.assertTrue(res.out.endswith('\nno changes added to commit (use "minigit add" and/or "minigit commit -a")\n'),
+                        res.out)
         self.assertEqual(self.head(), base)
         res = self.mg("commit", "--allow-empty", "-m", "same tree again")
         new = self.head()
@@ -1035,7 +1057,7 @@ class CommitTests(Base):
         os.remove(self.path("y.txt"))
         self.write("untracked.txt", "u\n")
         res = self.mg("commit", "-a", "-m", "all")
-        self.assertRegex(res.out, rf"^\[main {HEX7}\] all\n( \d+ files? changed.*\n)?$")
+        self.assertRegex(res.out, rf"^\[main {HEX7}\] all\n( \d+ files? changed.*\n( (create|delete) mode \d+ .*\n| mode change .*\n| rename .*\n)*)?$")
         self.assertEqual(self.porcelain(), "?? untracked.txt\n", "-a never stages untracked files")
         self.assertEqual(self.mg("cat-file", "-p", "HEAD:x.txt").stdout, b"x2\n")
         self.assertEqual(sorted(r[3] for r in self.tree_listing("HEAD:")), ["x.txt", "z.txt"])
@@ -1052,22 +1074,27 @@ class CommitTests(Base):
         self.write("z.txt", "staged\n")
         res = self.fail_mg("commit", "-a", "-m", "no-op")
         # git's wording when an untracked file is still present
-        self.assertEqual(res.err, 'error: nothing added to commit but untracked files present (use "minigit add" to track)\n')
+        self.assertTrue(res.out.endswith('\nnothing added to commit but untracked files present (use "minigit add" to track)\n'),
+                        res.out)
 
     def test_identity_sources_and_missing_identity(self):
         self.write("a.txt", "a\n")
         self.mg("add", "a.txt")
         noid = self.make_env(identity=False)
         noid["MINIGIT_AUTHOR_DATE"] = AUTHOR_DATE
-        res = self.fail_mg("commit", "-m", "x", env=noid)
-        self.assertEqual(res.err, 'error: please set your identity: minigit config --global user.name "You"; '
-                                  "minigit config --global user.email you@example.com\n")
+        res = self.fail_mg("commit", "-m", "x", env=noid, code=128)
+        self.assertEqual(res.err, "fatal: author identity unknown (user.name and user.email not set)\n"
+                                  "hint: tell minigit who you are, once for all your repositories:\n"
+                                  'hint:   minigit config --global user.name "Your Name"\n'
+                                  "hint:   minigit config --global user.email you@example.com\n"
+                                  "hint: (leave out --global to set it for this repository only)\n")
         self.assertFalse(self.exists(".minigit/refs/heads/main"), "a failed commit must not create the branch")
         self.assertEqual(self.lock_files(), [])
         self.assertEqual(self.porcelain(), "A  a.txt\n")
         # only a name is not enough either
         half = dict(noid, MINIGIT_AUTHOR_NAME="Half")
-        self.assertIn("please set your identity", self.fail_mg("commit", "-m", "x", env=half).err)
+        self.assertIn("author identity unknown (user.email not set)",
+                      self.fail_mg("commit", "-m", "x", env=half, code=128).err)
         # global config
         self.mg("config", "--global", "user.name", "Global User", env=noid)
         self.mg("config", "--global", "user.email", "global@example.com", env=noid)
@@ -1151,8 +1178,8 @@ class CommitTests(Base):
         self.mg("add", "a.txt")
         lock = self.path(".minigit/refs/heads/main.lock")
         write(lock, b"")
-        res = self.fail_mg("commit", "-m", "blocked")
-        self.assertIn("error: unable to lock", res.err)
+        res = self.fail_mg("commit", "-m", "blocked", code=128)
+        self.assertIn("fatal: unable to lock", res.err)
         self.assertIn("main.lock exists", res.err)
         self.assertEqual(res.out, "")
         self.assertEqual(self.gitfile("refs/heads/main"), base + "\n")
@@ -1166,7 +1193,7 @@ class CommitTests(Base):
         self.assertEqual(self.mg("fsck").rc, 0)
         # the index lock blocks commit as well
         write(self.path(".minigit/index.lock"), b"")
-        res = self.fail_mg("commit", "--allow-empty", "-m", "x")
+        res = self.fail_mg("commit", "--allow-empty", "-m", "x", code=128)
         self.assertIn("index.lock exists", res.err)
         os.remove(self.path(".minigit/index.lock"))
 
@@ -1198,7 +1225,7 @@ class CommitTests(Base):
         for r in ok:
             self.assertRegex(r.out, rf"^\[main {HEX7}\] c\d\n$")
         for r in failed:
-            self.assertEqual(r.rc, 1, str(r))
+            self.assertEqual(r.rc, 128, str(r))
             self.assertIn("unable to lock", r.err, str(r))
             self.assertEqual(r.out, "")
         lines = self.mg("log", "--oneline").out.splitlines()
@@ -1256,34 +1283,34 @@ class ObjectStoreTests(Base):
         good = read(path)
         # content changed, hash no longer matches
         write(path, zlib.compress(b"blob 6\0hellX\n"))
-        res = self.fail_mg("cat-file", "-p", "HEAD:h.txt")
-        self.assertIn("error: ", res.err)
+        res = self.fail_mg("cat-file", "-p", "HEAD:h.txt", code=128)
+        self.assertIn("fatal: ", res.err)
         self.assertIn(HELLO_BLOB, res.err)
         self.assertIn("corrupt", res.err)
         self.assertEqual(res.out, "")
         res = self.fail_mg("fsck")
         self.assertIn(HELLO_BLOB, res.out)
-        res = self.fail_mg("show", "HEAD:h.txt")
+        res = self.fail_mg("show", "HEAD:h.txt", code=128)
         self.assertIn("corrupt", res.err)
         # header says a different length
         write(path, zlib.compress(b"blob 5\0hello\n"))
-        res = self.fail_mg("cat-file", "-p", HELLO_BLOB)
+        res = self.fail_mg("cat-file", "-p", HELLO_BLOB, code=128)
         self.assertIn("corrupt", res.err)
         # truncated zlib stream
         write(path, good[: len(good) // 2])
-        res = self.fail_mg("cat-file", "-p", HELLO_BLOB)
+        res = self.fail_mg("cat-file", "-p", HELLO_BLOB, code=128)
         self.assertIn("corrupt", res.err)
         self.assertNotIn("internal error", res.err)
         self.assertEqual(self.fail_mg("fsck").rc, 1)
         # plain garbage that is not zlib at all
         write(path, b"this is not zlib data")
-        res = self.fail_mg("cat-file", "-p", HELLO_BLOB)
+        res = self.fail_mg("cat-file", "-p", HELLO_BLOB, code=128)
         self.assertNotIn("internal error", res.err)
         self.assertNotIn("Traceback", res.err)
         # missing
         os.remove(path)
-        res = self.fail_mg("cat-file", "-p", "HEAD:h.txt")
-        self.assertEqual(res.err, f"error: object {HELLO_BLOB} not found\n")
+        res = self.fail_mg("cat-file", "-p", "HEAD:h.txt", code=128)
+        self.assertEqual(res.err, f"fatal: object {HELLO_BLOB} not found\n")
         res = self.fail_mg("fsck")
         self.assertIn(f"missing object {HELLO_BLOB}", res.out)
         self.assertEqual(self.mg("rev-parse", "HEAD").rc, 0, "refs still resolve")
@@ -1302,17 +1329,19 @@ class ObjectStoreTests(Base):
         write(self.object_path(tree), zlib.compress(b"tree %d\0" % len(bad_tree) + bad_tree))
         res = self.fail_mg("fsck")
         self.assertIn(tree, res.out)
-        res = self.fail_mg("cat-file", "-p", "HEAD:a.txt")
+        res = self.fail_mg("cat-file", "-p", "HEAD:a.txt", code=128)
         self.assertNotIn("internal error", res.err)
         self.assertNotIn("Traceback", res.err)
-        res = self.fail_mg("status")
+        # status compares the index with HEAD by tree id (the index hashes to the same tree), so it does
+        # not need to read the damaged tree; fsck above is what reports it
+        res = self.mg("status")
         self.assertNotIn("internal error", res.err)
         # a commit object whose stored bytes are not a commit
         write(self.object_path(commit), zlib.compress(b"commit 7\0garbage"))
         for args in (["log"], ["cat-file", "-p", "HEAD"], ["commit", "-m", "x"], ["status"]):
             with self.subTest(args=args):
-                res = self.fail_mg(*args)
-                self.assertTrue(res.err.startswith("error: "), str(res))
+                res = self.fail_mg(*args, code=128)
+                self.assertTrue(res.err.startswith("fatal: "), str(res))
                 self.assertNotIn("Traceback", res.err)
         self.assertEqual(self.gitfile("refs/heads/main"), commit + "\n", "nothing may be rewritten")
 

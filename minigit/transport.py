@@ -10,6 +10,8 @@ import base64
 import http.client
 import json
 import os
+import socket
+import ssl
 import struct
 import urllib.error
 import urllib.parse
@@ -40,6 +42,29 @@ def _is_hex40(value: object) -> bool:
 
 # ---------------------------------------------------------------- URLs ----
 
+def redact_url(url: str) -> str:
+    """``url`` safe to print: a token in the userinfo becomes ``***`` (the user name stays).
+
+    Works on malformed URLs too, so an error message about a bad URL never shows the token.
+    """
+    scheme, sep, rest = url.partition("://")
+    if not sep:
+        return url
+    end = len(rest)
+    for ch in "/?#":
+        i = rest.find(ch)
+        if i != -1:
+            end = min(end, i)
+    netloc, tail = rest[:end], rest[end:]
+    if "@" not in netloc:
+        return url
+    userinfo, _, hostport = netloc.rpartition("@")
+    user, colon, token = userinfo.partition(":")
+    if not colon or not token:
+        return url
+    return f"{scheme}://{user}:***@{hostport}{tail}"
+
+
 def split_url(url: str) -> tuple[str, tuple[str, str] | None]:
     """Return (url without userinfo, (user, token) or None)."""
     url = url.strip()
@@ -47,7 +72,7 @@ def split_url(url: str) -> tuple[str, tuple[str, str] | None]:
         parts = urllib.parse.urlsplit(url)
         parts.port  # noqa: B018 - validates the port and IPv6 brackets now
     except ValueError as e:
-        raise MinigitError(f"invalid remote url '{url}': {e}") from None
+        raise MinigitError(f"invalid remote url '{redact_url(url)}': {e}") from None
     netloc = parts.netloc
     if "@" not in netloc:
         return url, None
@@ -77,9 +102,14 @@ def check_url(url: str) -> urllib.parse.SplitResult:
         parts = urllib.parse.urlsplit(url)
         _ = parts.port  # raises ValueError on a bad port
     except ValueError:
-        raise RemoteError(f"invalid remote url '{url}'") from None
+        raise RemoteError(f"invalid remote url '{redact_url(url)}'") from None
     if parts.scheme.lower() not in DEFAULT_PORTS or not parts.hostname:
-        raise RemoteError(f"unsupported remote url '{url}': expected http://host:port/<repo>")
+        shown = redact_url(url)
+        hint = None
+        if "://" not in url:
+            hint = ("minigit talks only to a 'minigit serve' server; local paths and ssh "
+                    "(user@host:path) remotes are not supported")
+        raise RemoteError(f"unsupported remote url '{shown}': expected http://host:port/<repo>", hint=hint)
     return parts
 
 
@@ -256,6 +286,25 @@ if hasattr(urllib.request, "HTTPSHandler"):  # Python built without ssl: http on
     _HANDLER_CLASSES.append(_HTTPSHandler)
 
 
+def _connect_failure(exc: BaseException, url: str) -> tuple[str, str | None]:
+    """A readable reason (and hint) for a failed connection instead of the raw socket error."""
+    reason = getattr(exc, "reason", exc)  # URLError wraps the socket error
+    parts = urllib.parse.urlsplit(url)
+    where = f"{parts.hostname}:{parts.port or DEFAULT_PORTS.get(parts.scheme.lower(), '')}"
+    if isinstance(reason, ConnectionRefusedError):
+        return "connection refused", f"is 'minigit serve' running on {where}? check the host and port of the URL"
+    if isinstance(reason, socket.gaierror):
+        return f"could not resolve host '{parts.hostname}'", "check the host name in the URL"
+    if isinstance(reason, ssl.SSLError):
+        hint = None
+        if parts.scheme.lower() == "https":
+            hint = "'minigit serve' speaks plain http; use an http:// URL unless a TLS proxy is in front of it"
+        return f"TLS error ({getattr(reason, 'reason', None) or reason})", hint
+    if isinstance(reason, TimeoutError):
+        return "connection timed out", f"is the server at {where} reachable?"
+    return str(reason) or reason.__class__.__name__, None
+
+
 def _describe(exc: BaseException) -> str:
     if isinstance(exc, http.client.IncompleteRead):
         expected = f" of {len(exc.partial) + exc.expected}" if exc.expected is not None else ""
@@ -343,7 +392,8 @@ class HttpRemote:
             # urllib wraps errors raised while connecting *and* while sending the body
             if req.minigit_connected and isinstance(exc.reason, TimeoutError):
                 raise self._timeout_error(read_timeout, on_timeout, data) from None
-            raise RemoteError(f"could not connect to server at {self.url}: {exc.reason}") from None
+            reason, hint = _connect_failure(exc, self.url)
+            raise RemoteError(f"could not connect to server at {self.url}: {reason}", hint=hint) from None
         except (OSError, http.client.HTTPException) as exc:
             if isinstance(exc, TimeoutError) and req.minigit_connected:  # connected, then no answer
                 raise self._timeout_error(read_timeout, on_timeout, data) from None
@@ -357,7 +407,8 @@ class HttpRemote:
                 raise RemoteError(f"connection to {self.url} was closed by the server before a complete "
                                   f"response was received ({_describe(exc)}); the request may not have "
                                   "completed, check the remote state and try again") from None
-            raise RemoteError(f"could not connect to server at {self.url}: {exc}") from None
+            reason, hint = _connect_failure(exc, self.url)
+            raise RemoteError(f"could not connect to server at {self.url}: {reason}", hint=hint) from None
 
     @staticmethod
     def _parse_error_body(body: bytes) -> dict | None:
@@ -402,7 +453,10 @@ class HttpRemote:
         try:
             payload = json.loads(body.decode("utf-8"))
         except (UnicodeDecodeError, ValueError):
-            raise RemoteError(f"malformed {what} response from {self.url} (not JSON)") from None
+            hint = None
+            if what in ("info/refs", "repository list"):
+                hint = f"is {self.server_url} a 'minigit serve' server? the URL must be http://host:port/<repo>"
+            raise RemoteError(f"malformed {what} response from {self.url} (not JSON)", hint=hint) from None
         if not isinstance(payload, dict):
             raise RemoteError(f"malformed {what} response from {self.url}")
         return payload

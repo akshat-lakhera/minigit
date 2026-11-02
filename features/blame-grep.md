@@ -99,8 +99,8 @@ filename <path>
 | worktree blame in a bare repo | `MinigitError("this operation must be run in a work tree")` |
 | NUL in the first 8000 bytes of the blamed content | `MinigitError("cannot blame binary file 'p'")` |
 | `-L` start beyond the end | `MinigitError("file 'p' has only N lines")` |
-| `-L` syntax: not `^\d+(,(\+?\d+))?$`, start `0`, `END < START`, or `+0` | `UsageError("invalid -L range 'x' (use START[,END] or START,+N)")`, exit 2 |
-| no path, more than one path, more than one rev | `UsageError`, exit 2 |
+| `-L` syntax: not `^\d+(,(\+?\d+))?$`, start `0`, `END < START`, or `+0` | `UsageError("invalid -L range 'x' (use START[,END] or START,+N)")`, exit 129 |
+| no path, more than one path, more than one rev | `UsageError`, exit 129 |
 | `<rev>` is not a commit / unknown | the usual `RevisionError` from `resolve_rev` |
 
 An empty file prints nothing and exits 0 (`-L` on it: "has only 0 lines").
@@ -218,8 +218,10 @@ minigit grep [-i] [-n] [-l | -c] [-w] [-F] [-e PATTERN]... [--cached] [PATTERN] 
   matches when any pattern matches. The first positional is the pattern unless `-e` is
   given. Each line is matched without its trailing `\n` (a `\r` stays part of the line).
 - Paths after `--` (or non-revision positionals, resolved like `diff`) filter by prefix:
-  `p == s or p.startswith(s + "/")`, after `repo.relpath(s, cwd)`. Output paths are always
-  **repo-relative** (minigit prints repo-relative paths everywhere; git prints cwd-relative).
+  `p == s or p.startswith(s + "/")`, after `repo.relpath(s, cwd)`. As in git, a search started in a
+  subdirectory without paths covers only that subdirectory, and output paths are relative to the
+  current directory (`b.txt`, `../a.txt` for `-- ..`), like `status` shows them; from the top they
+  are the repo paths.
 - Files are printed in sorted path order, lines in file order.
 - A **binary** file (NUL in the first 8000 bytes) that has a matching line prints
   `Binary file <path> matches` instead of its lines (`-c` prints its count, `-l` its path).
@@ -240,7 +242,7 @@ Content is written as raw bytes with the source line's `\n` stripped and one `\n
 **Exit codes:** `0` when at least one line (or, with `-l`/`-c`, one file) matched; `1` when
 nothing matched, with nothing on stderr (grep convention; the precedent in minigit is
 `merge` returning 1 for conflicts without an `error:` line); `1` with `error:` for a
-`MinigitError`; `2` for usage errors.
+`MinigitError`; `129` for usage errors.
 
 **Errors:**
 
@@ -248,7 +250,7 @@ nothing matched, with nothing on stderr (grep convention; the precedent in minig
 |---|---|
 | no pattern | `UsageError("grep: a pattern is required")` |
 | invalid regular expression | `UsageError("invalid regular expression 'x': <re.error message>")` |
-| `-l` with `-c` | argparse mutually exclusive group, exit 2 |
+| `-l` with `-c` | argparse mutually exclusive group, exit 129 |
 | `--cached` with `<rev>` | `UsageError("grep: --cached cannot be combined with a revision")` |
 | two revisions | `UsageError("grep: at most one revision is allowed")` |
 | default/`--cached` in a bare repo | `MinigitError("this operation must be run in a work tree")` |
@@ -399,7 +401,7 @@ blame
 - Author column padded to the longest printed author, including `Not Committed Yet`.
 - Line-number column right-justified (`-L 9,11` on 12 lines).
 - `-L START`, `-L START,END`, `-L START,+N`; start beyond EOF is exit 1; `0` or `END < START`
-  is exit 2.
+  is exit 129.
 - CRLF content keeps its `\r`; a final line without `\n` still gets a terminating `\n`.
 - Binary file refused; directory, untracked file and unknown path give "does not exist in".
 - `-C sub blame b.txt` resolves against the cwd.
@@ -422,9 +424,9 @@ grep
 - Pathspec prefix filtering with and without `--`; a non-matching pathspec is exit 1, not an
   error.
 - Output is byte-faithful (`crlf.txt:win\r\n`; `nonl.txt:last\n`).
-- Paths sorted; repo-relative even from a subdirectory (`-C sub`).
+- Paths sorted; from a subdirectory (`-C sub`) only its files, relative to it.
 - No match: exit 1, empty stdout and stderr. Bad regex, no pattern, `-l -c`, `--cached` with a
-  rev, two revs: exit 2.
+  rev, two revs: exit 129.
 - Empty index on an unborn repo: exit 1, no output (*unit*).
 
 ---
@@ -455,7 +457,7 @@ Section 6, after `show`:
   several `-e` are OR-ed. Lines are matched without their `\n`.
 - Output, sorted by path: `[<rev>:]<path>:[<lineno>:]<content>\n`; `-l`: `[<rev>:]<path>`;
   `-c`: `[<rev>:]<path>:<count>`; binary file: `[<rev>:]Binary file <path> matches`.
-- Exit 0 if anything matched, 1 if nothing did (no stderr), 2 on usage errors including an
+- Exit 0 if anything matched, 1 if nothing did (no stderr), 129 on usage errors including an
   invalid regular expression (`invalid regular expression 'x': <reason>`).
 ```
 
@@ -511,8 +513,6 @@ could be split between two agents if ever needed.
 - **No rename detection.** Documented; matches git without `-M`.
 - **Regex dialect.** Python `re`, not POSIX BRE/ERE; `-i` folds ASCII only because matching is
   on bytes (needed for byte-faithful output). Documented in `--help` and README.
-- **Repo-relative paths in `grep` output** differ from git's cwd-relative paths but match the
-  rest of minigit (`status`, `diff`). Documented.
 - **Exit 1 for "no match"** shares the code with `MinigitError`; the two are told apart by the
   absence of an `error:` line on stderr. Tests assert both stdout and stderr.
 - **Uncommitted-line timestamp** is "now", so the human format is non-deterministic for those

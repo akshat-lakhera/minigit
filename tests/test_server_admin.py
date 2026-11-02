@@ -271,8 +271,8 @@ class ServerAdminCliTests(_AdminCase):
         self.add_user("alice")
         self.add_token("alice", "ci")
         before = self.server_json()
-        self.fails(2, "revoke-token", "alice")
-        self.fails(2, "revoke-token", "alice", "ci", "--all")
+        self.fails(129, "revoke-token", "alice")
+        self.fails(129, "revoke-token", "alice", "ci", "--all")
         res = self.fails(1, "revoke-token", "bob", "ci")
         self.assertIn("user 'bob' does not exist", res.err)
         self.assertEqual(self.server_json(), before)
@@ -475,9 +475,9 @@ class ServerAdminCliTests(_AdminCase):
         self.assertIn("user 'ghost' does not exist", res.err)
         res = self.fails(1, "perm", "proj", "bad name", "read")
         self.assertIn("invalid user name", res.err)
-        self.fails(2, "perm", "proj", "alice", "admin")
-        self.fails(2, "perm", "proj", "", "read")
-        self.fails(2, "perm", "proj", " , ", "read")
+        self.fails(129, "perm", "proj", "alice", "admin")
+        self.fails(129, "perm", "proj", "", "read")
+        self.fails(129, "perm", "proj", " , ", "read")
         self.assertEqual(self.server_json(), before, "a refused perm must not touch server.json")
 
     def test_create_repo_refuses_unknown_users(self):
@@ -517,9 +517,9 @@ class ServerAdminCliTests(_AdminCase):
         rec = self.repo("proj")
         self.assertEqual(rec, {"readers": ["*"], "writers": ["*"], "public": False, "allow_force": False})
         before = self.server_json()
-        self.fails(2, "set-repo", "proj")
-        self.fails(2, "set-repo", "proj", "--public", "--private")
-        self.fails(2, "set-repo", "proj", "--allow-force", "--no-allow-force")
+        self.fails(129, "set-repo", "proj")
+        self.fails(129, "set-repo", "proj", "--public", "--private")
+        self.fails(129, "set-repo", "proj", "--allow-force", "--no-allow-force")
         res = self.fails(1, "set-repo", "nosuch", "--public")
         self.assertIn("repository 'nosuch' does not exist", res.err)
         self.assertEqual(self.server_json(), before)
@@ -539,7 +539,7 @@ class ServerAdminCliTests(_AdminCase):
             self.assertIn(sub, res.out + res.err)
         # the "subcommand is required" usage error names them too
         res = run(["server"], cwd=self.dir, env=self.env, check=False)
-        self.assertEqual(res.returncode, 2, str(res))
+        self.assertEqual(res.returncode, 129, str(res))
         for sub in ("remove-user", "add-token", "list-tokens", "revoke-token", "perm", "set-repo"):
             self.assertIn(sub, res.err)
 
@@ -550,7 +550,7 @@ class ServerAdminCliTests(_AdminCase):
         for args in (["remove-user"], ["add-token", "alice"], ["list-tokens"], ["revoke-token"],
                      ["perm", "proj"], ["perm"], ["set-repo"], ["set-repo", "proj", "--bogus"]):
             with self.subTest(args=args):
-                self.fails(2, *args)
+                self.fails(129, *args)
         self.assertEqual(self.server_json(), before)
 
     def test_bad_names_are_refused_before_anything_changes(self):

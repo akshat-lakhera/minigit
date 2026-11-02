@@ -10,10 +10,8 @@ from __future__ import annotations
 import functools
 import hashlib
 import os
-import random
 import re
 import time
-from datetime import datetime, timedelta
 
 from .errors import LockError, MinigitError, ObjectError
 
@@ -34,7 +32,12 @@ def sha1_hex(data: bytes) -> str:
 
 
 def _tmp_name(path: str) -> str:
-    return "%s.tmp-%d-%08x" % (path, os.getpid(), random.getrandbits(32))
+    return "%s.tmp-%d-%s" % (path, os.getpid(), random_hex8())
+
+
+def random_hex8() -> str:
+    """8 random hex digits for temporary file names (os.urandom: no 'random' import at startup)."""
+    return os.urandom(4).hex()
 
 
 def _write_all(fd: int, data: bytes) -> None:
@@ -312,6 +315,8 @@ def parse_tz(s: str) -> int:
 
 def format_date(ts: int, offset: int) -> str:
     """``"Tue Oct 20 09:05:03 2026 +0530"`` (git's default date format)."""
+    from datetime import datetime, timedelta  # only the commands that print dates pay for it
+
     try:
         dt = datetime(1970, 1, 1) + timedelta(seconds=int(ts) + int(offset))
     except (OverflowError, ValueError):

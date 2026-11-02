@@ -9,7 +9,6 @@ from __future__ import annotations
 import errno
 import hashlib
 import os
-import shutil
 import stat
 from typing import TYPE_CHECKING, Iterable
 
@@ -88,6 +87,7 @@ def _rmtree(path: str) -> None:
     if os.path.islink(path):
         _unlink(path)
     else:
+        import shutil  # lazy: shutil pulls in bz2 and lzma
         shutil.rmtree(path, onerror=onerror)
 
 
@@ -103,13 +103,13 @@ def _conflict_message(paths: list[str], operation: str, untracked: Iterable[str]
     blocks: list[str] = []
     if paths:
         blocks.append(f"Your local changes to the following files would be overwritten by {operation}:\n"
-                      f"{listing(paths)}Please commit your changes or restore them before you {action}.")
+                      f"{listing(paths)}Please commit your changes or stash them before you {action}.")
     if dirs:
         blocks.append("Updating the following directories would lose untracked files in them:\n" + listing(dirs))
     if untracked:
         blocks.append(f"The following untracked working tree files would be overwritten by {operation}:\n"
                       f"{listing(untracked)}Please move or remove them before you {action}.")
-    return "\nerror: ".join(blocks)
+    return "\nerror: ".join(blocks) + "\nAborting"
 
 
 def conflict_error(operation: str, paths: Iterable[str] = (), untracked: Iterable[str] = (),
@@ -340,17 +340,20 @@ def mode_from_stat(st: os.stat_result, previous: str | None) -> str:
     return "100755" if st.st_mode & 0o111 else "100644"
 
 
-def worktree_entry(repo: "Repository", index: Index, rel: str, head_mode: str | None = None) -> Entry | None:
+def worktree_entry(repo: "Repository", index: Index, rel: str, head_mode: str | None = None,
+                   st: os.stat_result | None = None) -> Entry | None:
     """``(mode, sha)`` of the file on disk, or None when it is missing / not a regular file.
 
     Uses the stat cache when the index entry is clean and not racy; otherwise hashes the content
-    (nothing is written to the object store).
+    (nothing is written to the object store). ``st`` is the file's stat when the caller already
+    has it (from ``scan_files``), which saves a ``stat`` call per file.
     """
     ie = index.get(rel, 0)
     if ie is None and fs_ignores_case(repo) and index.case_variant(rel) is not None:
         # Case-insensitive filesystem: the file on disk is the tracked case variant, not ``rel``.
         return None
-    st = _stat(_abs(repo, rel))
+    if st is None:
+        st = _stat(_abs(repo, rel))
     if st is None or not stat.S_ISREG(st.st_mode):
         return None
     previous = ie.mode if ie is not None else head_mode

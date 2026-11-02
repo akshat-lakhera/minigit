@@ -2,7 +2,10 @@
 
 Every failure the library reports is a ``MinigitError`` subclass. Only ``cli.py``
 prints; library code raises these and the CLI maps ``exit_code`` to the process
-exit status (1 for any error, 2 for usage errors).
+exit status and ``prefix`` to the first word of the message, as git does:
+``error: ...`` exits 1, ``fatal: ...`` (``FatalError``, ``RevisionError``,
+``NotARepositoryError``) exits 128 and a usage error exits 129. A ``prefix`` of
+``""`` prints the message bare (git's "Aborting commit due to empty commit message.").
 """
 
 from __future__ import annotations
@@ -12,6 +15,7 @@ class MinigitError(Exception):
     """Base class for every error minigit reports to the user."""
 
     exit_code: int = 1
+    prefix: str = "error"   # "error", "fatal" or "" (the message is printed bare)
 
     def __init__(self, message: str, *, hint: str | None = None) -> None:
         super().__init__(message)
@@ -22,21 +26,28 @@ class MinigitError(Exception):
         return self.message
 
 
+class FatalError(MinigitError):
+    """An error git reports as ``fatal: ...`` with exit status 128 (bad pathspec, no identity, ...)."""
+
+    exit_code = 128
+    prefix = "fatal"
+
+
 class UsageError(MinigitError):
-    exit_code = 2
+    exit_code = 129
 
 
-class NotARepositoryError(MinigitError):
+class NotARepositoryError(FatalError):
     pass
 
 
-class ObjectError(MinigitError):
+class ObjectError(FatalError):
     def __init__(self, message: str, *, sha: str | None = None, hint: str | None = None) -> None:
         super().__init__(message, hint=hint)
         self.sha = sha
 
 
-class LockError(MinigitError):
+class LockError(FatalError):
     pass
 
 
@@ -56,7 +67,7 @@ class RefUpdateError(MinigitError):
         self.actual = actual
 
 
-class RevisionError(MinigitError):
+class RevisionError(FatalError):
     pass
 
 

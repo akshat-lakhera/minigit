@@ -88,10 +88,10 @@ def _cmd(ns, cwd: str, action: str) -> int:
                             allow_empty=getattr(ns, "allow_empty", False))
     except MinigitError as e:
         for out in getattr(e, "outcomes", []):   # earlier commits of a sequence did land
-            _say(out.messages + [out.summary])
+            _say(out.messages + [out.summary] + out.details)
         raise
     for out in outcomes:
-        _say(out.messages + [out.summary])
+        _say(out.messages + [out.summary] + out.details)
     if outcomes[-1].kind == "conflict":
         return _report_conflict(outcomes[-1])
     return 0

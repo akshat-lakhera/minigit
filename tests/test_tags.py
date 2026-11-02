@@ -152,7 +152,7 @@ class TagCommandTests(RepoCase):
         self.assertEqual(self.ok("tag", "-d", "v1"), f"Deleted tag 'v1' (was {self.c1[:7]})\n")
         self.assertIsNone(self.repo.refs.resolve("refs/tags/v1"))
         self.assertEqual(self.ok("tag"), "v2\n")
-        self.assertIn("error: tag 'v1' not found", self.fail_cli("tag", "-d", "v1"))
+        self.assertIn("error: tag 'v1' not found.", self.fail_cli("tag", "-d", "v1"))
         # a plain file name is not an object (``cat-file`` sees a commit)
         self.assertEqual(self.ok("cat-file", "-t", "v2"), "commit\n")
 
@@ -184,32 +184,49 @@ class TagCommandTests(RepoCase):
 
     def test_exists_force_and_errors(self):
         self.ok("tag", "v1", "HEAD~1")
-        self.assertIn("error: tag 'v1' already exists", self.fail_cli("tag", "v1"))
-        self.assertIn("error: tag 'v1' already exists", self.fail_cli("tag", "-a", "v1", "-m", "x"))
+        # as git: fatal (exit 128)
+        self.assertIn("fatal: tag 'v1' already exists", self.fail_cli("tag", "v1", code=128))
+        self.assertIn("fatal: tag 'v1' already exists", self.fail_cli("tag", "-a", "v1", "-m", "x", code=128))
         self.assertEqual(self.repo.refs.resolve("refs/tags/v1"), self.c1)
         self.assertEqual(self.ok("tag", "-f", "v1"), f"Updated tag 'v1' (was {self.c1[:7]})\n")
         self.assertEqual(self.repo.refs.resolve("refs/tags/v1"), self.c2)
         self.assertEqual(self.ok("tag", "-f", "v1"), "")  # same value: nothing to say
         for bad in ("v 1", "a..b", "x.lock", "HEAD", "refs/tags/v1", "v1/", ".hidden", "a^b"):
-            self.assertIn(f"'{bad}' is not a valid tag name", self.fail_cli("tag", bad), bad)
-        self.assertIn("'-v1' is not a valid tag name", self.fail_cli("tag", "--", "-v1"))
-        self.assertIn("error: unknown revision 'nope'", self.fail_cli("tag", "v9", "nope"))
+            self.assertIn(f"fatal: '{bad}' is not a valid tag name", self.fail_cli("tag", bad, code=128), bad)
+        self.assertIn("'-v1' is not a valid tag name", self.fail_cli("tag", "--", "-v1", code=128))
+        self.assertIn("fatal: unknown revision 'nope'", self.fail_cli("tag", "v9", "nope", code=128))
         blob = self.ok("rev-parse", "HEAD:a.txt").strip()
-        self.assertIn("is not a commit", self.fail_cli("tag", "v9", blob))
+        self.assertIn("is not a commit", self.fail_cli("tag", "v9", blob, code=128))
         self.assertIsNone(self.repo.refs.resolve("refs/tags/v9"))
         # usage errors
-        self.assertEqual(self.cli("tag", "a", "b", "c")[0], 2)
-        self.assertEqual(self.cli("tag", "-d")[0], 2)
-        self.assertEqual(self.cli("tag", "-l", "-m", "x")[0], 2)
-        self.assertEqual(self.cli("tag", "-n", "v5")[0], 2)
+        self.assertEqual(self.cli("tag", "a", "b", "c")[0], 129)
+        self.assertEqual(self.cli("tag", "-d")[0], 129)
+        self.assertEqual(self.cli("tag", "-l", "-m", "x")[0], 129)
+        self.assertEqual(self.cli("tag", "-n", "v5")[0], 129)
 
     def test_unborn_head(self):
         other = os.path.join(self.root, "empty")
         os.makedirs(other)
         ops.init(other)
         rc, _, err = self.cli("-C", other, "tag", "v1")
-        self.assertEqual(rc, 1)
-        self.assertIn("unknown revision 'HEAD'", err)
+        self.assertEqual(rc, 128)
+        self.assertIn("fatal: unknown revision 'HEAD'", err)
+        self.assertIn("hint: the current branch 'main' has no commits yet", err)
+
+    def test_peel_syntax_and_message_cleanup(self):
+        self.ok("tag", "-a", "v1", "HEAD~1", "-m", "# dropped, as git tag does\nannotated  \n\n\nbody")
+        tag_sha = self.repo.refs.resolve("refs/tags/v1")
+        self.assertEqual(tags.read_tag(self.repo, tag_sha).message, "annotated\n\nbody\n")
+        self.assertEqual(self.ok("rev-parse", "v1^{}").strip(), self.c1)
+        self.assertEqual(self.ok("rev-parse", "v1^{commit}").strip(), self.c1)
+        self.assertEqual(self.ok("rev-parse", "v1^{tag}").strip(), tag_sha)
+        self.assertEqual(self.ok("cat-file", "-t", "v1^{tree}"), "tree\n")
+        self.assertEqual(self.ok("log", "--oneline", "v1^{commit}"), f"{self.c1[:7]} (tag: v1) one\n")
+        rc, _, err = self.cli("rev-parse", "HEAD^{blob}")
+        self.assertEqual(rc, 128)
+        self.assertIn("expected blob type", err)
+        rc, _, err = self.cli("tag", "-a", "v2", "-m", "# only a comment")
+        self.assertEqual((rc, "no tag message" in err), (1, True))
 
     def test_revparse_order_and_peeling(self):
         self.ok("tag", "-a", "v1", "HEAD~1", "-m", "annotated")
@@ -238,12 +255,12 @@ class TagCommandTests(RepoCase):
         self.ok("tag", "-a", "v1", "HEAD~1", "-m", "annotated")
         self.assertIn("-1\n+2\n", self.ok("diff", "v1", "main"))
         self.assertEqual(self.ok("log", "--oneline", "v1"), f"{self.c1[:7]} (tag: v1) one\n")
-        self.assertIn("HEAD is now at " + self.c1[:7], self.ok("switch", "--detach", "v1"))
+        self.assertIn("HEAD is now at " + self.c1[:7], self.cli("switch", "--detach", "v1")[2])
         self.assertEqual(self.repo.head_commit(), self.c1)
         self.ok("switch", "main")
-        self.assertIn("HEAD is now at " + self.c1[:7], self.ok("checkout", "v1"))
+        self.assertIn("HEAD is now at " + self.c1[:7], self.cli("checkout", "v1")[2])
         self.ok("switch", "main")
-        err = self.fail_cli("switch", "v1")
+        err = self.fail_cli("switch", "v1", code=128)
         self.assertIn("a branch is expected, got tag 'v1'", err)
         self.assertEqual(self.ok("branch"), "* main\n")
         self.assertEqual(self.ok("branch", "-a"), "* main\n")
@@ -339,7 +356,7 @@ class TagCommandTests(RepoCase):
         self.assertEqual(tags.tag_delete(self.repo, "v1"), f"Deleted tag 'v1' (was {self.c2[:7]})")
         with self.assertRaises(MinigitError) as cm:
             tags.tag_delete(self.repo, "v1")
-        self.assertEqual(cm.exception.message, "tag 'v1' not found")
+        self.assertEqual(cm.exception.message, "tag 'v1' not found.")
         with self.assertRaises(MinigitError):
             tags.tag_delete(self.repo, "a b")  # an invalid name is simply "not found"
 

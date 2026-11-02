@@ -14,14 +14,14 @@ minigit stash [push] [-m|--message MSG] [-u|--include-untracked]
 minigit stash pop   [stash@{N} | N]
 minigit stash apply [stash@{N} | N]
 minigit stash drop  [stash@{N} | N]
-minigit stash show  [stash@{N} | N]
+minigit stash show  [-p] [stash@{N} | N]
 minigit stash list
 minigit stash clear
 ```
 
 - No subcommand means `push`, also with options (`stash -m x`, `stash -u`).
 - An entry is `stash@{N}` or a bare `N` (handy in PowerShell, where `{}` needs quoting); default `stash@{0}`.
-- Usage errors (exit 2): an unknown subcommand (including git's old `save`), pathspecs for `push` (also after
+- Usage errors (exit 129): an unknown subcommand (including git's old `save`), pathspecs for `push` (also after
   `--`), `-m`/`-u` with anything but `push`, arguments to `list`/`clear`, more than one entry, a malformed entry
   (`banana`, `stash@{x}`, `stash@{-1}`).
 
@@ -29,11 +29,11 @@ minigit stash clear
 |---|---|---|
 | `push` | `Saved working directory and index state <subject>` | 0 |
 | `push`, nothing to save | `No local changes to save` | 0 |
-| `apply` | *(nothing)*, or `CONFLICT (...)` lines | 0, or 1 on conflict |
-| `pop` | `Dropped stash@{N} (<sha>)`; on conflict `CONFLICT (...)` lines + `The stash entry is kept in case you need it again.` | 0, or 1 on conflict |
+| `apply` | `Auto-merging` / `CONFLICT (...)` lines, then the long `status` (as git) | 0, or 1 on conflict |
+| `pop` | as `apply`, then `Dropped stash@{N} (<sha>)`; on conflict `The stash entry is kept in case you need it again.` instead | 0, or 1 on conflict |
 | `drop` | `Dropped stash@{N} (<sha>)` | 0 |
 | `list` | `stash@{N}: <subject>` per entry, newest first | 0 |
-| `show` | the patch from the entry's base commit to its worktree state | 0 |
+| `show` | the diffstat from the entry's base commit to its worktree state (git's default); `-p`: the patch | 0 |
 | `clear` | *(nothing)* | 0 |
 
 Subjects: `WIP on <branch>: <sha7> <HEAD subject>`, or `On <branch>: <MSG>` with `-m`; `<branch>` is
@@ -91,7 +91,7 @@ is written. Then:
 
 - No `--index` (restore the staged state), `--keep-index`, `--patch`, `--all` (ignored files), pathspecs,
   `stash branch` or `stash create/store`.
-- `show` prints a patch only (no `--stat`), and not the untracked files.
+- `show` does not include the untracked files.
 - `stash@{N}` is understood by the stash commands only, not by `rev-parse`/`log`/`diff`.
 - Dropped entries are not kept anywhere (git keeps them as unreachable objects; here too the objects stay in
   the store, there is just no reflog to find them).

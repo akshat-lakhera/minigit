@@ -37,12 +37,19 @@ def fake_errors() -> types.ModuleType:
             self.hint = hint
 
     class UsageError(MinigitError):
-        exit_code = 2
+        exit_code = 129
 
-    class NotARepositoryError(MinigitError):
+    class FatalError(MinigitError):
+        exit_code = 128
+        prefix = "fatal"
+
+    class UsageError(MinigitError):
+        exit_code = 129
+
+    class NotARepositoryError(FatalError):
         pass
 
-    class RevisionError(MinigitError):
+    class RevisionError(FatalError):
         pass
 
     class NothingToCommit(MinigitError):
@@ -69,7 +76,7 @@ def fake_errors() -> types.ModuleType:
             super().__init__(message, **kw)
             self.results, self.url = results, url
 
-    for cls in (MinigitError, UsageError, NotARepositoryError, RevisionError, NothingToCommit,
+    for cls in (MinigitError, UsageError, FatalError, NotARepositoryError, RevisionError, NothingToCommit,
                 CheckoutConflictError, RemoteError, AuthError, PermissionDeniedError,
                 PushRejectedError):
         setattr(mod, cls.__name__, cls)
@@ -170,7 +177,7 @@ class CliTestCase(unittest.TestCase):
             clone=Mock(return_value=(self.repo, ["Cloning into 'p'...", "warning: You appear to have cloned an empty repository."])),
             fetch=Mock(return_value=["change"]),
             format_fetch=Mock(return_value="From http://h:1/p\n * [new branch]      main -> origin/main"),
-            pull=Mock(return_value=(["change"], Outcome("merged", ["Merge made by the 'three-way' strategy."]))),
+            pull=Mock(return_value=(["change"], Outcome("merged", ["Merge made by the 'ort' strategy."]))),
             push=Mock(return_value=["To http://h:1/p", "   1..2  main -> main"]),
             format_push_rejection=Mock(return_value="To http://h:1/p\n ! [rejected]        main -> main (non-fast-forward)\nhint: Integrate the remote changes first ('minigit pull'), then push again."),
             login=Mock(),
@@ -241,7 +248,7 @@ class ParserTests(CliTestCase):
     def test_version(self):
         rc, out, _ = self.cli("--version")
         self.assertEqual(rc, 0)
-        self.assertIn("minigit 0.2.0", out)
+        self.assertIn("minigit 0.3.0", out)
 
     def test_help(self):
         rc, out, _ = self.cli("--help")
@@ -250,11 +257,11 @@ class ParserTests(CliTestCase):
         for name in ("init", "add", "commit", "merge", "push", "serve", "server", "fsck"):
             self.assertIn(name, out)
 
-    def test_no_args_prints_help_exit_2(self):
+    def test_no_args_prints_help_exit_1(self):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             rc = cli.main([])
-        self.assertEqual(rc, 2)
+        self.assertEqual(rc, 1)
         self.assertIn("usage: minigit", out.getvalue())
 
     def test_every_command_has_help(self):
@@ -263,15 +270,32 @@ class ParserTests(CliTestCase):
             self.assertEqual(rc, 0, name)
             self.assertIn(f"usage: minigit {name}", out)
 
-    def test_unknown_command_is_usage_error(self):
+    def test_unknown_command_suggests_the_closest(self):
         rc, _, err = self.cli("frobnicate")
-        self.assertEqual(rc, 2)
-        self.assertIn("error:", err)
-        self.assertIn("invalid choice", err)
+        self.assertEqual(rc, 1)  # git's exit code for an unknown command
+        self.assertEqual(err, "minigit: 'frobnicate' is not a minigit command. See 'minigit --help'.\n")
+        rc, _, err = self.cli("comit", "-m", "x")
+        self.assertEqual(rc, 1)
+        self.assertIn("is not a minigit command", err)
+        self.assertIn("The most similar command is\n\tcommit\n", err)
+
+    def test_mistyped_option_gets_a_did_you_mean_hint(self):
+        rc, _, err = self.cli("commit", "--amned")
+        self.assertEqual(rc, 129)
+        self.assertIn("error: unrecognized arguments: --amned", err)
+        self.assertIn("hint: did you mean '--amend'?", err)
+
+    def test_only_the_running_commands_parser_is_built(self):
+        # startup: 'status' must not import the modules that only define other commands' parsers
+        for name in ("minigit.stash", "minigit.rebase", "minigit.pr"):
+            sys.modules.pop(name, None)
+        self.ok("status")
+        for name in ("minigit.stash", "minigit.pr"):
+            self.assertNotIn(name, sys.modules)
 
     def test_missing_required_argument(self):
         rc, _, err = self.cli("clone")
-        self.assertEqual(rc, 2)
+        self.assertEqual(rc, 129)
         self.assertIn("usage: minigit clone", err)
         self.assertIn("error: the following arguments are required", err)
 
@@ -282,8 +306,8 @@ class ParserTests(CliTestCase):
 
     def test_bad_C_dir(self):
         rc, _, err = self.cli("-C", "does-not-exist", "status")
-        self.assertEqual(rc, 1)
-        self.assertIn("error: cannot change to 'does-not-exist'", err)
+        self.assertEqual(rc, 128)
+        self.assertIn("fatal: cannot change to 'does-not-exist'", err)
 
     def test_C_sets_cwd_for_discovery(self):
         sub = os.path.join(self.cwd, "sub")
@@ -298,30 +322,30 @@ class ParserTests(CliTestCase):
         self.assertEqual(out, "")
         self.assertEqual(err, "error: boom\nhint: try this\n")
 
-    def test_usage_error_from_library_exits_2(self):
+    def test_usage_error_from_library_exits_129(self):
         self.ops.commit.side_effect = self.E.UsageError("commit message required: use -m")
         rc, _, err = self.cli("commit")
-        self.assertEqual(rc, 2)
+        self.assertEqual(rc, 129)
         self.assertIn("error: commit message required", err)
 
     def test_not_a_repository(self):
         self.repo_mod.Repository.discover.side_effect = self.E.NotARepositoryError(
             "not a minigit repository (or any parent): /x")
         rc, _, err = self.cli("status")
-        self.assertEqual(rc, 1)
-        self.assertIn("error: not a minigit repository", err)
+        self.assertEqual(rc, 128)
+        self.assertIn("fatal: not a minigit repository", err)
 
     def test_internal_error(self):
         self.status.compute_status.side_effect = RuntimeError("kaboom")
         rc, _, err = self.cli("status")
-        self.assertEqual(rc, 1)
+        self.assertEqual(rc, 128)
         self.assertIn("fatal: internal error: kaboom", err)
         self.assertNotIn("Traceback", err)
 
     def test_internal_error_debug_traceback(self):
         self.status.compute_status.side_effect = RuntimeError("kaboom")
         rc, _, err = self.cli("status", env={"MINIGIT_DEBUG": "1"})
-        self.assertEqual(rc, 1)
+        self.assertEqual(rc, 128)
         self.assertIn("Traceback", err)
         self.assertIn("fatal: internal error: kaboom", err)
 
@@ -372,7 +396,7 @@ class RepoCommandTests(CliTestCase):
 
     def test_config_requires_key(self):
         rc, _, err = self.cli("config")
-        self.assertEqual(rc, 2)
+        self.assertEqual(rc, 129)
         self.assertIn("key is required", err)
 
     def test_config_global_outside_repo(self):
@@ -381,8 +405,8 @@ class RepoCommandTests(CliTestCase):
         self.ops.config_cmd.assert_called_with(None, "user.name", "Alice", global_=True,
                                                list_=False, unset=False)
         rc, _, err = self.cli("config", "user.name", "Alice")
-        self.assertEqual(rc, 1)
-        self.assertIn("error: no", err)
+        self.assertEqual(rc, 128)
+        self.assertIn("fatal: no", err)
 
     def test_add(self):
         self.ok("add", "a.txt", "dir")
@@ -392,8 +416,9 @@ class RepoCommandTests(CliTestCase):
 
     def test_add_nothing(self):
         rc, _, err = self.cli("add")
-        self.assertEqual(rc, 2)
-        self.assertIn("nothing specified", err)
+        self.assertEqual(rc, 0)   # as git: a note, not an error
+        self.assertIn("Nothing specified, nothing added.", err)
+        self.ops.add.assert_not_called()
 
     def test_add_error_message(self):
         self.ops.add.side_effect = self.E.MinigitError("pathspec 'nope' did not match any files")
@@ -411,7 +436,7 @@ class RepoCommandTests(CliTestCase):
         self.ok("add", "--update", "--", "sub")
         self.ops.add.assert_called_with(self.repo, ["sub"], self.cwd, force=False, update=True)
         rc, _, err = self.cli("add", "-A", "-u")
-        self.assertEqual(rc, 2)
+        self.assertEqual(rc, 129)
         self.assertIn("-A and -u cannot be used together", err)
         out = self.ok("add", "--help")
         self.assertIn("-A, --all", out)
@@ -423,7 +448,7 @@ class RepoCommandTests(CliTestCase):
                                             recursive=True, force=True)
         self.assertEqual(out, "rm 'a.txt'\n")
         rc, _, _ = self.cli("rm")
-        self.assertEqual(rc, 2)
+        self.assertEqual(rc, 128)
 
     def test_status_long_and_porcelain(self):
         self.assertIn("On branch main", self.ok("status"))
@@ -458,7 +483,7 @@ class RepoCommandTests(CliTestCase):
 
     def test_diff_too_many_revs(self):
         rc, _, err = self.cli("diff", "a", "b", "c", "--")
-        self.assertEqual(rc, 2)
+        self.assertEqual(rc, 129)
         self.assertIn("at most two revisions", err)
 
     def test_diff_binary_output(self):
@@ -487,9 +512,11 @@ class RepoCommandTests(CliTestCase):
 
     def test_commit_nothing_to_commit(self):
         self.ops.commit.side_effect = self.E.NothingToCommit("nothing to commit, working tree clean")
-        rc, _, err = self.cli("commit", "-m", "x")
+        rc, out, err = self.cli("commit", "-m", "x")
         self.assertEqual(rc, 1)
-        self.assertIn("error: nothing to commit, working tree clean", err)
+        # as git: the report goes to stdout, without an "error:" prefix
+        self.assertIn("nothing to commit, working tree clean", out)
+        self.assertEqual(err, "")
 
     def test_log(self):
         self.assertEqual(self.ok("log"), "commit abc\n")
@@ -533,11 +560,12 @@ class RepoCommandTests(CliTestCase):
     def test_log_graph_stat_and_paths(self):
         self.repo.relpath = lambda p, cwd: p
         self.ok("log", "--graph", "--stat", "--", "a.txt", "d")
-        self.history.log_entries.assert_called_with(self.repo, None, None, all_refs=False, paths=["a.txt", "d"])
+        self.history.log_entries.assert_called_with(self.repo, None, None, all_refs=False, paths=["a.txt", "d"],
+                                                    topo=True)   # --graph implies --topo-order, as in git
         self.history.format_log.assert_called_with(self.repo, [("sha", "commit")], False, graph=True, stat=True,
                                                    paths=["a.txt", "d"])
         self.ok("log", "--oneline", "--graph", "main")
-        self.history.log_entries.assert_called_with(self.repo, ["main"], None, all_refs=False)
+        self.history.log_entries.assert_called_with(self.repo, ["main"], None, all_refs=False, topo=True)
         self.history.format_log.assert_called_with(self.repo, [("sha", "commit")], True, graph=True)
         self.ok("log", "--stat", "-n", "2")
         self.history.format_log.assert_called_with(self.repo, [("sha", "commit")], False, stat=True)
@@ -561,7 +589,7 @@ class RepoCommandTests(CliTestCase):
         self.history.log_entries.assert_called_with(self.repo, ["nope"], None, all_refs=False)
         self.touch("main")
         rc, _, err = self.cli("log", "main")
-        self.assertEqual(rc, 2)
+        self.assertEqual(rc, 129)
         self.assertIn("ambiguous argument 'main': both revision and filename", err)
         self.assertIn("'--'", err)
         self.ok("log", "main", "--", "main")
@@ -618,7 +646,7 @@ class BranchCommandTests(CliTestCase):
                      ("branch", "-u", "origin/main", "a", "b"),
                      ("branch", "-d", "--unset-upstream", "f")):
             rc, _, err = self.cli(*args)
-            self.assertEqual(rc, 2, args)
+            self.assertEqual(rc, 129, args)
             self.assertIn("branch:", err)
         self.ops.unset_upstream.side_effect = self.E.MinigitError("branch 'main' has no upstream information")
         rc, _, err = self.cli("branch", "--unset-upstream")
@@ -640,7 +668,7 @@ class BranchCommandTests(CliTestCase):
         self.ok("branch", "-D", "f")
         self.ops.branch_delete.assert_called_with(self.repo, "f", force=True)
         rc, _, err = self.cli("branch", "-d")
-        self.assertEqual(rc, 2)
+        self.assertEqual(rc, 129)
         self.assertIn("branch name is required", err)
 
     def test_branch_errors(self):
@@ -650,7 +678,8 @@ class BranchCommandTests(CliTestCase):
         self.assertIn("not fully merged", err)
 
     def test_switch(self):
-        self.assertEqual(self.ok("switch", "f"), "Switched to branch 'f'\n")
+        rc, out, err = self.cli("switch", "f")
+        self.assertEqual((rc, out, err), (0, "", "Switched to branch 'f'\n"))  # git's notes go to stderr
         self.ops.switch.assert_called_with(self.repo, "f")
         self.ok("switch", "-c", "new")
         self.ops.switch.assert_called_with(self.repo, None, create="new", start=None)
@@ -662,9 +691,9 @@ class BranchCommandTests(CliTestCase):
         self.ops.switch.assert_called_with(self.repo, "HEAD", detach=True)
 
     def test_switch_usage(self):
-        self.assertEqual(self.cli("switch")[0], 2)
-        self.assertEqual(self.cli("switch", "a", "b")[0], 2)
-        self.assertEqual(self.cli("switch", "-c", "x", "a", "b")[0], 2)
+        self.assertEqual(self.cli("switch")[0], 128)
+        self.assertEqual(self.cli("switch", "a", "b")[0], 129)
+        self.assertEqual(self.cli("switch", "-c", "x", "a", "b")[0], 129)
 
     def test_switch_refusal(self):
         self.ops.switch.side_effect = self.E.CheckoutConflictError(
@@ -694,7 +723,7 @@ class BranchCommandTests(CliTestCase):
         self.ops.switch.assert_called_with(self.repo, None, create="new", start=None)
         self.ok("checkout", "-b", "new", "main")
         self.ops.switch.assert_called_with(self.repo, None, create="new", start="main")
-        self.assertEqual(self.cli("checkout", "-b", "new", "a", "b")[0], 2)
+        self.assertEqual(self.cli("checkout", "-b", "new", "a", "b")[0], 129)
 
     def test_checkout_paths(self):
         self.ok("checkout", "--", "a.txt", "b.txt")
@@ -720,9 +749,9 @@ class BranchCommandTests(CliTestCase):
         self.assertIn("invalid reference", err)
 
     def test_checkout_usage(self):
-        self.assertEqual(self.cli("checkout")[0], 2)
-        self.assertEqual(self.cli("checkout", "a", "b", "--", "c")[0], 2)
-        self.assertEqual(self.cli("checkout", "a", "--")[0], 2)
+        self.assertEqual(self.cli("checkout")[0], 129)
+        self.assertEqual(self.cli("checkout", "a", "b", "--", "c")[0], 129)
+        self.assertEqual(self.cli("checkout", "a", "--")[0], 129)
 
     def test_merge_fast_forward(self):
         out = self.ok("merge", "feature")
@@ -730,7 +759,7 @@ class BranchCommandTests(CliTestCase):
         self.assertEqual(out, "Updating 1..2\nFast-forward\n")
 
     def test_merge_options(self):
-        self.merge.merge.return_value = Outcome("merged", ["Merge made by the 'three-way' strategy."])
+        self.merge.merge.return_value = Outcome("merged", ["Merge made by the 'ort' strategy."])
         self.ok("merge", "--no-ff", "-m", "msg", "feature")
         self.merge.merge.assert_called_with(self.repo, "feature", message="msg", no_ff=True, allow_unrelated=False)
         self.ok("merge", "--allow-unrelated-histories", "other")  # QA bug 12
@@ -753,8 +782,8 @@ class BranchCommandTests(CliTestCase):
     def test_merge_abort(self):
         self.ok("merge", "--abort")
         self.merge.merge_abort.assert_called_once_with(self.repo)
-        self.assertEqual(self.cli("merge", "--abort", "x")[0], 2)
-        self.assertEqual(self.cli("merge")[0], 2)
+        self.assertEqual(self.cli("merge", "--abort", "x")[0], 129)
+        self.assertEqual(self.cli("merge")[0], 129)
 
     def test_merge_error(self):
         self.merge.merge.side_effect = self.E.MinigitError("refusing to merge unrelated histories")
@@ -786,9 +815,9 @@ class BranchCommandTests(CliTestCase):
         self.ops.reset_paths.assert_called_with(self.repo, "HEAD", ["c.txt"], self.cwd)
 
     def test_reset_usage(self):
-        self.assertEqual(self.cli("reset", "--hard", "--", "a")[0], 2)
-        self.assertEqual(self.cli("reset", "a", "b", "--", "c")[0], 2)
-        self.assertEqual(self.cli("reset", "--soft", "--hard")[0], 2)
+        self.assertEqual(self.cli("reset", "--hard", "--", "a")[0], 128)
+        self.assertEqual(self.cli("reset", "a", "b", "--", "c")[0], 129)
+        self.assertEqual(self.cli("reset", "--soft", "--hard")[0], 129)
 
     def test_restore(self):
         self.ok("restore", "a.txt")
@@ -800,7 +829,7 @@ class BranchCommandTests(CliTestCase):
         self.ok("restore", "-s", "main", "x")
         self.ops.restore.assert_called_with(self.repo, ["x"], self.cwd, staged=False, worktree=None,
                                             source="main")
-        self.assertEqual(self.cli("restore")[0], 2)
+        self.assertEqual(self.cli("restore")[0], 128)
 
 
 # ---------------------------------------------------------------------------
@@ -822,9 +851,9 @@ class RemoteCommandTests(CliTestCase):
         self.assertEqual(self.ok("remote", "get-url", "origin"), "http://h:1/p\n")
 
     def test_remote_usage(self):
-        self.assertEqual(self.cli("remote", "add", "origin")[0], 2)
-        self.assertEqual(self.cli("remote", "remove")[0], 2)
-        self.assertEqual(self.cli("remote", "bogus")[0], 2)
+        self.assertEqual(self.cli("remote", "add", "origin")[0], 129)
+        self.assertEqual(self.cli("remote", "remove")[0], 129)
+        self.assertEqual(self.cli("remote", "bogus")[0], 129)
 
     def test_clone(self):
         rc, out, err = self.cli("clone", "http://h:1/p", "dir")
@@ -873,14 +902,14 @@ class RemoteCommandTests(CliTestCase):
         self.remote.push_tags.assert_called_with(self.repo, "origin", force=True)
         self.remote.push.assert_not_called()
         rc, _, err = self.cli("push", "--tags", "origin", "v1")
-        self.assertEqual(rc, 2)
+        self.assertEqual(rc, 129)
         self.assertIn("--tags takes only a remote name", err)
-        self.assertEqual(self.cli("push", "--tags", "--delete", "origin")[0], 2)
+        self.assertEqual(self.cli("push", "--tags", "--delete", "origin")[0], 129)
 
     def test_tag_usage_errors_before_the_library_runs(self):
         for args in (("tag", "-d"), ("tag", "a", "b", "c"), ("tag", "-l", "-m", "x"), ("tag", "-n", "v1")):
             rc, _, err = self.cli(*args)
-            self.assertEqual(rc, 2, args)
+            self.assertEqual(rc, 129, args)
             self.assertIn("tag", err)
         self.assertIn("List, create or delete tags", self.ok("tag", "--help"))
 
@@ -897,7 +926,7 @@ class RemoteCommandTests(CliTestCase):
         self.remote.pull.assert_called_with(self.repo, None, None, allow_unrelated=False, rebase=False)
         self.remote.remote_url.assert_called_with(self.repo, "upstream")  # from get_upstream
         self.assertIn("main -> origin/main", out)
-        self.assertIn("Merge made by the 'three-way' strategy.", out)
+        self.assertIn("Merge made by the 'ort' strategy.", out)
         self.ok("pull", "origin", "main")
         self.remote.pull.assert_called_with(self.repo, "origin", "main", allow_unrelated=False, rebase=False)
         self.remote.remote_url.assert_called_with(self.repo, "origin")
@@ -950,6 +979,15 @@ class RemoteCommandTests(CliTestCase):
         rc, _, err = self.cli("pull")
         self.assertEqual(rc, 1)
         self.assertIn("no upstream", err)
+
+    def test_pull_refused_merge_still_prints_the_fetch(self):
+        exc = self.E.MinigitError("Your local changes to the following files would be overwritten by merge")
+        exc.fetch_changes = ["change"]
+        self.remote.pull.side_effect = exc
+        rc, out, err = self.cli("pull")
+        self.assertEqual(rc, 1)
+        self.assertIn("main -> origin/main", out)
+        self.assertIn("would be overwritten by merge", err)
 
     def test_push(self):
         out = self.ok("push")
@@ -1004,7 +1042,7 @@ class RemoteCommandTests(CliTestCase):
         out = self.ok("login", "http://h:1", "--user", "alice", "--token", "T")
         self.remote.login.assert_called_with("http://h:1", "alice", "T")
         self.assertEqual(out, "stored credentials for 'http://h:1'\n")
-        self.assertEqual(self.cli("login", "http://h:1", "--user", "a")[0], 2)
+        self.assertEqual(self.cli("login", "http://h:1", "--user", "a")[0], 129)
 
 
 class ServerCommandTests(CliTestCase):
@@ -1034,7 +1072,7 @@ class ServerCommandTests(CliTestCase):
         self.assertIsNone(kw["ready_file"])
         self.assertTrue(kw["verbose"])
         self.assertIs(kw["web"], True)
-        self.assertEqual(self.cli("serve")[0], 2)
+        self.assertEqual(self.cli("serve")[0], 129)
 
     def test_serve_no_web(self):
         self._make_root()
@@ -1082,7 +1120,7 @@ class ServerCommandTests(CliTestCase):
 
     def test_server_needs_subcommand(self):
         rc, _, err = self.cli("server")
-        self.assertEqual(rc, 2)
+        self.assertEqual(rc, 129)
         self.assertIn("subcommand", err)
 
 
@@ -1131,8 +1169,8 @@ class PlumbingTests(CliTestCase):
         self.assertEqual(self.ok("cat-file", "-t", "HEAD"), "commit\n")
         self.ops.cat_file.return_value = b"12\n"
         self.assertEqual(self.ok("cat-file", "-s", "HEAD"), "12\n")
-        self.assertEqual(self.cli("cat-file", "HEAD")[0], 2)
-        self.assertEqual(self.cli("cat-file", "-p", "-t", "HEAD")[0], 2)
+        self.assertEqual(self.cli("cat-file", "HEAD")[0], 129)
+        self.assertEqual(self.cli("cat-file", "-p", "-t", "HEAD")[0], 129)
 
     def test_ls_files(self):
         self.assertEqual(self.ok("ls-files"), "a.txt\nb.txt\n")
@@ -1150,25 +1188,25 @@ class PlumbingTests(CliTestCase):
         self.repo_mod.Repository.discover.side_effect = self.E.NotARepositoryError("no repo")
         self.ok("hash-object", "a.txt")
         self.ops.hash_object_cmd.assert_called_with(None, os.path.join(self.cwd, "a.txt"), False)
-        self.assertEqual(self.cli("hash-object", "-w", "a.txt")[0], 1)
+        self.assertEqual(self.cli("hash-object", "-w", "a.txt")[0], 128)
 
     def test_rev_parse(self):
         self.assertEqual(self.ok("rev-parse", "HEAD", "main"), SHA + "\n" + SHA + "\n")
         self.revparse.resolve_object.assert_called_with(self.repo, "main")
         self.assertEqual(self.ok("rev-parse", "--short", "HEAD"), SHA[:7] + "\n")
-        self.assertEqual(self.cli("rev-parse")[0], 2)
+        self.assertEqual(self.cli("rev-parse")[0], 129)
 
     def test_rev_parse_unknown(self):
         self.revparse.resolve_object.side_effect = self.E.RevisionError("unknown revision 'zzz'")
         rc, _, err = self.cli("rev-parse", "zzz")
-        self.assertEqual(rc, 1)
-        self.assertEqual(err, "error: unknown revision 'zzz'\n")
+        self.assertEqual(rc, 128)
+        self.assertEqual(err, "fatal: unknown revision 'zzz'\n")
 
     def test_help_command(self):
         self.assertIn("usage: minigit", self.ok("help"))
         self.assertIn("usage: minigit commit", self.ok("help", "commit"))
         rc, _, err = self.cli("help", "nope")
-        self.assertEqual(rc, 2)
+        self.assertEqual(rc, 129)
         self.assertIn("no help available", err)
 
 
@@ -1179,9 +1217,9 @@ class FallbackTests(unittest.TestCase):
         with patch.dict(sys.modules, {"minigit.errors": types.ModuleType("minigit.errors")}):
             err = io.StringIO()
             with contextlib.redirect_stderr(err):
-                rc = cli.main(["frobnicate"])
-            self.assertEqual(rc, 1)  # fallback exit code: the real UsageError gives 2
-            self.assertIn("error: argument <command>: invalid choice", err.getvalue())
+                rc = cli.main(["clone"])
+            self.assertEqual(rc, 1)  # fallback exit code: the real UsageError gives 129
+            self.assertIn("error: the following arguments are required", err.getvalue())
 
 
 if __name__ == "__main__":

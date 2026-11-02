@@ -11,7 +11,6 @@ import re
 import shutil
 import stat
 import sys
-import sys
 import urllib.parse
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -26,7 +25,8 @@ from . import worktree
 from .errors import MinigitError, PushRejectedError, RemoteError, UsageError
 from .refs import ANY, _check_windows_ref_name, check_ref_name
 from .repo import Repository
-from .transport import HttpRemote, RemoteRefs, check_url, save_credentials, split_url, url_with_user
+from .transport import (HttpRemote, RemoteRefs, check_url, redact_url, save_credentials, split_url,
+                        url_with_user)
 
 if TYPE_CHECKING:  # pragma: no cover
     from .merge import MergeOutcome
@@ -81,12 +81,13 @@ def remote_remove(repo: Repository, name: str) -> None:
 
 
 def remote_list(repo: Repository) -> dict[str, str]:
+    """Remote name -> URL for display (``remote -v``): a token in a hand-edited URL shows as ``***``."""
     cfg = repo.config
     out: dict[str, str] = {}
     for name in sorted(cfg.subsections("remote")):
         url = cfg.get(f"remote.{name}.url")
         if url:
-            out[name] = url
+            out[name] = redact_url(url)
     return out
 
 
@@ -251,7 +252,7 @@ def format_fetch(url: str, changes: list[RefChange]) -> str:
             lines.append(f"   {_abbrev(c.old) + '..' + _abbrev(c.new):<17} {branch} -> {dst}")
     if not lines:
         return ""
-    return "\n".join([f"From {url}"] + lines)
+    return "\n".join([f"From {redact_url(url)}"] + lines)
 
 
 # -------------------------------------------------------------- clone ----
@@ -314,7 +315,7 @@ def clone(url: str, directory: str | None, cwd: str) -> tuple[Repository, list[s
     target = os.path.abspath(os.path.join(cwd, directory))
     created = not os.path.exists(target)
     if not created and (not os.path.isdir(target) or os.listdir(target)):
-        raise MinigitError(f"destination '{directory}' already exists and is not empty")
+        raise MinigitError(f"destination path '{directory}' already exists and is not an empty directory")
 
     rem = HttpRemote(url)
     info = rem.info_refs()           # fails fast (auth, 404, ...) before touching the disk
@@ -385,17 +386,25 @@ def pull(repo: Repository, remote: str | None = None, branch: str | None = None,
     elif branch.startswith(HEADS):
         branch = branch[len(HEADS):]
     changes = fetch(repo, remote)
-    tracking = f"refs/remotes/{remote}/{branch}"
-    if repo.refs.resolve(tracking) is None:
-        if branch_arg is not None or configured:
-            raise MinigitError(f"couldn't find remote ref '{branch}' on '{remote}'",
-                               hint="check the branch name with: minigit fetch")
-        raise MinigitError(f"no upstream '{remote}/{branch}' (push with -u first)")
-    if rebase:
-        return changes, _pull_rebase(repo, tracking, f"{remote}/{branch}")
-    shown_url = split_url(url)[0]  # the user name of the URL does not belong in history
-    outcome = merge_mod.merge(repo, tracking, label=f"{remote}/{branch}",
-                              message=f"Merge branch '{branch}' of {shown_url}", allow_unrelated=allow_unrelated)
+    try:
+        tracking = f"refs/remotes/{remote}/{branch}"
+        if repo.refs.resolve(tracking) is None:
+            if branch_arg is not None or configured:
+                raise MinigitError(f"couldn't find remote ref '{branch}' on '{remote}'",
+                                   hint="check the branch name with: minigit fetch")
+            raise MinigitError(f"no upstream '{remote}/{branch}' (push with -u first)",
+                               hint=f"publish it with 'minigit push -u {remote} {branch}', or say what to merge: "
+                                    f"'minigit pull {remote} <branch>'")
+        if rebase:
+            return changes, _pull_rebase(repo, tracking, f"{remote}/{branch}")
+        shown_url = split_url(url)[0]  # the user name of the URL does not belong in history
+        outcome = merge_mod.merge(repo, tracking, label=f"{remote}/{branch}",
+                                  message=f"Merge branch '{branch}' of {shown_url}",
+                                  allow_unrelated=allow_unrelated)
+    except MinigitError as err:
+        # The fetch already moved the tracking refs: report it (as git does) although the merge failed.
+        err.fetch_changes = changes
+        raise
     return changes, outcome
 
 
@@ -503,6 +512,8 @@ def _dst_ref(dst: str, delete: bool = False, *, tag: bool = False) -> str:
         raise UsageError(f"invalid destination {what} name '{dst}'" + (f": {reason}" if reason else "")) from None
     if not name:
         raise UsageError(f"empty destination {what} name")
+    if name == "HEAD" and not tag and not delete:  # git refuses a branch named HEAD too
+        raise UsageError(f"invalid destination branch name '{dst}': 'HEAD' is not a valid branch name")
     return ref
 
 
@@ -523,6 +534,7 @@ def push(repo: Repository, remote: str | None = None, refspec: str | None = None
          set_upstream: bool = False, force: bool = False, delete: bool = False) -> list[str]:
     remote = remote or _default_remote(repo)
     url = remote_url(repo, remote)
+    shown = redact_url(url)
     store = repo.objects
 
     # -- parse the refspec ------------------------------------------------
@@ -543,6 +555,13 @@ def push(repo: Repository, remote: str | None = None, refspec: str | None = None
             src, delete = None, True
         if not dst:
             raise UsageError(f"invalid refspec '{refspec}': missing destination")
+    elif refspec in ("HEAD", "@"):
+        # as in git: the current branch, to the branch of the same name (never a branch named "HEAD")
+        current = _head_branch(repo)
+        if current is None:
+            raise MinigitError("you are not on a branch (detached HEAD); "
+                               f"use: minigit push {remote} HEAD:<branch>")
+        src, dst = "HEAD", current
     else:
         src, dst = refspec, refspec
 
@@ -579,13 +598,13 @@ def push(repo: Repository, remote: str | None = None, refspec: str | None = None
             rem.push([{"ref": dst_ref, "old": remote_old, "new": None}],
                      pack_mod.build_pack(store, []), force=force)
         except PushRejectedError as err:
-            err.src, err.dst = "", dst_name
+            err.src, err.dst, err.url = "", dst_name, shown
             raise
         if not is_tag:
             tracking = f"refs/remotes/{remote}/{dst_name}"
             if repo.refs.resolve(tracking) is not None:
                 repo.refs.update(tracking, None)
-        return [f"To {url}", f" - {'[deleted]':<17} {dst_name}"]
+        return [f"To {shown}", f" - {'[deleted]':<17} {dst_name}"]
 
     assert local is not None
     is_tag = dst_ref.startswith(TAGS)
@@ -603,12 +622,12 @@ def push(repo: Repository, remote: str | None = None, refspec: str | None = None
         if not is_tag and repo.refs.resolve(tracking) != local:
             repo.refs.update(tracking, local, expected=ANY)
         finish_upstream()
-        return ["Everything up-to-date"] + upstream_lines
+        return upstream_lines + ["Everything up-to-date"]  # git prints the upstream line first
 
     forced_update = False
     if remote_old is not None and is_tag:
         if not force:  # a tag on the remote is never moved silently
-            err = _tag_exists_error(url, dst_ref, remote_old)
+            err = _tag_exists_error(shown, dst_ref, remote_old)
             err.src, err.dst = src_label, dst_name
             raise err
         forced_update = True
@@ -623,7 +642,7 @@ def push(repo: Repository, remote: str | None = None, refspec: str | None = None
         if not fast_forward:
             if not force:
                 reason = "non-fast-forward" if known else "fetch-first"
-                err = PushRejectedError("push rejected", url=url, code="rejected", results=[{
+                err = PushRejectedError("push rejected", url=shown, code="rejected", results=[{
                     "ref": dst_ref, "status": "rejected", "reason": reason,
                     "current": remote_old, "message": _REJECT_MESSAGES[reason]}])
                 err.src, err.dst = src_label, dst_name
@@ -636,13 +655,13 @@ def push(repo: Repository, remote: str | None = None, refspec: str | None = None
     try:
         rem.push([{"ref": dst_ref, "old": remote_old, "new": local}], data, force=force)
     except PushRejectedError as err:
-        err.src, err.dst = src_label, dst_name
+        err.src, err.dst, err.url = src_label, dst_name, shown
         raise
 
     if not is_tag:
         repo.refs.update(tracking, local, expected=ANY)
     finish_upstream()
-    return [f"To {url}", _push_line(src_label, dst_name, remote_old, local, forced_update, is_tag)] + upstream_lines
+    return [f"To {shown}", _push_line(src_label, dst_name, remote_old, local, forced_update, is_tag)] + upstream_lines
 
 
 def _push_line(src_label: str, dst_name: str, remote_old: str | None, local: str, forced: bool,
@@ -661,10 +680,10 @@ def push_tags(repo: Repository, remote: str | None = None, *, force: bool = Fals
     (``PushRejectedError``, after the others were pushed) unless ``force`` is given.
     """
     remote = remote or _default_remote(repo)
-    url = remote_url(repo, remote)
+    rem = HttpRemote(remote_url(repo, remote))
+    url = redact_url(remote_url(repo, remote))
     store = repo.objects
     local_tags = repo.refs.list(TAGS)
-    rem = HttpRemote(url)
     info = rem.info_refs()
     updates: list[dict] = []
     lines: list[str] = []
@@ -682,7 +701,11 @@ def push_tags(repo: Repository, remote: str | None = None, *, force: bool = Fals
     if updates:
         exclude = [sha for sha in info.refs.values() if store.has(sha)]
         shas = pack_mod.objects_to_send(store, [u["new"] for u in updates], exclude)
-        rem.push(updates, pack_mod.build_pack(store, shas), force=force)
+        try:
+            rem.push(updates, pack_mod.build_pack(store, shas), force=force)
+        except PushRejectedError as err:
+            err.url = url
+            raise
     if rejected:
         err = PushRejectedError("push rejected", url=url, code="rejected", results=rejected)
         err.src = err.dst = rejected[0]["ref"][len(TAGS):]
@@ -709,7 +732,7 @@ def format_push_rejection(err: PushRejectedError, src: str | None = None, dst: s
     results = getattr(err, "results", None) or []
     rejected = [r for r in results if isinstance(r, dict) and r.get("status", "rejected") != "ok"]
     reason = rejected[0].get("reason") if rejected else None
-    url = getattr(err, "url", "") or ""
+    url = redact_url(getattr(err, "url", "") or "")
     src = _ref_display_name(src)
     dst = _ref_display_name(dst)
     lines = [f"To {url}"] + list(getattr(err, "accepted", None) or [])

@@ -133,7 +133,7 @@ class SingleUserWorkflowTests(CliCase):
         self.assertEqual(self.porcelain(self.repo), [
             "?? .minigitignore", "A  README.md", "A  src/app.py", "A  src/lib/util.py"])
         self.assertIn("ignored", self.git_fail("add", "debug.log").err)
-        self.assertIn("did not match any files", self.git_fail("add", "nope.txt").err)
+        self.assertIn("did not match any files", self.git_fail("add", "nope.txt", code=128).err)
         self.git("add", ".")          # everything that is not ignored
         self.assertEqual(self.porcelain(self.repo), [
             "A  .minigitignore", "A  README.md", "A  src/app.py", "A  src/lib/util.py"])
@@ -143,10 +143,10 @@ class SingleUserWorkflowTests(CliCase):
 
         res = self.git("commit", "-m", "initial import")
         self.assertRegex(res.out, rf"^\[main \(root-commit\) {HEX7}\] initial import\n"
-                                  r" 4 files changed, 6 insertions\(\+\)\n$")
+                                  r" 4 files changed, 6 insertions\(\+\)\n( create mode 100644 \S+\n){4}$")
         first = self.head(self.repo)
         self.assertIn("nothing to commit, working tree clean", self.git("status").out)
-        self.assertIn("nothing to commit", self.git_fail("commit", "-m", "again").err)
+        self.assertIn("nothing to commit", self.git_fail("commit", "-m", "again").out)
 
         # diff: working tree vs index, index vs HEAD, between commits
         self.put("README.md", "hello\nworld\n")
@@ -206,10 +206,10 @@ class SingleUserWorkflowTests(CliCase):
         # branch: create, list, refuse a duplicate
         self.git("branch", "feature")
         self.assertEqual(self.git("branch").out, "  feature\n* main\n")
-        self.assertIn("already exists", self.git_fail("branch", "feature").err)
+        self.assertIn("already exists", self.git_fail("branch", "feature", code=128).err)
 
         # checkout a branch and commit on it
-        self.assertIn("Switched to branch 'feature'", self.git("checkout", "feature").out)
+        self.assertIn("Switched to branch 'feature'", self.git("checkout", "feature").err)
         self.assertEqual(self.git("branch").out, "* feature\n  main\n")
         self.put("story.txt", base.replace("one", "ONE"))
         self.put("feature.txt", "feature work\n")
@@ -247,7 +247,7 @@ class SingleUserWorkflowTests(CliCase):
         self.git("switch", "main")
         main_tip = self.commit_file("story.txt", "ONE\ntwo\nTHREE\nfour\nfive\n", "main edits three")
         res = self.git("merge", "topic")
-        self.assertIn("Merge made by the 'three-way' strategy.", res.out)
+        self.assertIn("Merge made by the 'ort' strategy.", res.out)
         self.assertEqual(self.get("story.txt"), b"ONE\ntwo\nTHREE\nfour\nFIVE\n")
         self.assertEqual(self.rev(self.repo, "HEAD^1"), main_tip)
         self.assertEqual(self.rev(self.repo, "HEAD^2"), topic_tip)
@@ -307,11 +307,11 @@ class SingleUserWorkflowTests(CliCase):
 
         # detached HEAD: commit there, then come back
         merged = self.head(self.repo)
-        self.assertIn(f"HEAD is now at {main_tip[:7]}", self.git("checkout", "HEAD~1").out)
+        self.assertIn(f"HEAD is now at {main_tip[:7]}", self.git("checkout", "HEAD~1").err)
         self.assertIn(f"HEAD detached at {main_tip[:7]}", self.git("status").out)
         res = self.git("commit", "--allow-empty", "-m", "detached work")
         self.assertRegex(res.out, rf"^\[detached HEAD {HEX7}\] detached work\n$")
-        self.assertIn("Switched to branch 'main'", self.git("switch", "main").out)
+        self.assertIn("Switched to branch 'main'", self.git("switch", "main").err)
         self.assertEqual(self.head(self.repo), merged)
 
     def test_reset_and_restore(self):
@@ -505,7 +505,7 @@ class MultiUserWorkflowTests(CliCase):
 
         # Bob pulls (a real merge commit) and pushes.
         res = self.mg(bob, "pull", env=b_env)
-        self.assertIn("Merge made by the 'three-way' strategy.", res.out)
+        self.assertIn("Merge made by the 'ort' strategy.", res.out)
         self.assertEqual(read(os.path.join(bob, "alice.txt")), b"from alice\n")
         self.assertEqual(read(os.path.join(bob, "bob.txt")), b"from bob\n")
         merge_tip = self.head(bob, b_env)
@@ -704,17 +704,17 @@ class EntryPointTests(CliCase):
         self.env = make_env(self.tmp)
 
     def test_help_version_and_exit_codes(self):
-        self.assertEqual(self.mg(self.tmp, "--version").out, "minigit 0.2.0\n")
+        self.assertEqual(self.mg(self.tmp, "--version").out, "minigit 0.3.0\n")
         res = self.mg(self.tmp, "--help")
         for command in ("init", "add", "commit", "merge", "clone", "push", "pull", "serve"):
             self.assertIn(command, res.out)
         self.assertIn("--message", self.mg(self.tmp, "commit", "--help").out)
         self.assertIn("usage:", self.mg(self.tmp, "help", "merge").out)
-        self.assertIn("usage:", self.mg_fail(self.tmp, "frobnicate", code=2).err)
-        self.mg_fail(self.tmp, code=2)  # no command at all
-        self.mg_fail(self.tmp, "commit", "--no-such-flag", code=2)
-        res = self.mg_fail(self.tmp, "status")  # not inside a repository
-        self.assertTrue(res.err.startswith("error: not a minigit repository"), res.err)
+        self.assertIn("is not a minigit command", self.mg_fail(self.tmp, "frobnicate", code=1).err)   # git's exit code
+        self.mg_fail(self.tmp, code=1)  # no command at all: the help, exit 1
+        self.mg_fail(self.tmp, "commit", "--no-such-flag", code=129)
+        res = self.mg_fail(self.tmp, "status", code=128)  # not inside a repository
+        self.assertTrue(res.err.startswith("fatal: not a minigit repository"), res.err)
 
     def _env_with_this_python(self) -> dict:
         """PATH where ``python``/``python3`` are the interpreter running the tests."""
@@ -747,11 +747,11 @@ class EntryPointTests(CliCase):
 
         proc = subprocess.run([sys.executable, script, "--version"], cwd=work, env=env,
                               capture_output=True, timeout=60)
-        self.assertEqual((proc.returncode, proc.stdout.strip()), (0, b"minigit 0.2.0"), proc)
+        self.assertEqual((proc.returncode, proc.stdout.strip()), (0, b"minigit 0.3.0"), proc)
         if os.name == "nt" and not shutil.which("cmd"):  # pragma: no cover
             self.skipTest("cmd.exe is not available")
         proc = via_script("--version")
-        self.assertEqual((proc.returncode, proc.stdout.strip()), (0, b"minigit 0.2.0"), proc)
+        self.assertEqual((proc.returncode, proc.stdout.strip()), (0, b"minigit 0.3.0"), proc)
 
         self.assertEqual(via_script("init").returncode, 0)
         write(os.path.join(work, "a.txt"), "via the entry script\n")
@@ -759,8 +759,8 @@ class EntryPointTests(CliCase):
         proc = via_script("commit", "-m", "made by the entry script")
         self.assertEqual(proc.returncode, 0, proc)
         self.assertEqual(self.subjects(work), ["made by the entry script"])
-        self.assertEqual(via_script("merge").returncode, 2)               # usage error
-        self.assertEqual(via_script("switch", "nowhere").returncode, 1)   # minigit error
+        self.assertEqual(via_script("merge").returncode, 129)             # usage error
+        self.assertEqual(via_script("switch", "nowhere").returncode, 128) # fatal: invalid reference
 
 
 if __name__ == "__main__":

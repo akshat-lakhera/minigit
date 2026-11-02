@@ -297,7 +297,7 @@ class FastForwardTests(MergeCase):
         r.run("switch", "main")
 
         res = r.run("merge", "--no-ff", "feat")
-        self.assertIn("Merge made by the 'three-way' strategy.", res.out, res)
+        self.assertIn("Merge made by the 'ort' strategy.", res.out, res)
         self.assertNotIn("Fast-forward", res.out, res)
         head = r.sha("HEAD")
         self.assertNotEqual(head, feat)
@@ -443,7 +443,9 @@ class ThreeWayCleanTests(MergeCase):
         ours = r.commit_all("ours")
 
         res = r.run("merge", "feat")
-        self.assertEqual(res.out.strip(), "Merge made by the 'three-way' strategy.", res)
+        self.assertEqual(res.out.splitlines()[0], "Merge made by the 'ort' strategy.", res)
+        self.assertIn(" theirs.txt | 1 +\n 1 file changed, 1 insertion(+)\n create mode 100644 theirs.txt\n",
+                      res.out, res)   # git's diffstat and summary follow
         head = r.sha("HEAD")
         self.assertEqual(r.parents(head), [ours, theirs])
         self.assertEqual(r.message(head), "Merge branch 'feat'\n")
@@ -661,7 +663,7 @@ class ConflictTests(MergeCase):
         r = self.repo
         ours, theirs, res = self.conflicted_merge()
         lines = res.out.splitlines()
-        self.assertEqual(lines[0], "CONFLICT (content): Merge conflict in f.txt", res)
+        self.assertEqual(lines[:2], ["Auto-merging f.txt", "CONFLICT (content): Merge conflict in f.txt"], res)
         self.assertEqual(lines[-1], "Automatic merge failed; fix conflicts and then commit the result.", res)
         self.assertEqual(res.err, "", "conflicts are reported on stdout, not stderr")
         self.assertEqual(r.read("f.txt"), EXPECTED_MARKERS)
@@ -1143,7 +1145,7 @@ class RefusalTests(MergeCase):
         _, ours, theirs = self.diverge()
         r.write_gitfile("index.lock", "")
         res = r.run("merge", "feat", check=False)
-        self.assertEqual(res.returncode, 1, res)
+        self.assertEqual(res.returncode, 128, res)
         self.assertIn("index.lock exists", res.err, res)
         self.assertIn("If no other minigit process is running, delete it.", res.err, res)
         self.assertEqual(r.read("f.txt"), OURS)
@@ -1262,8 +1264,8 @@ class RefusalTests(MergeCase):
         env.pop("MINIGIT_AUTHOR_NAME")
         env.pop("MINIGIT_AUTHOR_EMAIL")
         res = r.run("merge", "feat", check=False, env=env)
-        self.assertEqual(res.returncode, 1, res)
-        self.assertIn("please set your identity", res.err, res)
+        self.assertEqual(res.returncode, 128, res)
+        self.assertIn("author identity unknown", res.err, res)
         self.assertEqual(r.sha("HEAD"), ours)
         self.assertFalse(r.exists("t.txt"), "a refused merge must not leave files behind")
         self.assertIsNone(r.state("MERGE_HEAD"))
@@ -1276,15 +1278,15 @@ class RefusalTests(MergeCase):
         res = r.run("merge", "feat", env=env)
         self.assertIn("Fast-forward", res.out, res)
 
-    def test_usage_errors_exit_2(self):
+    def test_usage_errors_exit_129(self):
         r = self.repo
         self.seed()
         res = r.run("merge", check=False)
-        self.assertEqual(res.returncode, 2, res)
+        self.assertEqual(res.returncode, 129, res)
         res = r.run("merge", "--abort", "feat", check=False)
-        self.assertEqual(res.returncode, 2, res)
+        self.assertEqual(res.returncode, 129, res)
         res = r.run("merge", "no-such-branch", check=False)
-        self.assertEqual(res.returncode, 1, res)
+        self.assertEqual(res.returncode, 128, res)   # git: fatal
         self.assertIn("unknown revision 'no-such-branch'", res.err, res)
 
 
@@ -1444,7 +1446,7 @@ class AbortTests(MergeCase):
         res = r.run("merge", "feat", check=False)
         self.assertEqual(res.returncode, 1, res)
         res = r.run("reset", "--soft", "HEAD~1", check=False)
-        self.assertEqual(res.returncode, 1, res)
+        self.assertEqual(res.returncode, 128, res)   # git: fatal
         self.assertEqual(r.state("MERGE_HEAD"), theirs)
         self.assertEqual(r.sha("HEAD"), ours)
 

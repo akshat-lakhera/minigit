@@ -326,7 +326,7 @@ def apply(repo: Repository, n: int = 0, *, pop: bool = False) -> ApplyOutcome:
     with _m("index").locked_index(repo) as index:
         _require_merged(index, what)
         ours = index.flat()
-        res = _m("merge").merge_trees(store, base, ours, theirs, OURS_LABEL, THEIRS_LABEL)
+        res = _m("merge").merge_trees(store, base, ours, theirs, OURS_LABEL, THEIRS_LABEL, auto_merging=True)
         plan = seq._plan(repo, index, ours, res, "stash pop" if pop else "stash apply")
         bad = _untracked_in_the_way(repo, u_flat, plan.target)
         if bad:
@@ -367,14 +367,18 @@ def list_entries(repo: Repository) -> list[str]:
     return [f"stash@{{{i}}}: {repo.read_commit(sha).subject}" for i, sha in enumerate(read_stack(repo))]
 
 
-def show(repo: Repository, n: int = 0) -> bytes:
-    """The patch from the entry's base commit to its worktree state."""
+def show(repo: Repository, n: int = 0, *, patch: bool = True) -> bytes:
+    """The change from the entry's base commit to its worktree state: the patch, or (``patch=False``,
+    what ``stash show`` prints by default, as in git) the diffstat."""
     repo.require_worktree()
     _stack, sha = _entry(repo, n)
     entry = read_entry(repo, sha)
     trees = _m("trees")
-    return _m("diff").diff_flats(repo, trees.commit_flat(repo.objects, entry.base),
-                                 trees.flatten_tree(repo.objects, entry.tree))
+    old = trees.commit_flat(repo.objects, entry.base)
+    new = trees.flatten_tree(repo.objects, entry.tree)
+    if not patch:
+        return _m("diff").diffstat(repo, old, new)
+    return _m("diff").diff_flats(repo, old, new)
 
 
 def clear(repo: Repository) -> None:
@@ -393,14 +397,26 @@ def add_parser(subparsers) -> None:
     s = subparsers.add_parser(
         "stash", help=help_,
         usage="minigit stash [push] [-m MSG] [-u]\n"
-              "       minigit stash (pop | apply | drop | show) [stash@{N} | N]\n"
+              "       minigit stash (pop | apply | drop) [stash@{N} | N]\n"
+              "       minigit stash show [-p] [stash@{N} | N]\n"
               "       minigit stash (list | clear)",
         description=help_ + ". Without a subcommand: push.")
     s.add_argument("-m", "--message", default=None, metavar="MSG", help="push: describe the entry")
     s.add_argument("-u", "--include-untracked", dest="include_untracked", action="store_true",
                    help="push: also save (and remove) untracked files")
+    s.add_argument("-p", "--patch", dest="patch", action="store_true",
+                   help="show: print the patch instead of the diffstat")
     s.add_argument("args", nargs="*", metavar="subcommand [stash@{N}]",
                    help="push (default), pop, apply, drop, list, show or clear; an entry (default stash@{0})")
+
+
+def _status_text(repo: Repository, cwd: str) -> str:
+    status = _m("status")
+    st = status.compute_status(repo)
+    view = getattr(_m("ops"), "status_view", None)
+    if view is not None:
+        st = view(repo, st, cwd)
+    return status.format_status_long(st)
 
 
 def cmd_stash(ns, cwd: str) -> int:
@@ -423,6 +439,8 @@ def cmd_stash(ns, cwd: str) -> int:
             raise UsageError(f"stash {sub} takes no arguments")
         if len(args) > 1:
             raise UsageError(f"stash {sub}: too many arguments (one stash entry at most)")
+    if getattr(ns, "patch", False) and sub != "show":
+        raise UsageError(f"stash {sub}: -p/--patch only works with 'stash show'")
     n = parse_ref(args[0]) if args and sub != "push" else 0
     repo = _m("repo").Repository.discover(cwd)
 
@@ -433,7 +451,7 @@ def cmd_stash(ns, cwd: str) -> int:
     elif sub == "list":
         _say("\n".join(list_entries(repo)))
     elif sub == "show":
-        _out(show(repo, n))
+        _out(show(repo, n, patch=getattr(ns, "patch", False)))
     elif sub == "clear":
         clear(repo)
     elif sub == "drop":
@@ -442,6 +460,7 @@ def cmd_stash(ns, cwd: str) -> int:
     else:
         out = apply(repo, n, pop=sub == "pop")
         _say("\n".join(out.messages))
+        _say(_status_text(repo, cwd))   # git shows the status after applying an entry
         if out.conflicts:
             if sub == "pop":
                 _say(KEPT)

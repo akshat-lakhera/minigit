@@ -240,7 +240,7 @@ class GcTests(unittest.TestCase):
         self.assertTrue(bare.objects.has(tip))
 
     def test_usage(self):
-        _, err = self.mg("gc", "extra", code=2)
+        _, err = self.mg("gc", "extra", code=129)
         self.assertIn("usage: minigit gc", err)
         out, _ = self.mg("gc", "--help")
         self.assertIn("--prune", out)

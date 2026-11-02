@@ -294,7 +294,13 @@ class Base(unittest.TestCase):
     def head_file(self, repo: str) -> str:
         return read(os.path.join(repo, ".minigit", "HEAD")).decode()
 
-    def assertFails(self, res: Result, *needles: str, code: int = 1) -> None:
+    # git reports these as "fatal: ..." and exits 128; other refusals are "error: ...", exit 1
+    FATAL_NEEDLES = ("unknown revision", "is not a commit", "does not exist in", "ambiguous short id",
+                     "not a minigit repository")
+
+    def assertFails(self, res: Result, *needles: str, code: int | None = None) -> None:
+        if code is None:
+            code = 128 if any(f in n for n in needles for f in self.FATAL_NEEDLES) else 1
         self.assertEqual(res.returncode, code, f"expected exit {code}:\n{res}")
         for n in needles:
             self.assertIn(n, res.err, f"missing {n!r} in stderr:\n{res}")
@@ -417,20 +423,20 @@ class TestLog(Base):
     def test_bad_revisions_and_usage(self):
         S = self.S
         self.assertFails(run(["log", "nosuch"], self.repo, self.env, check=False),
-                         "error: unknown revision 'nosuch'")
+                         "fatal: unknown revision 'nosuch'")
         self.assertFails(run(["log", "HEAD~6"], self.repo, self.env, check=False),
-                         "error: unknown revision 'HEAD~6'")
+                         "fatal: unknown revision 'HEAD~6'")
         blob = rev_parse(self.repo, self.env, "HEAD:a.txt")[0]
         self.assertFails(run(["log", blob], self.repo, self.env, check=False),
-                         f"error: '{blob}' is not a commit")
+                         f"fatal: \'{blob}\' is not a commit")
         tree = rev_parse(self.repo, self.env, "HEAD:dir")[0]
         self.assertFails(run(["log", "--oneline", tree], self.repo, self.env, check=False),
                          "is not a commit")
         # a short id of a blob is still "not a commit"
         self.assertFails(run(["log", blob[:8]], self.repo, self.env, check=False),
                          "is not a commit")
-        self.assertEqual(run(["log", "-n", "abc"], self.repo, self.env, check=False).returncode, 2)
-        self.assertEqual(run(["log", "--bogus"], self.repo, self.env, check=False).returncode, 2)
+        self.assertEqual(run(["log", "-n", "abc"], self.repo, self.env, check=False).returncode, 129)
+        self.assertEqual(run(["log", "--bogus"], self.repo, self.env, check=False).returncode, 129)
         del S
 
     def test_topological_order_beats_timestamps(self):
@@ -470,11 +476,11 @@ class TestLog(Base):
         self.assertFails(run(["log"], repo, env, check=False), msg)
         self.assertFails(run(["log", "--oneline"], repo, env, check=False), msg)
         self.assertFails(run(["log", "--all"], repo, env, check=False), msg)
-        self.assertFails(run(["show"], repo, env, check=False))
-        self.assertFails(run(["rev-parse", "HEAD"], repo, env, check=False), "error: unknown revision 'HEAD'")
+        self.assertFails(run(["show"], repo, env, check=False), code=128)   # git: fatal
+        self.assertFails(run(["rev-parse", "HEAD"], repo, env, check=False), "fatal: unknown revision 'HEAD'")
         other, env2 = self.fresh_repo("-b", "trunk")
         self.assertFails(run(["log"], other, env2, check=False),
-                         "error: your current branch 'trunk' does not have any commits yet")
+                         "error: your current branch 'trunk' does not have any commits yet", code=1)
 
     def test_outside_a_repository(self):
         tmp = self.scratch()
@@ -483,8 +489,8 @@ class TestLog(Base):
         os.makedirs(outside)
         for args in (["log"], ["show"], ["rev-parse", "HEAD"], ["log", "--oneline", "-n", "1"]):
             res = run(args, outside, env, check=False)
-            self.assertEqual(res.returncode, 1, str(res))
-            self.assertIn("error: not a minigit repository (or any parent): ", res.err)
+            self.assertEqual(res.returncode, 128, str(res))
+            self.assertIn("fatal: not a minigit repository (or any parent): ", res.err)
             self.assertIn(os.path.basename(outside), res.err)
 
     def test_from_subdirectory_and_dash_C(self):
@@ -495,7 +501,7 @@ class TestLog(Base):
         # rev:path is repository-root relative, as in git
         self.assertEqual(run(["show", "HEAD:dir/sub/deep.txt"], sub, self.env).stdout, b"deep\n")
         self.assertFails(run(["show", "HEAD:deep.txt"], sub, self.env, check=False),
-                         "error: path 'deep.txt' does not exist in 'HEAD'")
+                         "fatal: path 'deep.txt' does not exist in 'HEAD'")
         parent = os.path.dirname(self.repo)
         viac = run(["-C", os.path.basename(self.repo), "log", "--oneline", "-n", "1"], parent, self.env)
         self.assertEqual(viac.lines, root_lines[:1])
@@ -605,7 +611,7 @@ class TestShow(Base):
         second = run(["show", "HEAD~4"], self.repo, self.env).stdout.decode("utf-8")
         self.assertTrue(second.startswith(self.header("c2")), second)
         self.assertTrue(second.endswith(
-            "    second\n\n    body line\n\n"
+            "    second\n    \n    body line\n\n"   # git indents the blank message line too
             "diff --git a/a.txt b/a.txt\n"
             f"index {BLOB_A[:7]}..{BLOB_B[:7]} 100644\n"
             "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-a\n+b\n"), second)
@@ -699,24 +705,26 @@ class TestShow(Base):
                      ["log", "--oneline", "dir/"], ["log", "--oneline", "HEAD", "dir/sub"]):
             with self.subTest(args=args):
                 self.assertEqual(run(args, self.repo, self.env).out, f"{S['c3'][:7]} third\n")
-        # the merge changed f.txt against its first parent, so it counts for f.txt
+        # git's history simplification: the merge has f.txt exactly as its second parent has it
+        # (TREESAME), so it is hidden and only that parent is followed
         res = run(["log", "--oneline", "--", "f.txt"], self.repo, self.env)
-        self.assertEqual(res.out, f"{S['M'][:7]} merge feature\n{S['cf'][:7]} (feature) feat commit\n", str(res))
+        self.assertEqual(res.out, f"{S['cf'][:7]} (feature) feat commit\n", str(res))
         self.assertEqual(run(["log", "--oneline", "-n", "1", "feature", "--", "f.txt"], self.repo, self.env).out,
                          f"{S['cf'][:7]} (feature) feat commit\n")
+        # --graph implies --topo-order (as in git): the merged branch comes before the first parent
         res = run(["log", "--graph", "--oneline"], self.repo, self.env)
         self.assertEqual(res.out, (
             f"* {S['c6'][:7]} (HEAD -> main) sixth\n"
             f"* {S['c5'][:7]} fifth\n"
             f"*   {S['M'][:7]} merge feature\n"
             "|\\  \n"
-            f"* | {S['c3'][:7]} third\n"
             f"| * {S['cf'][:7]} (feature) feat commit\n"
+            f"* | {S['c3'][:7]} third\n"
             "|/  \n"
             f"* {S['c2'][:7]} second\n"
             f"* {S['c1'][:7]} first\n"), str(res))
         res = run(["log", "--graph", "--oneline", "--", "f.txt"], self.repo, self.env)
-        self.assertEqual(res.out, f"* {S['M'][:7]} merge feature\n* {S['cf'][:7]} (feature) feat commit\n", str(res))
+        self.assertEqual(res.out, f"* {S['cf'][:7]} (feature) feat commit\n", str(res))
 
     def test_blob_bytes_are_raw(self):
         S = self.S
@@ -758,18 +766,18 @@ class TestShow(Base):
 
     def test_path_and_usage_errors(self):
         self.assertFails(run(["show", "HEAD:nosuch"], self.repo, self.env, check=False),
-                         "error: path 'nosuch' does not exist in 'HEAD'")
+                         "fatal: path 'nosuch' does not exist in 'HEAD'")
         self.assertFails(run(["show", "HEAD~5:b.txt"], self.repo, self.env, check=False),
-                         "error: path 'b.txt' does not exist in 'HEAD~5'")
+                         "fatal: path 'b.txt' does not exist in 'HEAD~5'")
         self.assertFails(run(["show", "HEAD:dir/top.txt/x"], self.repo, self.env, check=False),
-                         "error: path 'dir/top.txt/x' does not exist in 'HEAD'")
+                         "fatal: path 'dir/top.txt/x' does not exist in 'HEAD'")
         self.assertFails(run(["show", "HEAD:dir/nope/deep.txt"], self.repo, self.env, check=False),
                          "does not exist in 'HEAD'")
         self.assertFails(run(["show", "nosuch:a.txt"], self.repo, self.env, check=False),
-                         "error: unknown revision 'nosuch'")
+                         "fatal: unknown revision 'nosuch'")
         self.assertFails(run(["show", "HEAD~9"], self.repo, self.env, check=False),
-                         "error: unknown revision 'HEAD~9'")
-        self.assertEqual(run(["show", "HEAD", "HEAD~1"], self.repo, self.env, check=False).returncode, 2)
+                         "fatal: unknown revision 'HEAD~9'")
+        self.assertEqual(run(["show", "HEAD", "HEAD~1"], self.repo, self.env, check=False).returncode, 129)
 
     def test_empty_tree_root_commit(self):
         repo, env = self.fresh_repo()
@@ -840,20 +848,20 @@ class TestRevParse(Base):
         S = self.S
         blob = rev_parse(self.repo, self.env, "HEAD:a.txt")[0]
         bad = {
-            "HEAD~6": "error: unknown revision 'HEAD~6'",
-            "HEAD^2": "error: unknown revision 'HEAD^2'",          # c6 has one parent
-            "HEAD~2^3": "error: unknown revision 'HEAD~2^3'",      # the merge has two
-            "HEAD~5^": "error: unknown revision 'HEAD~5^'",        # the root has none
-            "HEAD~x": "error: unknown revision 'HEAD~x'",
-            "nosuch": "error: unknown revision 'nosuch'",
-            "nosuch~1": "error: unknown revision 'nosuch~1'",
-            "0123456789012345678901234567890123456789": "error: unknown revision",
-            "refs/heads/nosuch": "error: unknown revision",
-            "": "error: unknown revision ''",
-            f"{blob}~1": f"error: '{blob}' is not a commit",
-            f"{blob}^0": f"error: '{blob}' is not a commit",
-            "HEAD:nosuch": "error: path 'nosuch' does not exist in 'HEAD'",
-            "ORIG_HEAD:zzz": "error: path 'zzz' does not exist in 'ORIG_HEAD'",
+            "HEAD~6": "fatal: unknown revision 'HEAD~6'",
+            "HEAD^2": "fatal: unknown revision 'HEAD^2'",          # c6 has one parent
+            "HEAD~2^3": "fatal: unknown revision 'HEAD~2^3'",      # the merge has two
+            "HEAD~5^": "fatal: unknown revision 'HEAD~5^'",        # the root has none
+            "HEAD~x": "fatal: unknown revision 'HEAD~x'",
+            "nosuch": "fatal: unknown revision 'nosuch'",
+            "nosuch~1": "fatal: unknown revision 'nosuch~1'",
+            "0123456789012345678901234567890123456789": "fatal: unknown revision",
+            "refs/heads/nosuch": "fatal: unknown revision",
+            "": "fatal: unknown revision ''",
+            f"{blob}~1": f"fatal: \'{blob}\' is not a commit",
+            f"{blob}^0": f"fatal: \'{blob}\' is not a commit",
+            "HEAD:nosuch": "fatal: path 'nosuch' does not exist in 'HEAD'",
+            "ORIG_HEAD:zzz": "fatal: path 'zzz' does not exist in 'ORIG_HEAD'",
         }
         for spec, needle in bad.items():
             with self.subTest(spec=spec):
@@ -862,9 +870,9 @@ class TestRevParse(Base):
                 self.assertEqual(res.stdout, b"")
         # a failing argument after a good one: the good one was printed, exit is 1
         res = run(["rev-parse", "HEAD", "nosuch"], self.repo, self.env, check=False)
-        self.assertEqual(res.returncode, 1)
+        self.assertEqual(res.returncode, 128)
         self.assertEqual(res.lines, [S["c6"]])
-        self.assertEqual(run(["rev-parse"], self.repo, self.env, check=False).returncode, 2)
+        self.assertEqual(run(["rev-parse"], self.repo, self.env, check=False).returncode, 129)
 
     def test_names_and_full_ref_names(self):
         S = self.S
@@ -874,7 +882,7 @@ class TestRevParse(Base):
         # the merge wrote ORIG_HEAD = the pre-merge head; it works as a log start too
         self.assertEqual(self.oneline(self.repo, self.env, "-n", "1", "ORIG_HEAD")[0][2], "third")
         self.assertFails(run(["rev-parse", "MERGE_HEAD"], self.repo, self.env, check=False),
-                         "error: unknown revision 'MERGE_HEAD'")
+                         "fatal: unknown revision 'MERGE_HEAD'")
 
     def test_short_hashes(self):
         S = self.S
@@ -889,14 +897,14 @@ class TestRevParse(Base):
         self.assertEqual(self.oneline(self.repo, self.env, "-n", "1", S["c3"][:7])[0][2], "third")
         self.assertEqual(run(["show", S["c2"][:5] + ":a.txt"], self.repo, self.env).stdout, b"b\n")
         self.assertFails(run(["rev-parse", head[:3]], self.repo, self.env, check=False),
-                         f"error: unknown revision '{head[:3]}'")
+                         f"fatal: unknown revision '{head[:3]}'")
         # a prefix matching nothing
         missing = "fffffffff" if not head.startswith("f") else "000000000"
         self.assertFails(run(["rev-parse", missing], self.repo, self.env, check=False),
-                         f"error: unknown revision '{missing}'")
+                         f"fatal: unknown revision '{missing}'")
         # not hex at all
         self.assertFails(run(["rev-parse", "abcg"], self.repo, self.env, check=False),
-                         "error: unknown revision 'abcg'")
+                         "fatal: unknown revision 'abcg'")
 
     def test_ambiguous_short_id(self):
         repo = self.copy_fixture()
@@ -908,7 +916,7 @@ class TestRevParse(Base):
         sha_a = run(["hash-object", "-w", "amb0.txt"], repo, self.env).out.strip()
         sha_b = run(["hash-object", "-w", "amb1.txt"], repo, self.env).out.strip()
         self.assertEqual((sha_a, sha_b), (blob_sha(a), blob_sha(b)))
-        msg = f"error: ambiguous short id '{prefix}' (matches 2 objects)"
+        msg = f"fatal: ambiguous short id '{prefix}' (matches 2 objects)"
         self.assertFails(run(["rev-parse", prefix], repo, self.env, check=False), msg)
         self.assertFails(run(["show", prefix], repo, self.env, check=False), msg)
         self.assertFails(run(["log", prefix], repo, self.env, check=False), msg)
@@ -940,7 +948,7 @@ class TestRevParse(Base):
         self.assertEqual((sha7, labels, subject), (S["c5"][:7], [name], "fifth"))
         # checkout of that name switches branches instead of detaching at the blob/prefix
         res = run(["checkout", name], repo, self.env)
-        self.assertEqual(res.out.strip(), f"Switched to branch '{name}'")
+        self.assertEqual(res.err.strip(), f"Switched to branch '{name}'")
         self.assertEqual(self.head_file(repo), f"ref: refs/heads/{name}\n")
         # the blob is still reachable through its longer unique id
         self.assertEqual(run(["show", blob[:12]], repo, self.env).stdout, data)
@@ -957,7 +965,7 @@ class TestRevParse(Base):
         self.assertEqual(len(entries), 6)
         self.assertEqual(run(["show", "topic/deep/name:a.txt"], repo, self.env).stdout, b"b\n")
         self.assertFails(run(["rev-parse", "topic/deep"], repo, self.env, check=False),
-                         "error: unknown revision 'topic/deep'")
+                         "fatal: unknown revision 'topic/deep'")
 
     def test_merge_head_during_a_conflict(self):
         S = self.S
@@ -984,7 +992,7 @@ class TestRevParse(Base):
         self.assertNotIn("conf a", run(["log", "--oneline"], repo, self.env).out)
         run(["merge", "--abort"], repo, self.env)
         self.assertFails(run(["rev-parse", "MERGE_HEAD"], repo, self.env, check=False),
-                         "error: unknown revision 'MERGE_HEAD'")
+                         "fatal: unknown revision 'MERGE_HEAD'")
         self.assertEqual(rev_parse(repo, self.env, "HEAD")[0], main_head)
 
     def test_orig_head_after_reset(self):
@@ -1044,7 +1052,7 @@ class TestDetachedHead(Base):
         S = self.S
         repo = self.copy_fixture()
         res = run(["checkout", S["c5"]], repo, self.env)
-        self.assertEqual(res.out.strip(), f"HEAD is now at {S['c5'][:7]} fifth")
+        self.assertEqual(res.err.strip().splitlines()[-1], f"HEAD is now at {S['c5'][:7]} fifth")
         self.assertEqual(self.head_file(repo), S["c5"] + "\n")
         self.assertEqual(run(["status"], repo, self.env).lines[0], f"HEAD detached at {S['c5'][:7]}")
         self.assertEqual(rev_parse(repo, self.env, "HEAD", "@", "main", "HEAD~1"), [S["c5"], S["c5"], S["c6"], S["M"]])
@@ -1056,7 +1064,7 @@ class TestDetachedHead(Base):
         # --all still shows main's tip, decorated as a plain branch
         self.assertEqual(self.oneline(repo, self.env, "--all")[0], (S["c6"][:7], ["main"], "sixth"))
         back = run(["checkout", "main"], repo, self.env)
-        self.assertEqual(back.out.strip(), "Switched to branch 'main'")
+        self.assertEqual(back.err.strip().splitlines()[-1], "Switched to branch 'main'")
         self.assertEqual(self.head_file(repo), "ref: refs/heads/main\n")
         self.assertEqual(self.oneline(repo, self.env, "-n", "1")[0], (S["c6"][:7], ["HEAD -> main"], "sixth"))
 
@@ -1064,7 +1072,7 @@ class TestDetachedHead(Base):
         S = self.S
         repo = self.copy_fixture()
         res = run(["switch", "--detach", "main"], repo, self.env)
-        self.assertEqual(res.out.strip(), f"HEAD is now at {S['c6'][:7]} sixth")
+        self.assertEqual(res.err.strip(), f"HEAD is now at {S['c6'][:7]} sixth")
         self.assertEqual(self.head_file(repo), S["c6"] + "\n")
         self.assertEqual(run(["log", "--oneline", "-n", "1"], repo, self.env).lines,
                          [f"{S['c6'][:7]} (HEAD, main) sixth"])
@@ -1073,7 +1081,7 @@ class TestDetachedHead(Base):
         self.assertEqual(run(["status"], repo, self.env).lines[0], f"HEAD detached at {S['c6'][:7]}")
         # detaching at a short sha and at HEAD itself
         run(["switch", "main"], repo, self.env)
-        self.assertEqual(run(["checkout", S["cf"][:7]], repo, self.env).out.strip(),
+        self.assertEqual(run(["checkout", S["cf"][:7]], repo, self.env).err.strip().splitlines()[-1],
                          f"HEAD is now at {S['cf'][:7]} feat commit")
         self.assertEqual(run(["log", "--oneline", "-n", "1"], repo, self.env).lines,
                          [f"{S['cf'][:7]} (HEAD, feature) feat commit"])
@@ -1203,7 +1211,7 @@ class TestWithServer(Base):
         full = run(["log", "-n", "1", "origin/main"], work, env).lines[0]
         self.assertEqual(full, f"commit {c1} (origin/main)")
         self.assertFails(run(["rev-parse", "origin/nosuch"], work, env, check=False),
-                         "error: unknown revision 'origin/nosuch'")
+                         "fatal: unknown revision 'origin/nosuch'")
         # after pushing, the remote-tracking ref moves with the branch
         run(["push"], work, env)
         self.assertEqual(rev_parse(work, env, "origin/main")[0], c2)

@@ -211,15 +211,36 @@ def _grouped(ops, n: int):
         yield group
 
 
+def _func_name(line: bytes) -> bytes | None:
+    """git's default hunk-header context: a line that starts with a letter, ``_`` or ``$``, cut to
+    80 bytes and stripped of trailing whitespace; None for any other line."""
+    if line[:1].isalpha() or line[:1] in (b"_", b"$"):
+        return line[:80].rstrip()
+    return None
+
+
 def render_hunks(a: bytes, b: bytes, context: int = 3) -> bytes:
-    """Only the ``@@`` hunks for two text blobs (no header lines)."""
+    """Only the ``@@`` hunks for two text blobs (no header lines).
+
+    Like git, each ``@@`` line ends with the nearest line above the hunk that looks like the start
+    of a function (see ``_func_name``), e.g. ``@@ -17,7 +17,7 @@ def main():``.
+    """
     al = split_lines(a)
     bl = split_lines(b)
     out = bytearray()
+    func = b""
+    searched = -1   # git's funclineprev: lines at or below it were searched for an earlier hunk
     for group in _grouped(_opcodes(al, bl), context):
         i1, i2 = group[0][1], group[-1][2]
         j1, j2 = group[0][3], group[-1][4]
-        out += f"@@ -{_range(i1, i2 - i1)} +{_range(j1, j2 - j1)} @@\n".encode()
+        for k in range(i1 - 1, searched, -1):
+            found = _func_name(al[k])
+            if found is not None:
+                func = found
+                break
+        searched = max(searched, i1 - 1)
+        out += f"@@ -{_range(i1, i2 - i1)} +{_range(j1, j2 - j1)} @@".encode()
+        out += (b" " + func if func else b"") + b"\n"
         for tag, a1, a2, b1, b2 in group:
             if tag == "equal":
                 for line in al[a1:a2]:
@@ -283,25 +304,32 @@ def _version(repo, entry: Entry | None, path: str, from_worktree: bool) -> FileV
     return FileVersion(mode, sha, data)
 
 
-def _unmerged_diff(repo, path: str) -> bytes:
-    """Worktree file (with conflict markers) diffed against stage 2 ("ours")."""
+def _unmerged_sides(repo, path: str) -> tuple[FileVersion, FileVersion] | None:
+    """(stage 2 "ours", the worktree file with its conflict markers), or None when they are equal
+    or a side is missing (as `git diff --ours`: no stage 2, i.e. added by them, means no diff)."""
     from minigit.index import read_index
 
     stages = read_index(repo).unmerged().get(path, {})
-    entry = stages.get(2)   # as `git diff --ours`: no stage 2 (added by them) means no diff
+    entry = stages.get(2)
     if entry is None:
-        return b""
+        return None
     try:
         old = _version(repo, (entry.mode, entry.sha), path, False)
         data = _version(repo, (entry.mode, entry.sha), path, True).data
     except Exception:
-        return b""
+        return None
     if old.data == data:
-        return b""
+        return None
     import hashlib
 
     sha = hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
-    return render_file_diff(path, old, FileVersion(entry.mode, sha, data))
+    return old, FileVersion(entry.mode, sha, data)
+
+
+def _unmerged_diff(repo, path: str) -> bytes:
+    """Worktree file (with conflict markers) diffed against stage 2 ("ours")."""
+    sides = _unmerged_sides(repo, path)
+    return render_file_diff(path, *sides) if sides is not None else b""
 
 
 def _render(repo, old: FlatTree, new: FlatTree, new_from_worktree: bool,
@@ -398,6 +426,13 @@ def file_stats(repo, old: FlatTree, new: FlatTree, *, new_from_worktree: bool = 
     for p in sorted(set(paths) | unmerged_set):
         if p in unmerged_set:
             stats.append(FileStat(p, 0, 0, unmerged=True))
+            sides = _unmerged_sides(repo, p) if new_from_worktree else None
+            if sides is not None:   # git adds the line of the patch `diff` prints (against "ours")
+                a, b = sides[0].data, sides[1].data
+                if is_binary(a) or is_binary(b):
+                    stats.append(FileStat(p, len(b), len(a), binary=True))
+                else:
+                    stats.append(FileStat(p, *count_changes(a, b)))
             continue
         if p in sources:
             continue
@@ -421,6 +456,8 @@ def file_stats(repo, old: FlatTree, new: FlatTree, *, new_from_worktree: bool = 
 def format_shortstat(files: int, insertions: int, deletions: int) -> str:
     """git's summary line: `` 2 files changed, 3 insertions(+), 1 deletion(-)``."""
     out = f" {files} file changed" if files == 1 else f" {files} files changed"
+    if not files:
+        return out   # only unmerged paths: " 0 files changed"
     if insertions or not deletions:
         out += f", {insertions} insertion(+)" if insertions == 1 else f", {insertions} insertions(+)"
     if deletions or not insertions:
@@ -469,7 +506,7 @@ def format_diffstat(stats: Sequence[FileStat], width: int = 80) -> str:
     lines: list[str] = []
     files = insertions = deletions = 0
     for s in stats:
-        files += 1
+        files += not s.unmerged   # the "Unmerged" line is not counted (its diff line is)
         name = s.name
         prefix = ""
         room = name_width

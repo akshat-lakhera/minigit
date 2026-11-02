@@ -3,7 +3,8 @@
 Revision syntax (SPEC section 5): ``HEAD``, ``@``, ``ORIG_HEAD``, ``MERGE_HEAD``,
 a full sha, a ref name (``refs/x``, then ``refs/tags/x``, then ``refs/heads/x``,
 then ``refs/remotes/x``), a hex prefix of >= 4 characters; suffixes ``~N``,
-``^``, ``^N`` applied left to right; and ``rev:path`` for a blob or tree.
+``^``, ``^N`` and the peel suffixes ``^{}``, ``^{commit}``, ``^{tree}``, ``^{blob}``,
+``^{tag}``, ``^{object}`` applied left to right; and ``rev:path`` for a blob or tree.
 An annotated tag is peeled to the commit it names wherever a commit is required.
 """
 
@@ -17,6 +18,8 @@ from .refs import is_hex_sha
 from .repo import Repository
 
 _SUFFIX_RE = re.compile(r"(~|\^)(\d*)")
+_PEEL_RE = re.compile(r"\^\{([a-z]*)\}")
+_PEEL_TYPES = ("", "commit", "tree", "blob", "tag", "object")
 _HEXPREFIX_RE = re.compile(r"^[0-9a-fA-F]{4,40}$")
 
 
@@ -45,15 +48,17 @@ def resolve_ref(repo: Repository, name: str) -> str | None:
     return None
 
 
-def _unknown(spec: str) -> RevisionError:
-    return RevisionError("unknown revision '%s'" % spec)
+def _unknown(spec: str, hint: str | None = None) -> RevisionError:
+    return RevisionError("unknown revision '%s'" % spec, hint=hint)
 
 
 def _resolve_base(repo: Repository, base: str, spec: str) -> str:
     if base in ("HEAD", "@"):
         sha = repo.refs.resolve("HEAD")
         if sha is None:
-            raise _unknown(spec)
+            branch = repo.refs.current_branch()
+            raise _unknown(spec, None if branch is None else
+                           "the current branch '%s' has no commits yet" % branch)
         return sha
     if base in ("ORIG_HEAD", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD"):
         sha = repo.refs.read_special(base)
@@ -106,19 +111,34 @@ def _commit_of(repo: Repository, sha: str, label: str):
 def _apply_suffixes(repo: Repository, sha: str, base: str, suffix: str, spec: str) -> str:
     pos = 0
     label = base
-    sha = peel_to_commit(repo, sha, label)  # as in git, "v1~0" and "v1^0" name the tagged commit
     while pos < len(suffix):
+        here = base + suffix[:pos]   # the revision named so far, for the hints
+        peel_m = _PEEL_RE.match(suffix, pos)
+        if peel_m is not None or suffix.startswith("^{", pos):
+            # git's peel syntax: X^{} (tags followed), X^{commit}, X^{tree}, X^{blob}, X^{tag}, X^{object}
+            want = peel_m.group(1) if peel_m is not None else None
+            if want not in _PEEL_TYPES:
+                raise _unknown(spec, "minigit understands the peel suffixes ^{}, ^{commit}, ^{tree}, "
+                                     "^{blob}, ^{tag} and ^{object}")
+            pos = peel_m.end()
+            sha = _peel_to(repo, sha, want, spec)
+            label = here + peel_m.group(0)
+            continue
         m = _SUFFIX_RE.match(suffix, pos)
         if not m:
             raise _unknown(spec)
         op, num = m.group(1), m.group(2)
         pos = m.end()
+        # as in git, "v1~0" and "v1^0" name the tagged commit
+        sha = peel_to_commit(repo, sha, label)
         if op == "~":
             n = int(num) if num else 1
-            for _ in range(n):
+            for i in range(n):
                 c = _commit_of(repo, sha, label)
                 if not c.parents:
-                    raise _unknown(spec)
+                    at = here + ("~%d" % i if i else "")
+                    raise _unknown(spec, "%s (%s) is a root commit: the history has no commit before it"
+                                   % (at, sha[:7]))
                 sha = c.parents[0]
                 label = sha
         else:
@@ -127,10 +147,36 @@ def _apply_suffixes(repo: Repository, sha: str, base: str, suffix: str, spec: st
             if n == 0:
                 continue
             if n > len(c.parents):
-                raise _unknown(spec)
+                count = len(c.parents)
+                raise _unknown(spec, "%s (%s) has %s" % (
+                    here, sha[:7], "no parent" if not count else "%d parent%s" % (count, "s" * (count > 1))))
             sha = c.parents[n - 1]
             label = sha
     return sha
+
+
+def _peel_to(repo: Repository, sha: str, want: str, spec: str) -> str:
+    """``X^{want}``: ``""`` follows tags to the first non-tag object, ``object`` is ``X`` itself,
+    ``tag`` requires a tag object; ``commit``/``tree``/``blob`` follow tags (and a commit to its
+    tree for ``tree``) and require that type."""
+    if want == "object":
+        return sha
+    try:
+        if want == "tag":
+            obj_type = repo.objects.read(sha)[0]
+            peeled = sha
+        else:
+            obj_type, peeled = peel(repo.objects, sha)
+            if want == "tree" and obj_type == "commit":
+                obj_type, peeled = "tree", parse_commit(repo.objects.read_typed(peeled, "commit")).tree
+    except ObjectError as e:
+        raise RevisionError(e.message) from None
+    if want and obj_type != want:
+        # git peels a commit on to its tree before giving up, and names that type
+        got = "tree" if obj_type == "commit" and want != "commit" else obj_type
+        raise RevisionError("%s: expected %s type, but the object dereferences to %s type"
+                            % (spec, want, got))
+    return peeled
 
 
 def _resolve_path(repo: Repository, commitish: str, rev_label: str, path: str) -> str:

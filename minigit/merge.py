@@ -27,7 +27,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from .repo import Repository
 
 MERGE_FAILED = "Automatic merge failed; fix conflicts and then commit the result."
-MERGE_MADE = "Merge made by the 'three-way' strategy."
+MERGE_MADE = "Merge made by the 'ort' strategy."
 
 
 @dataclass
@@ -117,13 +117,17 @@ def _resolve_file_dir(store: ObjectStore, res: TreeMergeResult, ours: FlatTree, 
 
 
 def merge_trees(store: ObjectStore, base: FlatTree, ours: FlatTree, theirs: FlatTree,
-                ours_label: str, theirs_label: str, *, virtual: bool = False) -> TreeMergeResult:
+                ours_label: str, theirs_label: str, *, virtual: bool = False, call_depth: int = 1,
+                auto_merging: bool = False) -> TreeMergeResult:
     """Three-way tree merge (SPEC "Tree merge rules").
 
     ``virtual=True`` builds a virtual merge base for the recursive strategy:
     nothing is left unmerged. A content conflict keeps its conflict-marked
     text (so the outer merge conflicts there too, as git does), and a
-    modify/delete or binary conflict falls back to the base version.
+    modify/delete or binary conflict falls back to the base version; its
+    conflict markers are ``2 * call_depth`` characters longer, as in git.
+    ``auto_merging`` adds git's ``Auto-merging <path>`` line before every
+    content merge to ``messages`` (the porcelain commands print them).
     """
     res = TreeMergeResult()
 
@@ -160,10 +164,12 @@ def merge_trees(store: ObjectStore, base: FlatTree, ours: FlatTree, theirs: Flat
             # modify/delete: b exists here (b None would equal the missing side)
             if o is None:
                 conflict(p, b, None, t, (t[0], blob(t)),
-                         f"CONFLICT (modify/delete): {p} deleted in {ours_label} and modified in {theirs_label}.")
+                         f"CONFLICT (modify/delete): {p} deleted in {ours_label} and modified in {theirs_label}."
+                         f"  Version {theirs_label} of {p} left in tree.")
             else:
                 conflict(p, b, o, None, (o[0], blob(o)),
-                         f"CONFLICT (modify/delete): {p} deleted in {theirs_label} and modified in {ours_label}.")
+                         f"CONFLICT (modify/delete): {p} deleted in {theirs_label} and modified in {ours_label}."
+                         f"  Version {ours_label} of {p} left in tree.")
             continue
         else:
             mode = _merge_mode(p, b, o, t, res.messages)
@@ -176,10 +182,13 @@ def merge_trees(store: ObjectStore, base: FlatTree, ours: FlatTree, theirs: Flat
             else:
                 b_data = blob(b) if b is not None else None
                 o_data, t_data = blob(o), blob(t)
+                if auto_merging and not virtual:
+                    res.messages.append(f"Auto-merging {p}")
                 if is_binary(o_data) or is_binary(t_data) or (b_data is not None and is_binary(b_data)):
                     conflict(p, b, o, t, (o[0], o_data), f"CONFLICT (binary): Merge conflict in {p}")
                     continue
-                content, clean = merge3.merge_blobs(b_data or None, o_data, t_data, ours_label, theirs_label)
+                content, clean = merge3.merge_blobs(b_data or None, o_data, t_data, ours_label, theirs_label,
+                                                    marker_size=merge3.MARKER_SIZE + (2 * call_depth if virtual else 0))
                 if clean:
                     chosen = (mode, store.write("blob", content))
                 else:
@@ -217,7 +226,8 @@ def merged_base_flat(store: ObjectStore, bases: list[str], depth: int = 0) -> Fl
         else:
             sub_tree = merged_base_flat(store, sub, depth + 1)
         res = merge_trees(store, sub_tree, tree, commit_flat(store, nxt),
-                          "Temporary merge branch 1", "Temporary merge branch 2", virtual=True)
+                          "Temporary merge branch 1", "Temporary merge branch 2", virtual=True,
+                          call_depth=depth + 1)
         tree = res.merged
         tips.append(nxt)
     return tree
@@ -299,7 +309,7 @@ def _three_way(repo: Repository, index: Index, head: str, theirs: str, ours: Fla
     # first, so a conflict the two sides resolved differently conflicts again.
     # Unrelated histories (allowed explicitly) merge against an empty base, as in git.
     base_flat: FlatTree = merged_base_flat(store, bases) if bases else {}
-    res = merge_trees(store, base_flat, ours, commit_flat(store, theirs), "HEAD", label)
+    res = merge_trees(store, base_flat, ours, commit_flat(store, theirs), "HEAD", label, auto_merging=True)
 
     target: dict[str, Entry | None] = {}
     for p in set(ours) | set(res.merged) | set(res.stages):
@@ -385,7 +395,9 @@ def merge(repo: Repository, rev: str, *, message: str | None = None, label: str 
                                    [f"Updating {head[:7]}..{theirs[:7]}", "Fast-forward"])
         else:
             if staged:
-                raise MinigitError("you have staged changes; commit them first: " + ", ".join(staged))
+                raise MinigitError("you have staged changes; commit them first: " + ", ".join(staged),
+                                   hint="a merge commit is made from HEAD; commit or stash the staged "
+                                        "changes, or unstage them with 'minigit restore --staged'")
             outcome, merge_msg = _three_way(repo, index, head, theirs, head_flat, rev, label, message,
                                             allow_unrelated)
     # The index is written; now move refs / record merge state.
@@ -396,7 +408,43 @@ def merge(repo: Repository, rev: str, *, message: str | None = None, label: str 
         repo.write_state("MERGE_MSG", (merge_msg or "").encode("utf-8"))
     else:
         repo.refs.update_head(outcome.commit, expected=head)
+        if head is not None:
+            outcome.messages.extend(change_summary(repo, head_flat, commit_flat(store, outcome.commit)))
     return outcome
+
+
+def change_summary(repo: Repository, old: FlatTree, new: FlatTree) -> list[str]:
+    """What git prints after a merge or fast-forward: the diffstat, then the create/delete/mode lines."""
+    from . import diff   # M3, imported lazily (only for the report, after everything is written)
+
+    stats = diff.file_stats(repo, old, new)
+    if not stats:
+        return []
+    return diff.format_diffstat(stats).rstrip("\n").split("\n") + mode_summary(old, new)
+
+
+def mode_summary(old: FlatTree, new: FlatTree) -> list[str]:
+    """git's ``--summary`` lines: `` create mode 100644 p``, `` delete mode ...``, `` rename ...``,
+    `` mode change 100644 => 100755 p``, in path order."""
+    from . import diff
+
+    lines: list[str] = []
+    paths = diff.changed_paths(old, new)
+    renames = diff._exact_renames(old, new, paths)
+    sources = set(renames.values())
+    for p in sorted(paths):
+        o, n = old.get(p), new.get(p)
+        if p in renames:
+            lines.append(f" rename {diff._rename_name(renames[p], p)} (100%)")
+        elif p in sources:
+            continue
+        elif o is None:
+            lines.append(f" create mode {n[0]} {p}")
+        elif n is None:
+            lines.append(f" delete mode {o[0]} {p}")
+        elif o[0] != n[0]:
+            lines.append(f" mode change {o[0]} => {n[0]} {p}")
+    return lines
 
 
 def merge_abort(repo: Repository) -> None:

@@ -16,6 +16,7 @@ from minigit.errors import (
 from minigit.index import IndexEntry, locked_index, read_index
 from minigit.objects import EMPTY_TREE, hash_object
 from minigit.repo import Repository
+from minigit.util import format_date
 
 ENV_KEYS = ("MINIGIT_GLOBAL_CONFIG", "MINIGIT_AUTHOR_NAME", "MINIGIT_AUTHOR_EMAIL", "MINIGIT_AUTHOR_DATE")
 
@@ -187,7 +188,21 @@ class InitAddRmTests(RepoCase):
         self.write("x.log", "log\n")
         with self.assertRaises(MinigitError) as cm:
             self.add("x.log")
-        self.assertEqual(cm.exception.message, "path 'x.log' is ignored by .minigitignore (use -f)")
+        # git's report, printed without a prefix; the hint says how to add it anyway
+        self.assertEqual(cm.exception.message,
+                         "The following paths are ignored by one of your .minigitignore files:\nx.log")
+        self.assertEqual(cm.exception.hint, "Use -f if you really want to add them.")
+        self.assertEqual(cm.exception.prefix, "")
+        self.assertEqual(cm.exception.exit_code, 1)
+        # every ignored path is listed (sorted), and nothing is staged
+        self.write("w.log", "w\n")
+        self.write("z0.txt", "z\n")
+        with self.assertRaises(MinigitError) as cm:
+            self.add("x.log", "w.log", "z0.txt")
+        self.assertTrue(cm.exception.message.endswith(":\nw.log\nx.log"), cm.exception.message)
+        self.assertEqual(read_index(self.repo).paths(), [])
+        os.unlink(os.path.join(self.wt, "w.log"))
+        os.unlink(os.path.join(self.wt, "z0.txt"))
         self.assertEqual(self.add("x.log", force=True), ["x.log"])
         # directory add skips ignored files but keeps tracked ones
         self.write("y.log", "y\n")
@@ -203,7 +218,8 @@ class InitAddRmTests(RepoCase):
         self.write("x.log", "l\n")
         with self.assertRaises(MinigitError) as cm:
             self.add("private")
-        self.assertIn("use -f", cm.exception.message)
+        self.assertIn("ignored", cm.exception.message)
+        self.assertIn("-f", cm.exception.hint)
         self.assertEqual(self.add("private", force=True), ["private/a.txt", "private/deep/b.txt"])
         self.assertEqual(self.add(".", force=True), [".minigitignore", "x.log"])
         self.assertEqual(read_index(self.repo).paths(),
@@ -258,7 +274,9 @@ class InitAddRmTests(RepoCase):
         self.write("a.txt", "modified\n")
         with self.assertRaises(MinigitError) as cm:
             ops.rm(self.repo, ["a.txt"], self.wt)
-        self.assertEqual(cm.exception.message, "'a.txt' has staged or local changes (use -f)")
+        self.assertEqual(cm.exception.message,
+                         "the following file has local modifications:\n    a.txt\n"
+                         "(use --cached to keep the file, or -f to force removal)")
         # --cached is fine while the index still equals HEAD
         ops.rm(self.repo, ["a.txt"], self.wt, cached=True)
         self.assertTrue(self.exists("a.txt"))
@@ -266,8 +284,19 @@ class InitAddRmTests(RepoCase):
         # a staged new file is refused without -f
         self.write("n.txt", "n\n")
         self.add("n.txt")
-        with self.assertRaises(MinigitError):
+        with self.assertRaises(MinigitError) as cm:
             ops.rm(self.repo, ["n.txt"], self.wt)
+        self.assertEqual(cm.exception.message,
+                         "the following file has changes staged in the index:\n    n.txt\n"
+                         "(use --cached to keep the file, or -f to force removal)")
+        # staged content that matches neither the file nor HEAD: --cached does not help either
+        self.write("n.txt", "n2\n")
+        for cached in (False, True):
+            with self.assertRaises(MinigitError) as cm:
+                ops.rm(self.repo, ["n.txt"], self.wt, cached=cached)
+            self.assertEqual(cm.exception.message,
+                             "the following file has staged content different from both the\n"
+                             "file and the HEAD:\n    n.txt\n(use -f to force removal)")
         ops.rm(self.repo, ["n.txt"], self.wt, force=True)
         self.assertFalse(self.exists("n.txt"))
 
@@ -280,11 +309,38 @@ class StatusTests(RepoCase):
         self.assertTrue(st.unborn)
         self.assertTrue(st.is_clean())
         text = status.format_status_long(st)
-        self.assertIn("On branch main\n\nNo commits yet\n", text)
-        self.assertIn("nothing to commit, working tree clean", text)
+        self.assertEqual(text, 'On branch main\n\nNo commits yet\n\n'
+                               'nothing to commit (create/copy files and use "minigit add" to track)\n')
+        self.assertEqual(status.format_status_long(st, hints=False),
+                         "On branch main\n\nNo commits yet\n\nnothing to commit\n")
+        self.write("u.txt", "u\n")
+        self.assertEqual(status.format_status_long(status.compute_status(self.repo)),
+                         "On branch main\n\nNo commits yet\n\n"
+                         "Untracked files:\n"
+                         '  (use "minigit add <file>..." to include in what will be committed)\n'
+                         "\tu.txt\n\n"
+                         'nothing added to commit but untracked files present (use "minigit add" to track)\n')
+        self.add("u.txt")
+        self.assertEqual(status.format_status_long(status.compute_status(self.repo)),
+                         "On branch main\n\nNo commits yet\n\n"
+                         "Changes to be committed:\n"
+                         '  (use "minigit rm --cached <file>..." to unstage)\n'
+                         "\tnew file:   u.txt\n\n")
+        ops.rm(self.repo, ["u.txt"], self.wt, force=True)
         self.commit_file("a.txt", "a\n")
         text = status.format_status_long(status.compute_status(self.repo))
         self.assertEqual(text, "On branch main\nnothing to commit, working tree clean\n")
+        self.write("a.txt", "b\n")
+        self.assertEqual(status.format_status_long(status.compute_status(self.repo)),
+                         "On branch main\n"
+                         "Changes not staged for commit:\n"
+                         '  (use "minigit add <file>..." to update what will be committed)\n'
+                         '  (use "minigit restore <file>..." to discard changes in working directory)\n'
+                         "\tmodified:   a.txt\n\n"
+                         'no changes added to commit (use "minigit add" and/or "minigit commit -a")\n')
+        self.assertEqual(status.format_status_long(status.compute_status(self.repo), hints=False),
+                         "On branch main\nChanges not staged for commit:\n\tmodified:   a.txt\n\n"
+                         "no changes added to commit\n")
 
     def test_every_code(self):
         self.commit_file("mod.txt", "1\n")
@@ -319,14 +375,19 @@ class StatusTests(RepoCase):
                          "D  staged_del_kept.txt\n"
                          "?? untracked/u.txt\n"
                          " D wdel.txt\n")
-        text = status.format_status_long(status.compute_status(self.repo))
+        text = status.format_status_long(status.compute_status(self.repo), hints=False)
         self.assertIn("Changes to be committed:\n\tnew file:   added.txt\n", text)
         self.assertIn("\tmodified:   mod.txt\n", text)
         self.assertIn("\tdeleted:    del.txt\n", text)
         self.assertIn("Changes not staged for commit:\n", text)
         self.assertIn("\tdeleted:    wdel.txt\n", text)
-        self.assertIn("Untracked files:\n\tstaged_del_kept.txt\n\tuntracked/u.txt\n", text)
-        self.assertNotIn("nothing to commit", text)
+        self.assertIn("Untracked files:\n\tstaged_del_kept.txt\n\tuntracked/u.txt\n\n", text)
+        self.assertNotIn("nothing", text)          # something is staged: no closing summary line
+        self.assertTrue(text.endswith("\tuntracked/u.txt\n\n"))
+        text = status.format_status_long(status.compute_status(self.repo))
+        self.assertIn('Changes to be committed:\n  (use "minigit restore --staged <file>..." to unstage)\n', text)
+        # a deleted file in the unstaged section switches the hint to add/rm, as in git
+        self.assertIn('Changes not staged for commit:\n  (use "minigit add/rm <file>..." to update', text)
 
     def test_unmerged_codes(self):
         self.commit_file("f.txt", "1\n")
@@ -352,14 +413,19 @@ class StatusTests(RepoCase):
         for path, (_, xy, _) in cases.items():
             self.assertEqual(codes[path], xy, path)
         text = status.format_status_long(st)
-        self.assertIn("You have unmerged paths.", text)
+        self.assertIn('You have unmerged paths.\n  (fix conflicts and run "minigit commit")\n'
+                      '  (use "minigit merge --abort" to abort the merge)\n\nUnmerged paths:\n'
+                      '  (use "minigit add/rm <file>..." as appropriate to mark resolution)\n', text)
         for path, (_, _, label) in cases.items():
             self.assertIn(f"\t{label:<17}{path}\n", text)
+        self.assertTrue(text.endswith('\nno changes added to commit (use "minigit add" and/or "minigit commit -a")\n'))
         with locked_index(self.repo) as index:
             for path in cases:
                 index.remove(path)
         text = status.format_status_long(status.compute_status(self.repo))
-        self.assertIn("All conflicts fixed but you are still merging.", text)
+        # a resolved merge is committable even with nothing staged: no summary line, as in git
+        self.assertEqual(text, "On branch main\nAll conflicts fixed but you are still merging.\n"
+                               '  (use "minigit commit" to conclude merge)\n\n')
 
     def test_ignored_and_nested_ignore(self):
         self.write(".minigitignore", "*.log\nbuild/\n")
@@ -579,7 +645,8 @@ class DiffTests(RepoCase):
                          " a.txt => c.txt | 0\n 1 file changed, 0 insertions(+), 0 deletions(-)\n")
         # the commit summary line comes from the same counting
         _sha, summary = ops.commit(self.repo, ["three"], stat=True)
-        self.assertTrue(summary.endswith("\n 1 file changed, 0 insertions(+), 0 deletions(-)"), summary)
+        self.assertTrue(summary.endswith("\n 1 file changed, 0 insertions(+), 0 deletions(-)\n"
+                                         " rename a.txt => c.txt (100%)"), summary)
 
 
 # =========================================================================== commit
@@ -622,7 +689,8 @@ class CommitTests(RepoCase):
         self.write("b.txt", "b\n")
         self.add("a.txt", "b.txt")
         sha, summary = ops.commit(self.repo, ["root"], stat=True)
-        self.assertEqual(summary, f"[main (root-commit) {sha[:7]}] root\n 2 files changed, 4 insertions(+)")
+        self.assertEqual(summary, f"[main (root-commit) {sha[:7]}] root\n 2 files changed, 4 insertions(+)\n"
+                                  " create mode 100644 a.txt\n create mode 100644 b.txt")
         self.write("b.txt", "b\nmore\n")
         self.add("b.txt")
         self.assertEqual(commit("one more line"), " 1 file changed, 1 insertion(+)")
@@ -635,13 +703,15 @@ class CommitTests(RepoCase):
         os.unlink(os.path.join(self.wt, "b.txt"))
         self.write("c.txt", "b\nmore\n")
         self.add("b.txt", "c.txt")
-        self.assertEqual(commit("rename"), " 1 file changed, 0 insertions(+), 0 deletions(-)")
+        self.assertEqual(commit("rename"), " 1 file changed, 0 insertions(+), 0 deletions(-)\n"
+                                           " rename b.txt => c.txt (100%)")
         os.unlink(os.path.join(self.wt, "a.txt"))
         self.add("a.txt")
-        self.assertEqual(commit("delete"), " 1 file changed, 5 deletions(-)")
+        self.assertEqual(commit("delete"), " 1 file changed, 5 deletions(-)\n delete mode 100644 a.txt")
         self.write("img.bin", b"\0\1\2")
         self.add("img.bin")
-        self.assertEqual(commit("binary"), " 1 file changed, 0 insertions(+), 0 deletions(-)")
+        self.assertEqual(commit("binary"), " 1 file changed, 0 insertions(+), 0 deletions(-)\n"
+                                           " create mode 100644 img.bin")
         # concluding a merge prints no stat line, as in git
         self.repo.refs.write_special("MERGE_HEAD", self.repo.read_commit(self.repo.head_commit()).parents[0])
         self.write("m.txt", "m\n")
@@ -676,11 +746,39 @@ class CommitTests(RepoCase):
         self.assertEqual(cm.exception.message, "commit message required: use -m")
         with self.assertRaises(MinigitError) as cm:
             ops.commit(self.repo, ["   \n"])
-        self.assertEqual(cm.exception.message, "aborting commit due to empty commit message")
+        self.assertEqual(cm.exception.message, "Aborting commit due to empty commit message.")
+        self.assertEqual(cm.exception.prefix, "")   # printed bare, as git does
         self.repo.write_state("MERGE_MSG", b"Merge branch 'x'\n# Conflicts:\n#\ta.txt\n")
         sha, summary = ops.commit(self.repo, [])
         self.assertEqual(self.repo.read_commit(sha).message, "Merge branch 'x'\n")
         self.assertIsNone(self.repo.read_state("MERGE_MSG"))
+
+    def test_message_cleanup_matches_git(self):
+        # git's default cleanup for -m: trailing whitespace per line, one blank line between
+        # paragraphs, no leading/trailing blank lines, '#' lines kept; ids then match git's
+        self.assertEqual(ops.cleanup_message("\n\n  lead  \t\n\n\n# keep\nx   \n\n\n\n second \n"),
+                         "  lead\n\n# keep\nx\n\n second\n")
+        self.assertEqual(ops.cleanup_message("a\r\nb  \r\n"), "a\nb\n")
+        self.assertEqual(ops.cleanup_message(" \n\t\n"), "")
+        self.assertEqual(ops.cleanup_message("# c\nbody\n", strip_comments=True), "body\n")
+        self.assertEqual(ops.message_subject("  multi\nline  \n\nbody"), "  multi line")
+        self.write("a.txt", "a\n")
+        self.add("a.txt")
+        sha, summary = ops.commit(self.repo, ["\n first  \nline\n\n\n", "body  "], stat=True)
+        self.assertEqual(self.repo.read_commit(sha).message, " first\nline\n\nbody\n")
+        self.assertTrue(summary.startswith(f"[main (root-commit) {sha[:7]}]  first line\n"), summary)
+
+    def test_amend_to_an_empty_commit_is_refused_like_git(self):
+        self.commit_file("a.txt", "a\n", "one")
+        c2 = self.commit_file("b.txt", "b\n", "two")
+        ops.rm(self.repo, ["b.txt"], self.wt)            # the amended commit would change nothing
+        with self.assertRaises(MinigitError) as cm:
+            ops.commit(self.repo, ["two"], amend=True)
+        self.assertTrue(cm.exception.message.startswith("You asked to amend the most recent commit"))
+        self.assertEqual(cm.exception.prefix, "")
+        self.assertEqual(self.repo.head_commit(), c2)
+        sha, _ = ops.commit(self.repo, ["two"], amend=True, allow_empty=True)
+        self.assertEqual(self.repo.read_commit(sha).tree, self.repo.read_commit(self.repo.read_commit(sha).parents[0]).tree)
 
     def test_missing_identity(self):
         os.environ.pop("MINIGIT_AUTHOR_NAME")
@@ -689,7 +787,7 @@ class CommitTests(RepoCase):
         self.add("a.txt")
         with self.assertRaises(MinigitError) as cm:
             ops.commit(self.repo, ["x"])
-        self.assertIn("please set your identity", cm.exception.message)
+        self.assertIn("author identity unknown", cm.exception.message)
         self.assertIsNone(self.repo.head_commit())
         ops.config_cmd(self.repo, "user.name", "Cfg User", global_=True)
         ops.config_cmd(self.repo, "user.email", "cfg@example.com", global_=True)
@@ -748,7 +846,9 @@ class CommitTests(RepoCase):
         self.add("c.txt")
         sha, summary = self.amend("two, fixed", "body")
         self.assertNotEqual(sha, c2)
-        self.assertEqual(summary, f"[main {sha[:7]}] two, fixed\n 2 files changed, 2 insertions(+)")
+        date = format_date(old.author.timestamp, old.author.tz_offset)
+        self.assertEqual(summary, f"[main {sha[:7]}] two, fixed\n Date: {date}\n 2 files changed, 2 insertions(+)\n"
+                                  " create mode 100644 b.txt\n create mode 100644 c.txt")
         new = self.repo.read_commit(sha)
         self.assertEqual(new.parents, (c1,))
         self.assertEqual(new.message, "two, fixed\n\nbody\n")
@@ -765,7 +865,9 @@ class CommitTests(RepoCase):
         self.assertNotEqual(sha, c1)
         self.assertEqual(self.repo.read_commit(sha).message, "one\n")
         self.assertEqual(self.repo.read_commit(sha).parents, ())
-        self.assertEqual(summary, f"[main {sha[:7]}] one\n 1 file changed, 1 insertion(+)")
+        a = self.repo.read_commit(c1).author
+        self.assertEqual(summary, f"[main {sha[:7]}] one\n Date: {format_date(a.timestamp, a.tz_offset)}\n"
+                                  " 1 file changed, 1 insertion(+)\n create mode 100644 a.txt")
         self.assertEqual(self.repo.refs.read_special("ORIG_HEAD"), c1)
 
     def test_amend_with_all_restages_tracked_files(self):
@@ -786,7 +888,8 @@ class CommitTests(RepoCase):
         c2 = self.commit_file("a.txt", "b\n", "two")
         ops.switch(self.repo, c2, detach=True)
         sha, summary = self.amend("two again")
-        self.assertEqual(summary, f"[detached HEAD {sha[:7]}] two again\n 1 file changed, 1 insertion(+), 1 deletion(-)")
+        self.assertTrue(summary.startswith(f"[detached HEAD {sha[:7]}] two again\n Date: "), summary)
+        self.assertTrue(summary.endswith("\n 1 file changed, 1 insertion(+), 1 deletion(-)"), summary)
         self.assertEqual(self.repo.refs.resolve("HEAD"), sha)
         self.assertEqual(self.repo.refs.resolve("refs/heads/main"), c2)
         self.assertEqual(self.repo.read_commit(sha).parents, (c1,))
@@ -794,7 +897,8 @@ class CommitTests(RepoCase):
     def test_amend_refusals(self):
         with self.assertRaises(MinigitError) as cm:
             ops.commit(self.repo, ["x"], amend=True)
-        self.assertEqual(cm.exception.message, "you have nothing to amend")
+        self.assertEqual(cm.exception.message, "You have nothing to amend.")
+        self.assertEqual(cm.exception.exit_code, 128)
         c1 = self.commit_file("a.txt", "a\n", "one")
         c2 = self.commit_file("a.txt", "b\n", "two")
         for kind, state in (("merge", "MERGE_HEAD"), ("cherry-pick", "CHERRY_PICK_HEAD"), ("revert", "REVERT_HEAD")):
@@ -1005,19 +1109,22 @@ class HistoryTests(RepoCase):
         self.assertEqual(log(["a.txt", "d/y.txt"]), [c4, c3, c1])
         self.assertEqual(log([""]), [c4, c3, c2, c1])     # the root: every commit that changes anything
         self.assertEqual(log(["a.txt/x"]), [])            # a file is not a directory
-        # a merge counts when its tree differs from its *first* parent's tree at the path
+        # history simplification: a merge with a parent that has the same content at the paths
+        # (TREESAME) is hidden and only that parent is followed, so the side commit shows alone
         ops.branch_create(self.repo, "side", c1)
         ops.switch(self.repo, "side")
         s1 = self.commit_file("s.txt", "s\n", "side")
         ops.switch(self.repo, "main")
         m = self.merge("side", "merge")
-        self.assertEqual(log(["s.txt"]), [m, s1])
+        self.assertEqual(log(["s.txt"]), [s1])
+        self.assertEqual(log([""]), [m, s1, c4, c3, c2, c1])   # differs from both parents: shown
         self.assertEqual(log(["a.txt"]), [c3, c1])
         self.assertEqual(shas(history.log_entries(self.repo, ["side"], None, paths=["s.txt"])), [s1])
         self.assertEqual(shas(history.log_entries(self.repo, None, None, all_refs=True, paths=["a.txt"])), [c3, c1])
 
     def _graph(self, oneline: bool, **kw) -> str:
-        entries = history.log_entries(self.repo, None, None, **{k: v for k, v in kw.items() if k == "paths"})
+        entries = history.log_entries(self.repo, None, None, topo=True,
+                                      **{k: v for k, v in kw.items() if k == "paths"})
         return history.format_log(self.repo, entries, oneline, graph=True, **kw)
 
     def test_graph_linear(self):
@@ -1067,21 +1174,36 @@ class HistoryTests(RepoCase):
         ops.switch(self.repo, "main")
         ma = self.merge("a", "MA", no_ff=True)
         mb = self.merge("b", "MB", no_ff=True)
+        # --graph implies --topo-order: MB's second parent b1 comes before MA (git's output)
         self.assertEqual(self._graph(True), (
             f"*   {mb[:7]} (HEAD -> main) MB\n"
             "|\\  \n"
-            f"* \\   {ma[:7]} MA\n"
+            f"| * {b1[:7]} (b) b1\n"
+            f"* |   {ma[:7]} MA\n"
             "|\\ \\  \n"
-            f"| | * {b1[:7]} (b) b1\n"
             "| |/  \n"
             "|/|   \n"
             f"| * {a1[:7]} (a) a1\n"
             "|/  \n"
             f"* {c1[:7]} c1\n"))
-        # with a path filter the graph joins the shown commits
-        self.assertEqual(self._graph(True, paths=["b.txt"]), (
-            f"* {mb[:7]} (HEAD -> main) MB\n"
-            f"* {b1[:7]} (b) b1\n"))
+        # with a path filter: MB is TREESAME to b1 at b.txt, so it is hidden and b1 shows alone
+        self.assertEqual(self._graph(True, paths=["b.txt"]), f"* {b1[:7]} (b) b1\n")
+        # the graph joins the shown commits: MB and MA both change a.txt + b.txt from c1
+        self.assertEqual(self._graph(True, paths=["a.txt", "b.txt"]), (
+            f"*   {mb[:7]} (HEAD -> main) MB\n"
+            "|\\  \n"
+            f"| * {b1[:7]} (b) b1\n"
+            f"* {a1[:7]} (a) a1\n"))
+
+    def test_message_layout_like_git(self):
+        # git indents the blank lines of a message too, drops trailing whitespace, and --oneline
+        # shows the whole first paragraph joined with spaces
+        c = self.commit_file("a.txt", "1\n", "first line\nsecond line\n\nbody  \n\nend")
+        entries = history.log_entries(self.repo, None, None)
+        text = history.format_log(self.repo, entries, False)
+        self.assertTrue(text.endswith("\n    first line\n    second line\n    \n    body\n    \n    end\n"), text)
+        self.assertEqual(history.format_log(self.repo, entries, True),
+                         f"{c[:7]} (HEAD -> main) first line second line\n")
 
     def test_log_stat(self):
         c1 = self.commit_file("a.txt", "1\n", "one")
@@ -1260,7 +1382,8 @@ class BranchTests(RepoCase):
         ops.switch(self.repo, "main")
         with self.assertRaises(MinigitError) as cm:
             ops.branch_delete(self.repo, "feature")
-        self.assertEqual(cm.exception.message, "the branch 'feature' is not fully merged (use -D)")
+        self.assertEqual(cm.exception.message, "the branch 'feature' is not fully merged")
+        self.assertIn("minigit branch -D feature", cm.exception.hint)
         # merged into the upstream tracking ref counts as merged
         self.repo.refs.update("refs/remotes/origin/feature", c2)
         ops.set_upstream(self.repo, "feature", "origin", "refs/heads/feature")
@@ -1368,7 +1491,7 @@ class SwitchTests(RepoCase):
         self.assertEqual(cm.exception.paths, ["t.txt"])
         self.assertEqual(cm.exception.message,
                          "The following untracked working tree files would be overwritten by checkout:\n"
-                         "\tt.txt\nPlease move or remove them before you switch branches.")
+                         "\tt.txt\nPlease move or remove them before you switch branches.\nAborting")
         self.assertEqual(self.read("t.txt"), b"mine\n")
         self.assertEqual(self.repo.refs.current_branch(), "main")
 
@@ -1486,7 +1609,7 @@ class ResetRestoreTests(RepoCase):
         self.add("a.txt")
         self.repo.write_state("MERGE_HEAD", (self.c1 + "\n").encode())
         self.repo.write_state("MERGE_MSG", b"m\n")
-        self.assertEqual(ops.reset(self.repo, "HEAD~2"), "")
+        self.assertEqual(ops.reset(self.repo, "HEAD~2"), "Unstaged changes after reset:\nM\ta.txt")
         self.assertEqual(self.repo.head_commit(), self.c1)
         self.assertIsNone(self.repo.merge_head())
         self.assertIsNone(self.repo.read_state("MERGE_MSG"))
@@ -1542,7 +1665,7 @@ class ResetRestoreTests(RepoCase):
         self.assertEqual(self.read("b.txt"), b"b\n")
         with self.assertRaises(MinigitError) as cm:
             ops.restore(self.repo, ["nope.txt"], self.wt)
-        self.assertEqual(cm.exception.message, "pathspec 'nope.txt' did not match")
+        self.assertEqual(cm.exception.message, "pathspec 'nope.txt' did not match any file(s) known to minigit")
 
     def test_restore_staged(self):
         self.write("a.txt", "dirty\n")
@@ -1797,7 +1920,7 @@ class CliSemanticsTests(unittest.TestCase):
                            (["rev-parse", "--abbrev-ref", "HEAD"], "minigit rev-parse")):
             with self.subTest(args=args):
                 res = self.mg(*args, check=False)
-                self.assertEqual(res.returncode, 2)
+                self.assertEqual(res.returncode, 129)
                 self.assertIn(f"usage: {prog}", res.err)
                 self.assertIn("unrecognized arguments", res.err)
 
@@ -1806,7 +1929,7 @@ class CliSemanticsTests(unittest.TestCase):
         self.mg("branch", "--", "foo")
         self.assertIn("foo", self.mg("branch").out)
         res = self.mg("branch", "HEAD", check=False)
-        self.assertEqual(res.returncode, 1)
+        self.assertEqual(res.returncode, 128)
         self.assertIn("'HEAD' is not a valid branch name", res.err)
         self.assertFalse(os.path.exists(os.path.join(self.wt, ".minigit", "refs", "heads", "HEAD")))
 
@@ -1820,7 +1943,7 @@ class CliSemanticsTests(unittest.TestCase):
         self.commit("a.txt", "1\n", "one")
         self.commit("a.txt", "2\n", "two")
         res = self.mg("switch", "HEAD~1", check=False)
-        self.assertEqual(res.returncode, 1)
+        self.assertEqual(res.returncode, 128)
         self.assertIn("a branch is expected, got commit 'HEAD~1'", res.err)
         self.mg("switch", "--detach", "HEAD~1")
         self.assertTrue(self.mg("branch").out.startswith("* (HEAD detached at "))

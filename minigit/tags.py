@@ -34,7 +34,8 @@ class TagInfo:
 def tag_ref(name: str) -> str:
     """``refs/tags/<name>`` for a valid tag name (git's ``check-ref-format`` rules)."""
     MinigitError = _m("errors").MinigitError
-    invalid = MinigitError(f"'{name}' is not a valid tag name")
+    FatalError = _m("errors").FatalError
+    invalid = FatalError(f"'{name}' is not a valid tag name", hint=_m("ops")._REF_NAME_RULES)
     if (not name or name.startswith("refs/") or name.startswith("-") or name in ("HEAD", "@")
             or name.endswith(".") or name.endswith("/")):
         raise invalid
@@ -43,7 +44,7 @@ def tag_ref(name: str) -> str:
         _m("refs").check_ref_name(ref)
     except MinigitError as e:
         if ": too long" in e.message:
-            raise MinigitError(f"{invalid.message}: {e.message.rsplit(': ', 1)[1]}") from None
+            raise FatalError(f"{invalid.message}: {e.message.rsplit(': ', 1)[1]}") from None
         raise invalid from None
     return ref
 
@@ -123,14 +124,15 @@ def tag_create(repo, name: str, rev: str | None = None, *, messages=None, annota
     annotate = annotate or bool(messages)
     current = repo.refs.resolve(ref)
     if current is not None and not force:
-        raise errors.MinigitError(f"tag '{name}' already exists")
+        raise errors.FatalError(f"tag '{name}' already exists")
     target = revparse.resolve_object(repo, rev if rev is not None else "HEAD")
     label = rev if rev is not None else "HEAD"
     # minigit tags name commits (possibly through another tag); a blob or tree is refused
     revparse.peel_to_commit(repo, target, label)
     if annotate:
-        message = "\n\n".join(messages).rstrip() + "\n"
-        if message == "\n":
+        # the tag command's default cleanup: whitespace, and '#' lines are dropped even with -m
+        message = _m("ops").cleanup_message("\n\n".join(messages), strip_comments=True)
+        if not message:
             raise errors.MinigitError("no tag message", hint="give one with -m MSG")
         target_type = repo.objects.read(target)[0]
         tagger = repo.identity()  # identity errors surface before anything is written
@@ -142,7 +144,7 @@ def tag_create(repo, name: str, rev: str | None = None, *, messages=None, annota
         repo.refs.update(ref, value, expected=refs.ANY if force else None)
     except errors.RefUpdateError as e:
         if e.actual is not None:
-            raise errors.MinigitError(f"tag '{name}' already exists") from e
+            raise errors.FatalError(f"tag '{name}' already exists") from e
         raise
     if current is not None and current != value:
         return f"Updated tag '{name}' (was {_abbrev(current)})"
@@ -155,10 +157,10 @@ def tag_delete(repo, name: str) -> str:
     try:
         _m("refs").check_ref_name(ref)
     except errors.MinigitError:
-        raise errors.MinigitError(f"tag '{name}' not found") from None
+        raise errors.MinigitError(f"tag '{name}' not found.") from None
     sha = repo.refs.resolve(ref)
     if sha is None:
-        raise errors.MinigitError(f"tag '{name}' not found")
+        raise errors.MinigitError(f"tag '{name}' not found.")
     repo.refs.update(ref, None, expected=sha)
     return f"Deleted tag '{name}' (was {_abbrev(sha)})"
 

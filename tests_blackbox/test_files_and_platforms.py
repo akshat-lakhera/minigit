@@ -324,7 +324,7 @@ class LargeFiles(Base):
         lines[50000] = b"CHANGED\n"
         write(self.p("big.txt"), b"".join(lines))
         out = self.mg("diff", timeout=60).out
-        self.assertIn(b"@@ -49998,7 +49998,7 @@\n", out)
+        self.assertIn(b"@@ -49998,7 +49998,7 @@ line 49996\n", out)   # git's function-name context
         self.assertIn(b"-line 50000\n+CHANGED\n", out)
 
     def test_diff_of_repetitive_text_finishes_quickly(self):
@@ -514,7 +514,7 @@ class Names(Base):
         self.assertIn("ünï 名".encode(), r.out)
         self.assertIn("ünï 名".encode(), self.mg("log", "--oneline", env=env).out)
         r = self.mg("rm", "nope 名.txt", env=env, check=False)
-        self.assertEqual(r.code, 1, str(r))
+        self.assertEqual(r.code, 128, str(r))   # git: fatal
         self.assertIn("nope 名.txt".encode("utf-8"), r.err)
         self.assertNotIn(b"internal error", r.err)
 
@@ -607,7 +607,7 @@ class DeletedRenamed(Base):
         self.mg("commit", "-am", "del")
         self.assertEqual(self.ls_files(), ["a.txt"])
         r = self.mg("show", "HEAD:gone/ü.txt", check=False)
-        self.assertEqual(r.code, 1, str(r))
+        self.assertEqual(r.code, 128, str(r))   # git: fatal
         self.assertIn("deleted file mode 100644".encode(), self.mg("show", "HEAD").out)
 
     def test_file_replaced_by_directory_and_back(self):
@@ -830,7 +830,7 @@ class WindowsPaths(Base):
                 tree = write_tree(self.gitdir, [("100644", "base.txt", blob_sha(b"base\n")), (mode, top, sha)])
                 c = write_commit(self.gitdir, tree, [base])
                 r = self.mg("checkout", c, check=False)
-                self.assertEqual(r.code, 1, str(r))
+                self.assertEqual(r.code, 128, str(r))
                 self.assertNotIn("internal error", r.text)
                 self.assertEqual(self.head_raw(), "ref: refs/heads/main")
                 self.assertEqual(sorted(os.listdir(self.repo)), [".minigit", "base.txt"])
@@ -845,7 +845,7 @@ class WindowsPaths(Base):
         for mode in ("--hard", "--mixed"):
             with self.subTest(mode=mode):
                 r = self.mg("reset", mode, bad, check=False)
-                self.assertEqual(r.code, 1, str(r))
+                self.assertEqual(r.code, 128, str(r))
                 self.assertEqual(read(os.path.join(self.gitdir, "refs", "heads", "main")).decode().strip(), base,
                                  f"reset {mode} failed but moved the branch to the invalid commit")
                 st = self.mg("status", "--porcelain", check=False)
@@ -1030,7 +1030,7 @@ class ThroughServer(Base):
         tree = write_tree(self.gitdir, [("100644", "ok.txt", blob_sha(b"ok\n")), ("100644", "a:b", blob)])
         c = write_commit(self.gitdir, tree, [self.head_sha()])
         r = self.mg("push", "origin", f"{c}:evil", check=False)
-        self.assertEqual(r.code, 1, str(r))
+        self.assertEqual(r.code, 128, str(r))
         self.assertNotIn("internal error", r.text)
         self.assertEqual(self.info_refs(url, token)["refs"], before)
 

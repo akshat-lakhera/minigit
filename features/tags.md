@@ -30,19 +30,19 @@ minigit tag -d NAME...                      delete tags
 | `tag -f NAME [REV]` on an existing tag | `Updated tag 'v1' (was abc1234)` (nothing when the value is unchanged) | 0 |
 | `tag -d NAME` | `Deleted tag 'v1' (was abc1234)` per tag; `abc1234` is the ref's old value (the tag object for an annotated tag) | 0 |
 
-Errors (exit 1, `error: ...` on stderr):
+Errors (on stderr; as in git, `fatal: ...` exits 128 and `error: ...` exits 1):
 
 | Situation | Message |
 |---|---|
-| the tag exists and `-f` was not given | `tag 'v1' already exists` |
-| `-d` of a missing (or malformed) name | `tag 'v1' not found` |
-| `-a` without `-m`, or an empty message | `no tag message` (hint: `give one with -m MSG`) |
-| an invalid name | `'<name>' is not a valid tag name` (the `refs/tags/<name>` ref must pass `check_ref_name`; like git a leading `-`, `HEAD`, `@`, a `refs/` prefix and a trailing `.` or `/` are refused too) |
-| REV unknown, or not a commit (a blob, a tree) | `unknown revision 'x'`, `'x' is not a commit` |
-| unborn HEAD | `unknown revision 'HEAD'` |
-| no identity for an annotated tag | the usual `please set your identity: ...` |
+| the tag exists and `-f` was not given | `fatal: tag 'v1' already exists` |
+| `-d` of a missing (or malformed) name | `error: tag 'v1' not found.` |
+| `-a` without `-m`, or an empty message | `error: no tag message` (hint: `give one with -m MSG`) |
+| an invalid name | `fatal: '<name>' is not a valid tag name`, with a hint listing the naming rules (the `refs/tags/<name>` ref must pass `check_ref_name`; like git a leading `-`, `HEAD`, `@`, a `refs/` prefix and a trailing `.` or `/` are refused too) |
+| REV unknown, or not a commit (a blob, a tree) | `fatal: unknown revision 'x'`, `'x' is not a commit` |
+| unborn HEAD | `fatal: unknown revision 'HEAD'` (hint: the branch has no commits yet) |
+| no identity for an annotated tag | the usual `fatal: author identity unknown ...` |
 
-Usage errors (exit 2): more than two positionals, `-d` without a name, `-n` together with a name, `-a`/`-m`/`-f`
+Usage errors (exit 129, as git): more than two positionals, `-d` without a name, `-n` together with a name, `-a`/`-m`/`-f`
 together with `-l` (or with no name). A name that starts with `-` is given after `--` (`tag -- -v1`), which then
 fails with the "not a valid tag name" error above.
 

@@ -345,14 +345,16 @@ class ResetTests(MinigitCase):
         self.mg("add", "b.txt")
         before = self.status()
 
-        r = self.mg("reset", "--hard", "nosuchrev", code=1)
-        self.assertIn("unknown revision", r.err)
+        r = self.mg("reset", "--hard", "nosuchrev", code=128)   # git: fatal
+        self.assertIn("fatal: unknown revision", r.err)
         self.assertEqual(self.head(), c2)
         self.assertEqual(self.read("a.txt"), b"local edit\n")
         self.assertEqual(self.status(), before)
 
-        self.mg("reset", "--soft", "HEAD", "--", "a.txt", code=2)
-        self.mg("reset", "--hard", "HEAD", "--", "a.txt", code=2)
+        r = self.mg("reset", "--soft", "HEAD", "--", "a.txt", code=128)
+        self.assertTrue(r.err.startswith("fatal: Cannot do soft reset with paths.\n"), r)
+        r = self.mg("reset", "--hard", "HEAD", "--", "a.txt", code=128)
+        self.assertTrue(r.err.startswith("fatal: Cannot do hard reset with paths.\n"), r)
         r = self.mg("reset", "--", "nope.txt", code=1)
         self.assertIn("did not match", r.err)
         self.assertEqual(self.head(), c2)
@@ -360,8 +362,8 @@ class ResetTests(MinigitCase):
 
     def test_soft_reset_refused_during_merge(self):
         ours = self.make_conflict()
-        r = self.mg("reset", "--soft", "HEAD~1", code=1)
-        self.assertTrue(r.err.startswith("error:"), r)
+        r = self.mg("reset", "--soft", "HEAD~1", code=128)
+        self.assertEqual(r.err, "fatal: Cannot do a soft reset in the middle of a merge.\n")
         self.assertEqual(self.head(), ours)
         self.assertIsNotNone(self.special("MERGE_HEAD"))
         self.assertIn("UU f.txt", self.status())
@@ -488,7 +490,7 @@ class ResetTests(MinigitCase):
             with self.subTest(mode=mode):
                 self.mg("reset", "--soft", c3)     # re-arm: soft reset does not need the index
                 self.assertEqual(self.head(), c3)
-                r = self.mg("reset", mode, "HEAD~1", code=1)
+                r = self.mg("reset", mode, "HEAD~1", code=128)
                 self.assertIn("index.lock", r.err)
                 self.assertEqual(self.head(), c3, f"failed 'reset {mode}' moved HEAD anyway")
         os.remove(lock)
@@ -651,8 +653,9 @@ class RestoreTests(MinigitCase):
         self.assertIn("did not match", r.err)
         self.assertEqual(self.read("u.txt"), b"untracked\n")
         self.mg("restore", "nope.txt", code=1)
-        self.mg("restore", code=2)
-        r = self.mg("restore", "--source", "nosuchrev", "a.txt", code=1)
+        r = self.mg("restore", code=128)
+        self.assertEqual(r.err, "fatal: you must specify path(s) to restore\n")
+        r = self.mg("restore", "--source", "nosuchrev", "a.txt", code=128)
         self.assertIn("unknown revision", r.err)
         self.assertStatus(["?? u.txt"])
 
@@ -795,7 +798,8 @@ class IgnoreTests(MinigitCase):
         self.write("ok.txt", "ok\n")
 
         r = self.mg("add", "x.secret", code=1)
-        self.assertIn("is ignored by .minigitignore (use -f)", r.err)
+        self.assertEqual(r.err, "The following paths are ignored by one of your .minigitignore files:\n"
+                                "x.secret\nhint: Use -f if you really want to add them.\n")
         self.mg("add", "private/p.txt", code=1)
         self.mg("add", "ok.txt", "x.secret", code=1)
         self.assertEqual(self.ls_files(), [], "a failed add must not stage anything")

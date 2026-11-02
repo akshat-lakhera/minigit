@@ -10,7 +10,7 @@ import os
 from dataclasses import dataclass
 from typing import Sequence
 
-from minigit.errors import MinigitError, NothingToCommit, RefUpdateError, UsageError
+from minigit.errors import FatalError, MinigitError, NothingToCommit, RefUpdateError, UsageError
 from minigit.objects import EMPTY_TREE, Commit, hash_object, serialize_commit
 from minigit.refs import check_ref_name, short_ref
 from minigit.repo import REBASE_IN_PROGRESS, Repository
@@ -94,6 +94,7 @@ def add(repo: Repository, pathspecs: Sequence[str], cwd: str, *, force: bool = F
         pathspecs, cwd = ["."], repo.worktree   # the whole tree, from the root
     ignore = IgnoreMatcher(repo.worktree)
     affected: set[str] = set()
+    ignored: list[str] = []
     head_flat: FlatTree | None = None
     with locked_index(repo) as index:
         unmerged = set(index.unmerged())
@@ -108,17 +109,17 @@ def add(repo: Repository, pathspecs: Sequence[str], cwd: str, *, force: bool = F
                 # Windows has no exec bit: a path new to the index takes HEAD's mode
                 # (SPEC "mode from stat"), so 'rm --cached' + 'add' keeps 100755.
                 if head_flat is None:
-                    head_flat = repo.head_flat()
+                    head_flat = repo.head_flat(index.flat())
                 h = head_flat.get(p)
                 if h is not None and h[0] in ("100644", "100755") and h[0] != entry.mode:
                     entry.mode = h[0]
                     index.put(entry)
             return p
 
-        def stage_if_changed(p: str) -> None:
+        def stage_if_changed(p: str, st=None) -> None:
             cur = index.get(p)
             if cur is not None and p not in unmerged:
-                w = worktree_entry(repo, index, p)
+                w = worktree_entry(repo, index, p, st=st)  # st: scan_files' stat, saves a stat call
                 if w == (cur.mode, cur.sha):
                     return
             affected.add(stage(p))
@@ -133,7 +134,7 @@ def add(repo: Repository, pathspecs: Sequence[str], cwd: str, *, force: bool = F
             if update:
                 # -u: tracked files only; a new file is never staged
                 if not tracked and rel != "":
-                    raise MinigitError(f"pathspec '{spec}' did not match any files")
+                    raise FatalError(f"pathspec '{spec}' did not match any files")
                 for p in tracked:
                     if os.path.isfile(repo.abspath(p)):
                         stage_if_changed(p)
@@ -142,11 +143,12 @@ def add(repo: Repository, pathspecs: Sequence[str], cwd: str, *, force: bool = F
                         affected.add(p)
             elif rel == "" or os.path.isdir(absp):
                 if rel and not force and not tracked and ignore.is_ignored(rel, is_dir=True):
-                    raise MinigitError(f"path '{rel}' is ignored by .minigitignore (use -f)")
+                    ignored.append(rel)
+                    continue
                 # As in git, -f also stages the ignored files below a named directory.
                 scanned = scan_files(repo, _NoIgnore() if force else ignore, under=rel)
                 for p in sorted(scanned):
-                    stage_if_changed(p)
+                    stage_if_changed(p, scanned[p])
                 for p in tracked:
                     if p in scanned:
                         continue
@@ -157,14 +159,22 @@ def add(repo: Repository, pathspecs: Sequence[str], cwd: str, *, force: bool = F
                         affected.add(p)
             elif os.path.isfile(absp):
                 if not force and rel not in tracked and ignore.is_ignored(rel):
-                    raise MinigitError(f"path '{rel}' is ignored by .minigitignore (use -f)")
+                    ignored.append(rel)
+                    continue
                 affected.add(stage(rel))
             elif tracked:
                 for p in tracked:
                     index.remove(p)
                     affected.add(p)
             else:
-                raise MinigitError(f"pathspec '{spec}' did not match any files")
+                raise FatalError(f"pathspec '{spec}' did not match any files")
+        if ignored:
+            # git's report (exit 1, no "error:" prefix); nothing is staged (add is all-or-nothing)
+            err = MinigitError("The following paths are ignored by one of your .minigitignore files:\n"
+                               + "\n".join(sorted(set(ignored))),
+                               hint="Use -f if you really want to add them.")
+            err.prefix = ""
+            raise err
     return sorted(affected)
 
 
@@ -186,25 +196,34 @@ def rm(repo: Repository, pathspecs: Sequence[str], cwd: str, *, cached: bool = F
             rel = repo.relpath(spec, cwd)
             matched = [p for p in all_paths if _under(p, rel)]
             if not matched:
-                raise MinigitError(f"pathspec '{spec}' did not match any files")
+                raise FatalError(f"pathspec '{spec}' did not match any files")
             if rel not in matched and not recursive:
-                raise MinigitError(f"not removing '{rel or '.'}' recursively without -r")
+                raise FatalError(f"not removing '{rel or '.'}' recursively without -r")
             for p in matched:
                 if p not in targets:
                     targets.append(p)
         if not force:
+            # git's check_local_mod(): three lists, each reported as one "error:" block
+            both: list[str] = []      # the index matches neither the file nor HEAD
+            in_index: list[str] = []  # staged changes (the index differs from HEAD)
+            local: list[str] = []     # the file differs from the index
             for p in targets:
                 i = staged.get(p)
                 h = head_flat.get(p)
                 if i is None:  # conflicted path: removing it is how a conflict is resolved (as in git)
                     continue
                 w = worktree_entry(repo, index, p)
-                if cached:
-                    ok = i == h or i == w
-                else:
-                    ok = (w is None or w == i) and i == h
-                if not ok:
-                    raise MinigitError(f"'{p}' has staged or local changes (use -f)")
+                staged_change = i != h
+                local_change = w is not None and w != i
+                if staged_change and local_change:
+                    both.append(p)
+                elif not cached:
+                    if staged_change:
+                        in_index.append(p)
+                    if local_change:
+                        local.append(p)
+            if both or in_index or local:
+                raise MinigitError(_rm_refusal(both, in_index, local))
         for p in sorted(targets):
             index.remove(p)
             if not cached:
@@ -213,7 +232,58 @@ def rm(repo: Repository, pathspecs: Sequence[str], cwd: str, *, cached: bool = F
     return removed
 
 
+def _rm_refusal(both: list[str], in_index: list[str], local: list[str]) -> str:
+    """git's wording for ``rm`` without ``-f`` on files whose changes would be lost."""
+    blocks = []
+    for paths, one, many, advice in (
+            (both, "the following file has staged content different from both the\nfile and the HEAD:",
+             "the following files have staged content different from both the\nfile and the HEAD:",
+             "(use -f to force removal)"),
+            (in_index, "the following file has changes staged in the index:",
+             "the following files have changes staged in the index:",
+             "(use --cached to keep the file, or -f to force removal)"),
+            (local, "the following file has local modifications:",
+             "the following files have local modifications:",
+             "(use --cached to keep the file, or -f to force removal)")):
+        if paths:
+            blocks.append((one if len(paths) == 1 else many) + "".join(f"\n    {p}" for p in paths)
+                          + "\n" + advice)
+    return "\nerror: ".join(blocks)
+
+
 # --------------------------------------------------------------------------- commit
+
+def cleanup_message(text: str, *, strip_comments: bool = False) -> str:
+    """git's ``strbuf_stripspace`` (``--cleanup=whitespace``, or ``strip`` with ``strip_comments``):
+    trailing whitespace is removed from every line, runs of blank lines become one, blank lines at
+    the start and the end go, and the result ends with one newline; ``""`` when nothing is left."""
+    out: list[str] = []
+    blank = False
+    for line in text.split("\n"):
+        if strip_comments and line.startswith("#"):
+            continue
+        line = line.rstrip(" \t\r\v\f")
+        if not line:
+            blank = True
+            continue
+        if blank and out:
+            out.append("")
+        blank = False
+        out.append(line)
+    return "\n".join(out) + "\n" if out else ""
+
+
+def message_subject(message: str) -> str:
+    """git's ``%s``: the first paragraph of ``message`` with its lines joined by spaces."""
+    lines = []
+    for line in message.split("\n"):
+        if not line.strip():
+            if lines:
+                break
+            continue
+        lines.append(line.rstrip())   # a leading indent stays, as in git
+    return " ".join(lines)
+
 
 def create_commit(repo: Repository, tree: str, parents: Sequence[str], message: str, *,
                   author=None) -> str:
@@ -242,14 +312,37 @@ def _nothing_to_commit_message(repo: Repository, all_: bool) -> str:
         return "no changes added to commit (use \"minigit add\" and/or \"minigit commit -a\")"
     if any(xy == "??" for xy, _p in entries):
         return "nothing added to commit but untracked files present (use \"minigit add\" to track)"
+    if repo.head_commit() is None:
+        return "nothing to commit (create/copy files and use \"minigit add\" to track)"
     return "nothing to commit, working tree clean"
+
+
+def nothing_to_commit_report(repo: Repository, message: str, cwd: str) -> str:
+    """What ``commit`` prints (to stdout, as git does) when there is nothing to commit: the status
+    of the work tree, then ``message`` (the ``NothingToCommit`` text) as its last line."""
+    from minigit.status import compute_status, format_status_long
+
+    try:
+        text = format_status_long(status_view(repo, compute_status(repo), cwd))
+    except MinigitError:
+        return message
+    lines = text.rstrip("\n").split("\n")
+    # format_status_long ends with its own summary line; commit's message replaces it
+    if lines and lines[-1].startswith(("nothing to commit", "nothing added to commit", "no changes added to commit")):
+        lines.pop()
+    while lines and lines[-1] == "":
+        lines.pop()
+    lines = ["Initial commit" if line == "No commits yet" else line for line in lines]
+    if len(lines) > 1:
+        lines.append("")
+    return "\n".join(lines + [message])
 
 
 def _check_amend(repo: Repository) -> Commit:
     """The HEAD commit that ``--amend`` replaces; refuses on an unborn HEAD and during an operation."""
     head = repo.head_commit()
     if head is None:
-        raise MinigitError("you have nothing to amend")
+        raise FatalError("You have nothing to amend.")
     op = repo.operation_in_progress()
     if op is not None:
         kind = op[0]
@@ -296,6 +389,16 @@ def commit(repo: Repository, messages: Sequence[str], *, all_: bool = False,
             parent_tree = commit_tree_sha(repo.objects, head) if head else EMPTY_TREE
             if tree == parent_tree:
                 raise NothingToCommit(_nothing_to_commit_message(repo, all_))
+        if old is not None and not allow_empty and len(parents) < 2:
+            # as git: an amend whose result has the tree of its parent would be an empty commit
+            parent_tree = commit_tree_sha(repo.objects, parents[0]) if parents else EMPTY_TREE
+            if tree == parent_tree:
+                err = MinigitError(
+                    "You asked to amend the most recent commit, but doing so would make\n"
+                    "it empty. You can repeat your command with --allow-empty, or you can\n"
+                    "remove the commit entirely with \"minigit reset HEAD^\".")
+                err.prefix = ""
+                raise err
         if messages:
             message = "\n\n".join(messages)
         elif old is not None:
@@ -305,9 +408,11 @@ def commit(repo: Repository, messages: Sequence[str], *, all_: bool = False,
             if state_msg is None:
                 raise UsageError("commit message required: use -m")
             message = state_msg
-        message = message.rstrip() + "\n"
-        if message == "\n":
-            raise MinigitError("aborting commit due to empty commit message")
+        message = cleanup_message(message)   # git's default cleanup for a message given with -m
+        if not message:
+            err = MinigitError("Aborting commit due to empty commit message.")
+            err.prefix = ""   # git prints this line bare (exit 1)
+            raise err
         # identity errors surface here, before any object is written
         pick = repo.cherry_pick_head()   # a finished cherry-pick keeps the picked commit's author
         if old is not None:
@@ -321,18 +426,62 @@ def commit(repo: Repository, messages: Sequence[str], *, all_: bool = False,
         repo.clear_operation_state()
         new_flat = index.flat()
     branch = repo.refs.current_branch()
-    subject = message.split("\n", 1)[0]
+    subject = message_subject(message)
     if branch is None:
         prefix = f"[detached HEAD {_abbrev(sha)}]"
     elif head is None:
         prefix = f"[{branch} (root-commit) {_abbrev(sha)}]"
     else:
         prefix = f"[{branch} {_abbrev(sha)}]"
+    lines = [f"{prefix} {subject}"]
+    if stat:
+        # git's print_commit_summary(): " Author:" when the author is not the committer, " Date:"
+        # when the author date was taken over (amend), then the shortstat and the summary lines
+        new_commit = repo.read_commit(sha)
+        a, c = new_commit.author, new_commit.committer
+        if (a.name, a.email) != (c.name, c.email):
+            lines.append(f" Author: {a.name} <{a.email}>")
+        if old is not None:
+            from minigit.util import format_date
+
+            lines.append(f" Date: {format_date(a.timestamp, a.tz_offset)}")
     # like git, a merge commit (or a commit that changes nothing) gets no stat line; an amend is
     # compared with the (kept) parent, like the commit it replaces
     base = parents[0] if (old is not None and parents) else (None if old is not None else head)
-    line = _shortstat(repo, commit_flat(repo.objects, base), new_flat) if stat and len(parents) < 2 else None
-    return sha, f"{prefix} {subject}" + (f"\n{line}" if line else "")
+    if stat and len(parents) < 2:
+        base_flat = commit_flat(repo.objects, base, new_flat)
+        line = _shortstat(repo, base_flat, new_flat)
+        if line:
+            lines.append(line)
+            lines.extend(_summary_lines(base_flat, new_flat))
+    return sha, "\n".join(lines)
+
+
+def _summary_lines(old: dict, new: dict) -> list[str]:
+    """git's ``--summary`` lines: `` create mode 100644 p``, `` delete mode ...``, `` mode change
+    100644 => 100755 p`` and `` rename a => b (100%)`` for an exact rename, in path order."""
+    from minigit.diff import _exact_renames, _rename_name, changed_paths
+
+    paths = changed_paths(old, new, ())
+    renames = _exact_renames(old, new, paths)
+    sources = set(renames.values())
+    out = []
+    for p in sorted(paths):
+        if p in sources:
+            continue
+        o, n = old.get(p), new.get(p)
+        if p in renames:
+            src_mode = old[renames[p]][0]
+            out.append(f" rename {_rename_name(renames[p], p)} (100%)")
+            if src_mode != n[0]:
+                out.append(f" mode change {src_mode} => {n[0]} {p}")
+        elif o is None:
+            out.append(f" create mode {n[0]} {p}")
+        elif n is None:
+            out.append(f" delete mode {o[0]} {p}")
+        elif o[0] != n[0]:
+            out.append(f" mode change {o[0]} => {n[0]} {p}")
+    return out
 
 
 def _shortstat(repo: Repository, old: dict, new: dict) -> str | None:
@@ -430,9 +579,13 @@ def format_branch_list(items: list[BranchInfo], verbose: bool) -> str:
     return "\n".join(lines) + "\n"
 
 
+_REF_NAME_RULES = ("a name cannot contain spaces, '..', '~', '^', ':', '?', '*', '[', '\\' or '@{', "
+                   "and cannot start with '-' or '/' or end with '.', '/' or '.lock'")
+
+
 def _branch_ref(name: str) -> str:
     """``refs/heads/<name>`` for a valid new branch name (git's check-ref-format --branch)."""
-    invalid = MinigitError(f"'{name}' is not a valid branch name")
+    invalid = FatalError(f"'{name}' is not a valid branch name", hint=_REF_NAME_RULES)
     if (not name or name.startswith("refs/") or name.startswith("-") or name in ("HEAD", "@")
             or name.endswith(".") or name.endswith("/")):
         raise invalid
@@ -441,7 +594,7 @@ def _branch_ref(name: str) -> str:
         check_ref_name(ref)
     except MinigitError as e:
         if ": too long" in e.message:  # say why: the name is fine apart from its length
-            raise MinigitError(f"{invalid.message}: {e.message.rsplit(': ', 1)[1]}") from None
+            raise FatalError(f"{invalid.message}: {e.message.rsplit(': ', 1)[1]}") from None
         raise invalid from None
     return ref
 
@@ -451,15 +604,18 @@ def branch_create(repo: Repository, name: str, start: str | None = None) -> str:
 
     ref = _branch_ref(name)
     if resolve_local_branch(repo, name) is not None:
-        raise MinigitError(f"a branch named '{name}' already exists")
+        raise FatalError(f"a branch named '{name}' already exists")
     if start is None and repo.head_commit() is None:
-        raise MinigitError("not a valid object name: 'HEAD' (no commits yet)")
+        current = repo.refs.current_branch() or "HEAD"
+        raise FatalError(f"not a valid object name: '{current}'",
+                         hint=f"'{current}' has no commits yet: make the first commit, or run "
+                              f"'minigit switch -c {name}' to make it on '{name}' instead")
     sha = resolve_rev(repo, start if start is not None else "HEAD")
     try:
         repo.refs.update(ref, sha, expected=None)
     except RefUpdateError as e:
         if e.actual is not None:
-            raise MinigitError(f"a branch named '{name}' already exists") from e
+            raise FatalError(f"a branch named '{name}' already exists") from e
         raise
     return sha
 
@@ -490,7 +646,8 @@ def branch_delete(repo: Repository, name: str, *, force: bool = False) -> str:
                 if usha is not None and is_ancestor(repo.objects, sha, usha):
                     merged = True
         if not merged:
-            raise MinigitError(f"the branch '{name}' is not fully merged (use -D)")
+            raise MinigitError(f"the branch '{name}' is not fully merged",
+                               hint=f"If you are sure you want to delete it, run 'minigit branch -D {name}'")
     repo.refs.update(ref, None, expected=sha)
     cfg = repo.config
     if cfg.get(f"branch.{name}.remote") is not None or cfg.get(f"branch.{name}.merge") is not None:
@@ -599,7 +756,7 @@ def switch(repo: Repository, target: str | None, *, create: str | None = None, s
     if create is not None:
         ref = _branch_ref(create)
         if resolve_local_branch(repo, create) is not None:
-            raise MinigitError(f"a branch named '{create}' already exists")
+            raise FatalError(f"a branch named '{create}' already exists")
         if start is None:
             head = repo.head_commit()
             if head is not None:
@@ -659,7 +816,7 @@ def switch(repo: Repository, target: str | None, *, create: str | None = None, s
     try:
         resolve_rev(repo, target)
     except MinigitError:
-        raise MinigitError(f"invalid reference: {target}") from None
+        raise FatalError(f"invalid reference: {target}") from None
     ref = resolve_ref(repo, target)
     if ref and ref.startswith("refs/remotes/"):
         kind = "remote branch"
@@ -667,8 +824,96 @@ def switch(repo: Repository, target: str | None, *, create: str | None = None, s
         kind = "tag"
     else:
         kind = "commit"
-    raise MinigitError(f"a branch is expected, got {kind} '{target}'",
+    raise FatalError(f"a branch is expected, got {kind} '{target}'",
                        hint=f"use 'minigit switch --detach {target}' to look at it with a detached HEAD")
+
+
+def detached_head(repo: Repository) -> str | None:
+    """The commit of a detached HEAD, else None; what ``leaving_detached_head`` needs afterwards."""
+    return repo.head_commit() if repo.refs.current_branch() is None else None
+
+
+def leaving_detached_head(repo: Repository, old: str | None) -> str:
+    """git's note when a switch moved a detached HEAD away from ``old``: ``Previous HEAD position
+    was <sha7> <subject>``, or, when no ref reaches ``old`` any more, a warning that lists the
+    commits left behind (as git does, the newest four, then ``... and N more.``)."""
+    from minigit.graph import ancestors, topo_walk
+    from minigit.history import commit_tips
+
+    new = repo.head_commit()
+    if old is None or old == new:
+        return ""
+    kept = ancestors(repo.objects, commit_tips(repo) + ([new] if new else []))
+    if old in kept:
+        return f"Previous HEAD position was {_abbrev(old)} {_subject(repo, old)}"
+    lost = [(sha, c) for sha, c in topo_walk(repo.objects, [old]) if sha not in kept]
+    shown = lost if len(lost) <= 5 else lost[:4]
+    listing = "".join(f"  {_abbrev(sha)} {c.subject}\n" for sha, c in shown)
+    if len(lost) > 5:
+        listing += f" ... and {len(lost) - 4} more.\n"
+    n = len(lost)
+    them = "it" if n == 1 else "them"
+    return (f"Warning: you are leaving {n} commit{'s' if n != 1 else ''} behind, not connected to\n"
+            f"any of your branches:\n\n{listing}\n"
+            f"If you want to keep {them} by creating a new branch, this may be a good time\n"
+            f"to do so with:\n\n minigit branch <new-branch-name> {_abbrev(old)}\n\n")
+
+
+def detach_advice(repo: Repository, target: str, previous_branch: str | None) -> str:
+    """The note ``checkout <rev>`` prints when it detaches HEAD from a branch (git's
+    ``advice.detachedHead``, which turns it off here too); shorter and more concrete than git's."""
+    if (repo.config.get("advice.detachedhead") or "").lower() in ("false", "no", "off", "0"):
+        return ""
+    back = f"minigit switch {previous_branch}" if previous_branch else "minigit switch <branch>"
+    return (f"Note: switching to '{target}'.\n\n"
+            "You are in 'detached HEAD' state: you can look around and make experimental commits,\n"
+            "but they belong to no branch and are easy to lose once you switch away.\n"
+            "To keep commits you make here, create a branch for them (now or later) with:\n\n"
+            "  minigit switch -c <new-branch-name>\n\n"
+            f"Go back with '{back}'. Turn off this note with\n"
+            "'minigit config advice.detachedHead false'.\n\n")
+
+
+def local_changes(repo: Repository) -> str:
+    """git's list after a switch of the changes the work tree carries over (``diff HEAD
+    --name-status``): ``M\tp``, ``A\tp`` (staged new file) and ``D\tp`` lines, sorted by path."""
+    from minigit.index import read_index
+    from minigit.worktree import worktree_entry
+
+    head = repo.head_flat()
+    index = read_index(repo)
+    staged = index.flat()
+    lines = []
+    for p in sorted(set(head) | set(staged)):
+        if p not in staged:
+            lines.append(f"D\t{p}")
+            continue
+        w = worktree_entry(repo, index, p)
+        if w is None:
+            if p in head:
+                lines.append(f"D\t{p}")
+        elif p not in head:
+            lines.append(f"A\t{p}")
+        elif w != head[p]:
+            lines.append(f"M\t{p}")
+    return "\n".join(lines)
+
+
+def unstaged_after_reset(repo: Repository) -> str:
+    """git's report after a mixed reset: ``Unstaged changes after reset:`` and one ``M\tp`` or
+    ``D\tp`` line per tracked file that differs from the new index; ``""`` when none does."""
+    from minigit.index import read_index
+    from minigit.worktree import worktree_entry
+
+    index = read_index(repo)
+    lines = []
+    for p, entry in sorted(index.flat().items()):
+        w = worktree_entry(repo, index, p)
+        if w is None:
+            lines.append(f"D\t{p}")
+        elif w != entry:
+            lines.append(f"M\t{p}")
+    return "\n".join(["Unstaged changes after reset:"] + lines) if lines else ""
 
 
 # --------------------------------------------------------------------------- status display
@@ -747,7 +992,7 @@ def reset(repo: Repository, rev: str = "HEAD", mode: str = "mixed") -> str:
     if mode == "soft":
         op = repo.operation_in_progress()
         if op is not None:
-            raise MinigitError(f"cannot do a soft reset in the middle of a {op[0]}")
+            raise FatalError(f"Cannot do a soft reset in the middle of a {op[0]}.")
         if old_head is not None:
             repo.refs.write_special("ORIG_HEAD", old_head)
         repo.refs.update_head(target, expected=old_head)
@@ -785,7 +1030,7 @@ def reset(repo: Repository, rev: str = "HEAD", mode: str = "mixed") -> str:
     repo.clear_operation_state()
     if mode == "hard":
         return f"HEAD is now at {_abbrev(target)} {_subject(repo, target)}"
-    return ""
+    return unstaged_after_reset(repo)
 
 
 def _match_paths(repo: Repository, pathspecs: Sequence[str], cwd: str, candidates: set[str],
@@ -853,7 +1098,8 @@ def restore(repo: Repository, pathspecs: Sequence[str], cwd: str, *, staged: boo
         else:
             src_flat = dict(staged_flat)
         candidates = set(src_flat) | set(index.paths())
-        paths = _match_paths(repo, pathspecs, cwd, candidates, "pathspec '{spec}' did not match")
+        paths = _match_paths(repo, pathspecs, cwd, candidates,
+                             "pathspec '{spec}' did not match any file(s) known to minigit")
         if source is None and not staged:
             # Restoring the worktree from the index needs a stage-0 entry (as in git).
             conflicted = index.unmerged()

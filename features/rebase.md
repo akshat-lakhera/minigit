@@ -31,7 +31,7 @@ minigit rebase --abort
 - `--onto <newbase>`: start the replayed commits at `<newbase>` instead of `<upstream>`
   (`rebase --onto main side` moves `topic`'s own commits from `side` to `main`).
 - `<branch>`: switch to `<branch>` first (a local branch, or any revision for a detached HEAD), as git does.
-- `--continue`, `--skip`, `--abort` are mutually exclusive and take no other argument (usage error, exit 2).
+- `--continue`, `--skip`, `--abort` are mutually exclusive and take no other argument (usage error, exit 129).
   Without a rebase in progress they fail with `error: no rebase in progress` (exit 1).
 - `minigit pull --rebase [<remote> [<branch>]]` fetches and then runs this rebase onto the tracking branch
   instead of merging (`--no-rebase`, the default, merges). The preconditions of 1.3 are checked before the

@@ -433,7 +433,7 @@ class CloneTests(ServerCase):
         put(dest, {"keep.txt": "mine\n"})
         res = self.bob(self.ws, "clone", url, "dest", check=False)
         self.assertExit(res, 1)
-        self.assertIn("already exists and is not empty", res.err)
+        self.assertIn("already exists and is not an empty directory", res.err)
         self.assertEqual(sorted(os.listdir(dest)), ["keep.txt"])
         self.assertEqual(get(dest, "keep.txt"), b"mine\n")
         put(self.ws, {"afile": "data\n"})
@@ -655,7 +655,7 @@ class FetchTests(ServerCase):
         res = self.bob(b, "fetch")
         self.assertIn(" - [deleted]         feature -> origin/feature", res.out.splitlines())
         self.assertIsNone(self.ref_file(b, "refs/remotes/origin/feature"))
-        self.assertExit(self.bob(b, "rev-parse", "origin/feature", check=False), 1)
+        self.assertExit(self.bob(b, "rev-parse", "origin/feature", check=False), 128)
         self.assertEqual(set(self.branch_names(self.bob, b, "-r")), {"origin/main"})
 
     def test_fetch_reports_forced_update(self):
@@ -694,7 +694,7 @@ class FetchTests(ServerCase):
 
     def test_fetch_errors_cleanly_without_a_usable_remote(self):
         res = self.bob(self.ws, "fetch", check=False)
-        self.assertExit(res, 1)
+        self.assertExit(res, 128)
         self.assertIn("not a minigit repository", res.err)
         self.bob(self.ws, "init", "lone")
         lone = os.path.join(self.ws, "lone")
@@ -848,7 +848,7 @@ class PullTests(ServerCase):
         self.alice(a, "push")
         ours = self.commit(self.bob, b, {"b.txt": "bob\n", "shared.txt": lines.replace("line 9\n", "BOB 9\n")})
         res = self.bob(b, "pull")
-        self.assertIn("Merge made by the 'three-way' strategy.", res.out)
+        self.assertIn("Merge made by the 'ort' strategy.", res.out)
         parents, msg = self.commit_info(self.bob, b)
         self.assertEqual(parents, [ours, theirs])
         self.assertEqual(msg.strip(), f"Merge branch 'main' of {url}")
@@ -953,7 +953,7 @@ class PullTests(ServerCase):
         self.bob(b, "fetch")                       # fetching on a detached HEAD is fine
         self.assertEqual(get(b, ".minigit/HEAD"), head_before)
         res = self.bob(b, "pull", check=False)
-        self.assertIn(res.code, (1, 2), str(res))
+        self.assertIn(res.code, (1, 129), str(res))
         self.assertNotIn("internal error", res.err)
         self.assertEqual(get(b, ".minigit/HEAD"), head_before)
         self.assertEqual(get(b, "f.txt"), b"1\n")
@@ -1188,7 +1188,7 @@ class PullLocalChangesTests(ServerCase):
         ours = self.commit(self.bob, b, {"b.txt": "bob\n"})
         put(b, {"c.txt": "dirty\n", "u.txt": "untracked\n"})
         res = self.bob(b, "pull")
-        self.assertIn("Merge made by the 'three-way' strategy.", res.out)
+        self.assertIn("Merge made by the 'ort' strategy.", res.out)
         parents, _ = self.commit_info(self.bob, b)
         self.assertEqual(parents, [ours, theirs])
         self.assertEqual(get(b, "a.txt"), b"alice\n")

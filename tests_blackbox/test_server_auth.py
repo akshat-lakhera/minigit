@@ -1117,11 +1117,11 @@ class ClientCliAuthTests(_LiveServerBase):
         self.assertIn("(no credentials configured)", res.err)
         self.assertFalse(os.path.exists(dest))
         # login argument validation
-        for args, code in ((["login", self.server.url, "--user", "", "--token", "t"], 2),
-                           (["login", self.server.url, "--user", "alice", "--token", ""], 2),
+        for args, code in ((["login", self.server.url, "--user", "", "--token", "t"], 129),
+                           (["login", self.server.url, "--user", "alice", "--token", ""], 129),
                            (["login", "nonsense", "--user", "alice", "--token", "t"], 1),
                            (["login", "ftp://h:1/x", "--user", "alice", "--token", "t"], 1),
-                           (["login", self.server.url, "--user", "alice"], 2)):
+                           (["login", self.server.url, "--user", "alice"], 129)):
             with self.subTest(args=args):
                 res = run(args, cwd=self.work, env=env2, check=False)
                 self.assertEqual(res.returncode, code, str(res))
@@ -1306,15 +1306,15 @@ class ServeLifecycleTests(unittest.TestCase):
             with self.subTest(port=port):
                 res = run(["serve", "--root", os.path.join(self.dir, "srv"), "--port", port, "--quiet"],
                           cwd=self.dir, env=self.env, check=False)
-                self.assertIn(res.returncode, (1, 2), str(res))
+                self.assertIn(res.returncode, (1, 129), str(res))
                 self.assertNotIn("internal error", res.err, f"an out-of-range port is a usage error\n{res}")
                 self.assertNotIn("Traceback", res.err)
                 self.assertTrue(res.err.startswith("error:") or res.err.startswith("usage:"), str(res))
         res = run(["serve", "--root", os.path.join(self.dir, "srv"), "--port", "abc"], cwd=self.dir, env=self.env,
                   check=False)
-        self.assertEqual(res.returncode, 2, str(res))
+        self.assertEqual(res.returncode, 129, str(res))
         res = run(["serve"], cwd=self.dir, env=self.env, check=False)
-        self.assertEqual(res.returncode, 2, str(res))
+        self.assertEqual(res.returncode, 129, str(res))
         self.assertIn("--root", res.err)
 
     def test_serve_with_a_root_that_is_a_file_reports_the_root_problem(self):

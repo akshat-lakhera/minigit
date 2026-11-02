@@ -555,10 +555,10 @@ class PushBasicsTests(PushTestBase):
         a, ea = self.clone("alice")
         c1 = self.commit(a, ea)
         run(["push", "-u", "origin", "main"], a, ea)
-        # invalid destination names are usage errors (exit 2) and never reach the server
+        # invalid destination names are usage errors (exit 129) and never reach the server
         for bad in ("HEAD:bad..name", "HEAD:x.lock", "HEAD:a//b", "HEAD:.hidden", "HEAD:sp ace"):
             res = run(["push", "origin", bad], a, ea, check=False)
-            self.assertEqual(res.returncode, 2, f"{bad!r} should be a usage error:\n{res}")
+            self.assertEqual(res.returncode, 129, f"{bad!r} should be a usage error:\n{res}")
             self.assertTrue(res.err.startswith("error:"), res)
         # an unknown source is a plain error (exit 1), not an internal error
         res = run(["push", "origin", "nosuchbranch"], a, ea, check=False)
@@ -703,7 +703,7 @@ class NonFastForwardTests(PushTestBase):
         a, ea, b, eb, c1, c2, c3 = self.diverge()
         self.assert_rejected(run(["push"], a, ea, check=False))
         res = run(["pull"], a, ea)
-        self.assertIn("Merge made by the 'three-way' strategy.", res.out)
+        self.assertIn("Merge made by the 'ort' strategy.", res.out)
         merge = self.head(a, ea)
         self.assertNotIn(merge, (c1, c2, c3))
         log = run(["log", "-n", "1"], a, ea).out
@@ -776,7 +776,7 @@ class ConcurrentPushTests(PushTestBase):
             if i == winner:
                 continue
             res = run(["pull"], cwd, env)
-            self.assertIn("Merge made by the 'three-way' strategy.", res.out, res)
+            self.assertIn("Merge made by the 'ort' strategy.", res.out, res)
             res = run(["push"], cwd, env)
             self.assertEqual(self.server_ref(), self.head(cwd, env))
         for cwd, env in clones:

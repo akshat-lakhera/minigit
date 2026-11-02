@@ -33,6 +33,7 @@ from minigit.objects import (
     Commit,
     ObjectStore,
     Signature,
+    Tag,
     TreeEntry,
     decode_object,
     encode_object,
@@ -40,6 +41,7 @@ from minigit.objects import (
     parse_commit,
     parse_tree,
     serialize_commit,
+    serialize_tag,
     serialize_tree,
 )
 from minigit.refs import ANY, RefStore, check_ref_name, is_hex_sha, short_ref
@@ -99,7 +101,7 @@ def make_commit(store: ObjectStore, tree: str, parents, ts: int, msg: str = "m",
 
 class ErrorsTest(unittest.TestCase):
     def test_version(self):
-        self.assertEqual(__version__, "0.2.0")
+        self.assertEqual(__version__, "0.3.0")
 
     def test_hierarchy_and_attrs(self):
         e = MinigitError("boom", hint="try again")
@@ -107,7 +109,7 @@ class ErrorsTest(unittest.TestCase):
         self.assertEqual(e.message, "boom")
         self.assertEqual(e.hint, "try again")
         self.assertEqual(e.exit_code, 1)
-        self.assertEqual(UsageError("u").exit_code, 2)
+        self.assertEqual(UsageError("u").exit_code, 129)
         self.assertIsInstance(NotARepositoryError("x"), MinigitError)
         oe = ObjectError("bad", sha="ab" * 20)
         self.assertEqual(oe.sha, "ab" * 20)
@@ -880,7 +882,9 @@ class RepoTest(TempDirCase):
         repo, _ = Repository.init(self.p("work"))
         with self.assertRaises(MinigitError) as cm:
             repo.identity()
-        self.assertIn("please set your identity", cm.exception.message)
+        self.assertIn("author identity unknown", cm.exception.message)
+        self.assertEqual(cm.exception.exit_code, 128)
+        self.assertIn("minigit config --global user.email", cm.exception.hint)
         repo.config.set("user.name", "Ann")
         with self.assertRaises(MinigitError):
             repo.identity()
@@ -1135,6 +1139,64 @@ class RevparseTest(TempDirCase):
             with self.assertRaises(RevisionError, msg=bad) as cm:
                 revparse.resolve_rev(r, bad)
             self.assertIn("unknown revision", cm.exception.message)
+
+    def test_peel_suffixes(self):
+        # git's X^{}, X^{commit}, X^{tree}, X^{blob}, X^{tag}, X^{object}, mixed with ~N / ^N
+        r = self.repo
+        self.assertEqual(revparse.resolve_object(r, "HEAD^{tree}"), self.tree2)
+        self.assertEqual(revparse.resolve_object(r, "HEAD~3^{tree}"), self.tree1)
+        self.assertEqual(revparse.resolve_object(r, "HEAD^{tree}^{tree}"), self.tree2)
+        self.assertEqual(revparse.resolve_object(r, "HEAD^{commit}"), self.merge)
+        self.assertEqual(revparse.resolve_object(r, "HEAD^{}"), self.merge)
+        self.assertEqual(revparse.resolve_object(r, "HEAD^{object}"), self.merge)
+        self.assertEqual(revparse.resolve_rev(r, "HEAD^{commit}~2"), self.c2)
+        self.assertEqual(revparse.resolve_rev(r, "HEAD^{}^2"), self.side)
+        self.assertEqual(revparse.resolve_object(r, "HEAD^{tree}:a.txt"), self.blob2)
+        self.assertEqual(revparse.resolve_object(r, self.blob + "^{blob}"), self.blob)
+        self.assertEqual(revparse.resolve_object(r, self.blob[:8] + "^{}"), self.blob)
+        st = r.objects
+        tag = st.write("tag", serialize_tag(Tag(object=self.c2, type="commit", tag="t",
+                                                tagger=Signature("T", "t@x", 1, 0), message="t\n")))
+        r.refs.update("refs/tags/ann", tag)
+        self.assertEqual(revparse.resolve_object(r, "ann"), tag)
+        self.assertEqual(revparse.resolve_object(r, "ann^{tag}"), tag)
+        self.assertEqual(revparse.resolve_object(r, "ann^{object}"), tag)
+        self.assertEqual(revparse.resolve_object(r, "ann^{}"), self.c2)
+        self.assertEqual(revparse.resolve_object(r, "ann^{commit}"), self.c2)
+        self.assertEqual(revparse.resolve_object(r, "ann^{tree}"), self.tree2)
+        self.assertEqual(revparse.resolve_rev(r, "ann^{commit}~1"), self.c1)
+        for bad, msg in (("HEAD^{blob}", "HEAD^{blob}: expected blob type, but the object dereferences to tree type"),
+                         ("HEAD^{tag}", "HEAD^{tag}: expected tag type, but the object dereferences to tree type"),
+                         ("HEAD^{tree}^{commit}", "HEAD^{tree}^{commit}: expected commit type, but the object "
+                                                  "dereferences to tree type"),
+                         ("HEAD^{foo}", "unknown revision 'HEAD^{foo}'"),
+                         ("HEAD^{commit", "unknown revision 'HEAD^{commit'")):
+            with self.subTest(bad=bad):
+                with self.assertRaises(RevisionError) as cm:
+                    revparse.resolve_object(r, bad)
+                self.assertEqual(cm.exception.message, msg)
+        with self.assertRaises(RevisionError) as cm:
+            revparse.resolve_rev(r, "HEAD^{tree}")   # commands that need a commit refuse a tree
+        self.assertIn("is not a commit", cm.exception.message)
+
+    def test_revision_hints(self):
+        r = self.repo
+        with self.assertRaises(RevisionError) as cm:
+            revparse.resolve_rev(r, "HEAD~9")
+        self.assertEqual(cm.exception.message, "unknown revision 'HEAD~9'")
+        self.assertEqual(cm.exception.exit_code, 128)
+        self.assertEqual(cm.exception.hint, f"HEAD~3 ({self.c1[:7]}) is a root commit: the history has no "
+                                            "commit before it")
+        with self.assertRaises(RevisionError) as cm:
+            revparse.resolve_rev(r, "HEAD~1^2")
+        self.assertEqual(cm.exception.hint, f"HEAD~1 ({self.c3[:7]}) has 1 parent")
+        with self.assertRaises(RevisionError) as cm:
+            revparse.resolve_rev(r, "side^2")
+        self.assertEqual(cm.exception.hint, f"side ({self.side[:7]}) has 1 parent")
+        empty, _ = Repository.init(self.p("empty"))
+        with self.assertRaises(RevisionError) as cm:
+            revparse.resolve_rev(empty, "HEAD")
+        self.assertEqual(cm.exception.hint, "the current branch 'main' has no commits yet")
 
     def test_errors(self):
         r = self.repo

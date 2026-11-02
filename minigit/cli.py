@@ -11,8 +11,7 @@ import argparse
 import importlib
 import os
 import sys
-import traceback
-from typing import Sequence
+from collections.abc import Sequence
 
 
 # ---------------------------------------------------------------------------
@@ -54,12 +53,18 @@ def _write(stream, data: bytes) -> None:
         stream.flush()
     except Exception:
         pass
-    if buf is not None:
-        buf.write(data)
-        buf.flush()
-    else:
-        stream.write(data.decode("utf-8", "replace"))
-        stream.flush()
+    try:
+        if buf is not None:
+            buf.write(data)
+            buf.flush()
+        else:
+            stream.write(data.decode("utf-8", "replace"))
+            stream.flush()
+    except OSError as e:
+        # Windows reports a pipe whose reader has gone ('minigit log | head') as EINVAL
+        if isinstance(e, BrokenPipeError) or e.errno in (22, 32):
+            raise BrokenPipeError(32, "Broken pipe") from None
+        raise
 
 
 def _out(data: bytes | str) -> None:
@@ -94,14 +99,28 @@ def _warn(text: str) -> None:
 # ---------------------------------------------------------------------------
 
 class _Parser(argparse.ArgumentParser):
-    """ArgumentParser whose errors raise UsageError (exit 2) instead of exiting."""
+    """ArgumentParser whose errors raise UsageError (exit 129, as git) instead of exiting."""
 
     def error(self, message: str) -> None:  # type: ignore[override]
         _stderr(self.format_usage().rstrip())
         hint = None
         if "expected one argument" in message:
             hint = "a value that starts with '-' must be attached to its option, e.g. --token=-abc"
+        elif message.startswith("unrecognized arguments: "):
+            hint = self._option_hint(message[len("unrecognized arguments: "):].split())
         raise _usage(message, hint)
+
+    def _option_hint(self, extras: list[str]) -> str | None:
+        """'did you mean --oneline?' for a mistyped option (git only prints the usage)."""
+        import difflib
+
+        known = [o for o in self._option_string_actions if o.startswith("--")]
+        for arg in extras:
+            if arg.startswith("--"):
+                close = difflib.get_close_matches(arg.split("=", 1)[0], known, n=1, cutoff=0.6)
+                if close:
+                    return f"did you mean '{close[0]}'? (see '{self.prog} -h')"
+        return None
 
     def _print_message(self, message: str, file=None) -> None:  # type: ignore[override]
         # --help/--version text goes out as UTF-8 bytes with "\n" newlines like all other
@@ -138,7 +157,7 @@ def _version_string() -> str:
     try:
         return "minigit " + str(importlib.import_module("minigit").__version__)
     except Exception:  # pragma: no cover - the package always has a version
-        return "minigit 0.2.0"
+        return "minigit 0.3.0"
 
 
 def _add_blame_parser(sub) -> None:
@@ -157,7 +176,8 @@ def _add_blame_parser(sub) -> None:
 def _add_grep_parser(sub) -> None:
     """Parser for ``grep`` (handler: minigit/grep.py, imported lazily)."""
     text = ("Print lines of tracked files (or a tree) that match a pattern. Patterns are Python "
-            "regular expressions (-i folds ASCII only); output paths are repository-relative.")
+            "regular expressions (-i folds ASCII only). From a subdirectory only its files are "
+            "searched and paths are printed relative to it, as git does.")
     s = sub.add_parser("grep", help="Print lines of tracked files (or a tree) that match a pattern",
                        description=text)
     s.add_argument("-i", "--ignore-case", dest="ignore_case", action="store_true")
@@ -173,8 +193,51 @@ def _add_grep_parser(sub) -> None:
     s.add_argument("args", nargs="*", metavar="[pattern] [rev] [path...]")
 
 
-def build_parser() -> argparse.ArgumentParser:
-    """Build the full argparse parser. prog="minigit"; errors raise UsageError."""
+class _Skip:
+    """Stands in for the parsers of the commands ``build_parser(only=...)`` leaves out.
+
+    Every method call (add_argument, add_mutually_exclusive_group, add_subparsers, ...) is a
+    no-op that returns the same object, and attribute assignment is ignored.
+    """
+
+    def __getattr__(self, name):
+        return self._noop
+
+    def __setattr__(self, name, value) -> None:
+        pass
+
+    def _noop(self, *args, **kwargs):
+        return self
+
+
+_SKIP = _Skip()
+
+# Commands whose parsers live in their own module (``<module>.add_parser(sub)``).
+_MODULE_PARSERS = {
+    "cherry-pick": "cherry", "revert": "cherry", "stash": "stash", "pr": "pr",
+    "rebase": "rebase", "tag": "tags", "gc": "gc",
+}
+
+
+class _OnlySub:
+    """Subparsers proxy for ``build_parser(only=...)``: only the selected command is really added."""
+
+    def __init__(self, sub, only: str) -> None:
+        self._sub = sub
+        self._only = only
+
+    def add_parser(self, name, **kw):
+        if name != self._only:
+            return _SKIP
+        return self._sub.add_parser(name, **kw)
+
+
+def build_parser(only: str | None = None) -> argparse.ArgumentParser:
+    """Build the argparse parser. prog="minigit"; errors raise UsageError.
+
+    With ``only``, just that command's subparser is built (and only its module imported): the
+    other ~40 cost most of the CLI's startup time. ``only=""`` builds the top-level parser alone.
+    """
     p = _Parser(
         prog="minigit",
         description="minigit: a small, working git clone with a shared HTTP server.",
@@ -183,11 +246,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-C", dest="chdir", action="append", default=[], metavar="DIR",
                    help="run as if minigit was started in DIR")
     p.add_argument("--version", action="version", version=_version_string())
-    sub = p.add_subparsers(dest="command", metavar="<command>", parser_class=_Parser)
-    p._minigit_sub = sub  # type: ignore[attr-defined]
+    real_sub = p.add_subparsers(dest="command", metavar="<command>", parser_class=_Parser)
+    p._minigit_sub = real_sub  # type: ignore[attr-defined]
+    sub = real_sub if only is None else _OnlySub(real_sub, only)
 
     def cmd(name, help_, **kw):
         return sub.add_parser(name, help=help_, description=help_, **kw)
+
+    def module_parsers(module: str) -> None:
+        if only is None or _MODULE_PARSERS.get(only) == module:
+            _m(module).add_parser(sub)
 
     # --- repository ------------------------------------------------------
     s = cmd("init", "Create an empty repository")
@@ -302,12 +370,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--allow-unrelated-histories", dest="allow_unrelated", action="store_true",
                    help="merge histories that share no commit (e.g. two root commits)")
     s.add_argument("rev", nargs="?", help="branch or revision to merge")
-    _m("cherry").add_parser(sub)  # cherry-pick, revert (minigit/cherry.py)
-    _m("stash").add_parser(sub)  # stash (minigit/stash.py)
-    _m("pr").add_parser(sub)  # pr (minigit/pr.py)
-    _m("rebase").add_parser(sub)  # rebase (minigit/rebase.py)
-    _m("tags").add_parser(sub)  # tag (minigit/tags.py)
-    _m("gc").add_parser(sub)  # gc (minigit/gc.py)
+    module_parsers("cherry")  # cherry-pick, revert (minigit/cherry.py)
+    module_parsers("stash")  # stash (minigit/stash.py)
+    module_parsers("pr")  # pr (minigit/pr.py)
+    module_parsers("rebase")  # rebase (minigit/rebase.py)
+    module_parsers("tags")  # tag (minigit/tags.py)
+    module_parsers("gc")  # gc (minigit/gc.py)
 
     s = cmd("reset", "Reset HEAD, the index or files")
     g = s.add_mutually_exclusive_group()
@@ -384,8 +452,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="reject pushes larger than N bytes (default: 256 MiB)")
 
     s = cmd("server", "Administer a server root: users, tokens, repositories, permissions")
-    ss = s.add_subparsers(dest="server_cmd", metavar="<subcommand>", parser_class=_Parser)
-    _m("serveradmin").add_server_parsers(ss)
+    if s is not _SKIP:
+        ss = s.add_subparsers(dest="server_cmd", metavar="<subcommand>", parser_class=_Parser)
+        _m("serveradmin").add_server_parsers(ss)
 
     # --- plumbing --------------------------------------------------------
     cmd("fsck", "Verify the object store and ref connectivity")
@@ -533,8 +602,10 @@ def cmd_add(ns, cwd):
     if ns.all_ and ns.update:
         raise _usage("add: -A and -u cannot be used together")
     if not specs and not (ns.all_ or ns.update):
-        raise _usage("nothing specified, nothing added",
-                     hint="use 'minigit add <pathspec>...', 'minigit add .' or 'minigit add -A'")
+        # as git: a note, not an error (exit 0), so 'minigit add $files' with no files is harmless
+        _stderr("Nothing specified, nothing added.\n"
+                "hint: use 'minigit add <pathspec>...', 'minigit add .' or 'minigit add -A'")
+        return 0
     extra = {}
     if ns.all_:
         extra["all_"] = True
@@ -546,7 +617,7 @@ def cmd_add(ns, cwd):
 def cmd_rm(ns, cwd):
     paths = list(ns.paths) + list(ns.after)
     if not paths:
-        raise _usage("rm: at least one path is required")
+        raise _E("FatalError")("No pathspec was given. Which files should I remove?")
     lines = _m("ops").rm(_repo(cwd), paths, cwd, cached=ns.cached, recursive=ns.recursive,
                          force=ns.force)
     _say("\n".join(lines))
@@ -562,7 +633,11 @@ def cmd_status(ns, cwd):
     view = getattr(_m("ops"), "status_view", None)
     if view is not None:
         st = view(repo, st, cwd)  # cwd-relative paths, collapsed untracked dirs (as git shows them)
-    _say(status.format_status_porcelain(st) if ns.short else status.format_status_long(st))
+    if ns.short:
+        _say(status.format_status_porcelain(st))
+        return
+    cfg = getattr(repo, "config", None)   # advice.statusHints=false drops the "(use ...)" lines, as in git
+    _say(status.format_status_long(st, hints=cfg.get_bool("advice.statusHints", True) if cfg is not None else True))
 
 
 def cmd_diff(ns, cwd):
@@ -581,8 +656,16 @@ def cmd_diff(ns, cwd):
 
 def cmd_commit(ns, cwd):
     extra = {"amend": True} if ns.amend else {}
-    _sha, summary = _m("ops").commit(_repo(cwd), list(ns.messages), all_=ns.all_,
-                                     allow_empty=ns.allow_empty, stat=True, **extra)
+    ops = _m("ops")
+    repo = _repo(cwd)
+    try:
+        _sha, summary = ops.commit(repo, list(ns.messages), all_=ns.all_,
+                                   allow_empty=ns.allow_empty, stat=True, **extra)
+    except _E("NothingToCommit") as e:
+        # as git: the status of the work tree, ending with why nothing was committed, on stdout
+        report = getattr(ops, "nothing_to_commit_report", None)
+        _say(report(repo, e.message, cwd) if report else e.message)
+        return 1
     _say(summary)
 
 
@@ -635,6 +718,8 @@ def cmd_log(ns, cwd):
         revs, paths = _split_log_args(repo, cwd, list(ns.revs))
     rel = _rel_paths(repo, cwd, paths)
     extra = {"paths": rel} if rel else {}
+    if ns.graph:
+        extra["topo"] = True   # as git, --graph implies --topo-order
     entries = history.log_entries(repo, revs or None, ns.max_count, all_refs=ns.all_, **extra)
     fmt = {}
     if ns.graph:
@@ -690,21 +775,46 @@ def cmd_branch(ns, cwd):
         _say(ops.format_branch_list(items, bool(ns.verbose)))
 
 
-def cmd_switch(ns, cwd):
+def _switch(repo, target, *, advice: bool = False, **kw) -> None:
+    """``ops.switch`` with git's output: the notes ("Switched to ...", "HEAD is now at ...", a
+    detached HEAD left behind) go to stderr, the changes the work tree carries over to stdout.
+    ``advice``: ``checkout <rev>`` explains the detached HEAD it creates from a branch."""
     ops = _m("ops")
+    detached = getattr(ops, "detached_head", None)
+    before = detached(repo) if detached else None
+    branch_before = repo.refs.current_branch() if detached else None
+    message = ops.switch(repo, target, **kw)
+    if detached:
+        # 'switch -c B' with no start point leaves the work tree alone, and git lists nothing then
+        changes = "" if kw.get("create") and kw.get("start") is None else ops.local_changes(repo)
+        if changes:
+            _say(changes)
+        notes = [ops.leaving_detached_head(repo, before)]
+        if advice and before is None and branch_before is not None and target is not None:
+            notes.append(ops.detach_advice(repo, target, branch_before))
+        for note in notes:
+            if note:
+                _stderr(note)
+    if message:
+        _stderr(message)
+
+
+def cmd_switch(ns, cwd):
     args = list(ns.args)
     if ns.create:
         if len(args) > 1:
             raise _usage("switch -c takes at most one start point")
-        _say(ops.switch(_repo(cwd), None, create=ns.create, start=args[0] if args else None))
+        _switch(_repo(cwd), None, create=ns.create, start=args[0] if args else None)
     elif ns.detach:
         if len(args) > 1:
             raise _usage("switch --detach takes one revision")
-        _say(ops.switch(_repo(cwd), args[0] if args else "HEAD", detach=True))
+        _switch(_repo(cwd), args[0] if args else "HEAD", detach=True)
     else:
+        if not args:
+            raise _E("FatalError")("missing branch or commit argument")
         if len(args) != 1:
             raise _usage("switch: expected exactly one branch name")
-        _say(ops.switch(_repo(cwd), args[0]))
+        _switch(_repo(cwd), args[0])
 
 
 def cmd_checkout(ns, cwd):
@@ -714,7 +824,7 @@ def cmd_checkout(ns, cwd):
     if ns.branch:
         if ns.dashdash or len(args) > 1:
             raise _usage("checkout -b takes at most one start point")
-        _say(ops.switch(repo, None, create=ns.branch, start=args[0] if args else None))
+        _switch(repo, None, create=ns.branch, start=args[0] if args else None)
         return
     if ns.dashdash:
         if len(args) > 1:
@@ -732,13 +842,21 @@ def cmd_checkout(ns, cwd):
     if target in ("HEAD", "@") and repo.head_commit() is not None:
         return  # as in git: 'checkout HEAD' changes nothing and keeps the branch attached
     if _is_branch_or_dwim(repo, target):
-        _say(ops.switch(repo, target))
+        _switch(repo, target)
     elif _is_rev(repo, target):
-        _say(ops.switch(repo, target, detach=True))
+        _switch(repo, target, detach=True, advice=True)
     elif _path_exists(cwd, target):
         _restore_paths(repo, cwd, None, [target])
     else:
-        _say(ops.switch(repo, target))  # raises the library's error
+        try:
+            _switch(repo, target)  # raises the library's error (e.g. several remotes have the branch)
+        except _E("FatalError") as e:
+            if not e.message.startswith("invalid reference"):
+                raise
+            # git's wording: 'checkout x' that names no branch, revision or file is a pathspec error
+            raise _E("MinigitError")(f"pathspec '{target}' did not match any file(s) known to minigit",
+                                     hint=f"no branch, tag, commit or file is named '{target}' "
+                                          "('minigit branch -a' lists the branches)") from None
 
 
 def cmd_merge(ns, cwd):
@@ -775,14 +893,19 @@ def cmd_reset(ns, cwd):
         _say(ops.reset(repo, args[0] if args else "HEAD", mode))
         return
     if mode != "mixed":
-        raise _usage("reset: --soft/--hard cannot be used with paths")
+        raise _E("FatalError")(f"Cannot do {mode} reset with paths.",
+                               hint=f"'minigit restore --source {rev} --staged --worktree -- <paths>' "
+                                    "resets both the index and the files")
     ops.reset_paths(repo, rev, paths, cwd)
+    unstaged = getattr(ops, "unstaged_after_reset", None)
+    if unstaged:
+        _say(unstaged(repo))
 
 
 def cmd_restore(ns, cwd):
     paths = list(ns.paths) + list(ns.after)
     if not paths:
-        raise _usage("restore: at least one path is required")
+        raise _E("FatalError")("you must specify path(s) to restore")
     _m("ops").restore(_repo(cwd), paths, cwd, staged=ns.staged,
                       worktree=(True if ns.worktree else None), source=ns.source)
 
@@ -840,6 +963,8 @@ def cmd_pull(ns, cwd):
         changes, outcome = remote.pull(repo, ns.remote, ns.branch, allow_unrelated=ns.allow_unrelated,
                                        rebase=ns.rebase)
     except _E("MinigitError") as e:
+        if getattr(e, "fetch_changes", None):  # the fetch worked, then the merge/rebase refused
+            _say(remote.format_fetch(remote.remote_url(repo, name), e.fetch_changes))
         _say("\n".join(getattr(e, "lines", [])))   # what a stopped rebase did before the refusal
         raise
     _say(remote.format_fetch(remote.remote_url(repo, name), changes))
@@ -915,6 +1040,8 @@ def cmd_fsck(ns, cwd):
     if problems:
         _say("\n".join(problems))
         if any(not p.startswith("warning: ") for p in problems):
+            _stderr("hint: copy a good version of each damaged or missing object from another clone into "
+                    ".minigit/objects/; 'minigit gc --prune' refuses to delete anything until fsck is clean")
             return 1
     return 0
 
@@ -1031,17 +1158,51 @@ def _resolve_cwd(dirs: Sequence[str]) -> str:
     for d in dirs:
         cwd = os.path.abspath(os.path.join(cwd, d))
         if not os.path.isdir(cwd):
-            raise _E("MinigitError")(f"cannot change to '{d}': No such file or directory")
+            raise _E("FatalError")(f"cannot change to '{d}': No such file or directory")
     return cwd
 
 
+def _unknown_command(name: str) -> int:
+    """git's "'x' is not a git command" with the closest command names; exit 1 like git."""
+    import difflib
+
+    def score(c: str) -> float:
+        return difflib.SequenceMatcher(None, name, c).ratio()
+
+    close = difflib.get_close_matches(name, sorted(_COMMANDS), n=3, cutoff=0.6)
+    close = [c for c in close if score(c) >= score(close[0]) - 0.05] if close else []  # git: the best only
+    text = f"minigit: '{name}' is not a minigit command. See 'minigit --help'."
+    if close:
+        head = "The most similar command is" if len(close) == 1 else "The most similar commands are"
+        text += "\n\n" + head + "".join(f"\n\t{c}" for c in close)
+    _stderr(text)
+    return 1
+
+
+def _parser_for(argv: list[str]) -> argparse.ArgumentParser | None:
+    """The parser ``argv`` needs: only its command's subparser when that is enough (fast path)."""
+    i = _command_index(argv)
+    if i is None:
+        # no command: --version needs no subcommands; help and usage text list them all
+        quick = "--version" in argv and not ({"-h", "--help"} & set(argv))
+        return build_parser("" if quick else None)
+    name = argv[i]
+    if name not in _COMMANDS:
+        return None
+    if {"-h", "--help"} & set(argv[:i]):
+        return build_parser()  # 'minigit -h status' prints the top-level help
+    return build_parser(name)
+
+
 def _run(argv: list[str]) -> int:
-    parser = build_parser()
     before, after, has_dd = _split_dashdash(argv)
     if not before:
-        parser.print_help()
-        return 2
+        build_parser().print_help()
+        return 1
     before = _expand_log_count(before)
+    parser = _parser_for(before)
+    if parser is None:
+        return _unknown_command(before[_command_index(before)])
     ns, extras = parser.parse_known_args(before)
     if extras:
         # Report unknown options with the failing subcommand's usage, not the top-level one.
@@ -1050,18 +1211,98 @@ def _run(argv: list[str]) -> int:
     ns.after = after
     ns.dashdash = has_dd
     if ns.command is None:
-        parser.print_help()
-        return 2
+        build_parser().print_help()
+        return 1
     if has_dd and ns.command not in _TAKES_PATHS_AFTER_DASHDASH:
         # Never silently drop arguments: e.g. 'commit -- a' must not commit everything.
         raise _usage(f"{ns.command}: paths after '--' are not supported")
     cwd = _resolve_cwd(ns.chdir)
+    global _CWD
+    _CWD = cwd
     rc = _COMMANDS[ns.command](ns, cwd)
     return 0 if rc is None else int(rc)
 
 
+
+def _hint_lines(hint: str) -> str:
+    return "\n".join("hint: " + line if line else "hint:" for line in hint.split("\n"))
+
+
+_CWD: str | None = None  # the command's directory, for the hints below
+
+
+def _revision_hint(message: str) -> str | None:
+    """For "unknown revision 'mian'": "did you mean 'main'?" (the closest branch, tag or remote branch)."""
+    import re
+
+    m = re.match(r"unknown revision '([^'~^:@]+)'$", message)
+    if not m or _CWD is None:
+        return None
+    name = m.group(1)
+    try:
+        repo = _repo(_CWD)
+        names = [r.split("/", 2)[2] if r.startswith(("refs/heads/", "refs/tags/")) else r[len("refs/remotes/"):]
+                 for r in repo.refs.list("refs/")]
+    except Exception:  # a hint must never turn one error into another
+        return None
+    import difflib
+
+    close = difflib.get_close_matches(name, sorted(set(names)), n=1, cutoff=0.75)
+    return f"did you mean '{close[0]}'?" if close else None
+
+
+def _report(e) -> int:
+    """Print a MinigitError git-style ('fatal:' for exit 128, else 'error:') and return its exit code."""
+    code = getattr(e, "exit_code", 1)
+    code = int(code) if code else 1
+    message = getattr(e, "message", None) or str(e)
+    prefix = getattr(e, "prefix", None)
+    if prefix is None:  # an error class without the attribute (tests' fakes)
+        prefix = "fatal" if code == 128 else "error"
+    _stderr(f"{prefix}: {message}" if prefix else message)
+    hint = getattr(e, "hint", None)
+    if not hint and type(e).__name__ == "RevisionError":
+        hint = _revision_hint(message)
+    if hint:
+        _stderr(_hint_lines(hint))
+    return code
+
+
+def _os_error_text(e: OSError) -> str:
+    """'fatal: ...' plus a hint for an OSError no library function turned into a MinigitError."""
+    import errno
+
+    where = f": '{e.filename}'" if e.filename else ""
+    reason = e.strerror or str(e)
+    hint = None
+    if e.errno == errno.ENOSPC:
+        reason = "no space left on device"
+        hint = ("free some disk space and run the command again; 'minigit gc' removes temporary files "
+                "a failed write left in the object store")
+    elif e.errno == errno.EROFS:
+        reason = "read-only file system"
+    elif isinstance(e, PermissionError):
+        reason = "permission denied"
+        hint = ("check that the file or directory is writable by you"
+                + ("; another program (an editor, a virus scanner, a sync client) may also hold it "
+                   "open: close it and try again" if os.name == "nt" else ""))
+    elif e.errno == errno.EIO:
+        reason = "input/output error (the disk or network share may be failing)"
+    text = f"fatal: {reason}{where}"
+    return text + ("\n" + _hint_lines(hint) if hint else "")
+
+
+def _silence_stdout() -> None:
+    """After a broken pipe: point stdout at devnull so the interpreter's final flush stays quiet."""
+    try:
+        fd = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(fd, sys.stdout.fileno())
+    except Exception:
+        pass
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    """Run the CLI and return the exit code (0 ok, 1 MinigitError, 2 usage)."""
+    """Run the CLI and return git's exit code: 0 ok, 1 error, 128 fatal, 129 usage, 130 ctrl-C."""
     if argv is None:
         argv = sys.argv[1:]
     base = _E("MinigitError")
@@ -1075,11 +1316,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         _stderr("interrupted")
         return 130
     except BrokenPipeError:
-        try:
-            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
-        except Exception:
-            pass
-        return 1
+        # 'minigit log | head': the reader went away; like git, stop quietly (128 + SIGPIPE)
+        _silence_stdout()
+        return 141
     except (base, _Fallback) as e:
         if rejected is not _Fallback and isinstance(e, rejected):
             try:
@@ -1090,15 +1329,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 1
             except Exception:
                 pass
-        message = getattr(e, "message", None) or str(e)
-        _stderr(f"error: {message}")
-        hint = getattr(e, "hint", None)
-        if hint:
-            _stderr(f"hint: {hint}")
-        code = getattr(e, "exit_code", 1)
-        return int(code) if code else 1
+        return _report(e)
+    except OSError as e:
+        _debug_traceback()
+        _stderr(_os_error_text(e))
+        return 128
+    except MemoryError:
+        _stderr("fatal: out of memory")
+        return 128
     except Exception as e:  # noqa: BLE001 - last resort
-        if os.environ.get("MINIGIT_DEBUG") == "1":
-            traceback.print_exc()
-        _stderr(f"fatal: internal error: {e}")
-        return 1
+        _debug_traceback()
+        _stderr(f"fatal: internal error: {e}\n"
+                "hint: this is a bug in minigit; run the command again with MINIGIT_DEBUG=1 "
+                "to see where it happened")
+        return 128
+
+
+def _debug_traceback() -> None:
+    if os.environ.get("MINIGIT_DEBUG") == "1":
+        import traceback
+
+        traceback.print_exc()

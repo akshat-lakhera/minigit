@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import heapq
 from collections import deque
-from typing import Iterable, Iterator, Sequence
+from typing import Callable, Iterable, Iterator, Sequence
 
 from .objects import Commit, ObjectStore
 
@@ -104,13 +104,19 @@ def best_merge_base(store: ObjectStore, a: str, b: str) -> str | None:
     return min(bases, key=lambda s: (-commit_time(store, s), s))
 
 
-def topo_walk(store: ObjectStore, starts: Iterable[str]) -> Iterator[tuple[str, Commit]]:
+ParentsOf = Callable[[str, Commit], Sequence[str]]
+
+
+def topo_walk(store: ObjectStore, starts: Iterable[str],
+              parents_of: ParentsOf | None = None) -> Iterator[tuple[str, Commit]]:
     """Kahn's algorithm over the reachable set, newest committer time first.
 
     The heap is keyed ``(-committer_ts, insertion_seq)``, so a parent is never
-    yielded before all of its children.
+    yielded before all of its children. ``parents_of(sha, commit)`` replaces the
+    commit's parents as the edges of the walk (``log -- path``'s simplified history).
     """
     cache: dict[str, Commit] = {}
+    edges = parents_of or (lambda _sha, c: c.parents)
     roots: list[str] = []
     for s in starts:
         if s not in roots:
@@ -125,7 +131,7 @@ def topo_walk(store: ObjectStore, starts: Iterable[str]) -> Iterator[tuple[str, 
         queue.append(s)
     while queue:
         sha = queue.popleft()
-        for p in _commit(store, sha, cache).parents:
+        for p in edges(sha, _commit(store, sha, cache)):
             if p in indeg:
                 indeg[p] += 1
             else:
@@ -141,7 +147,7 @@ def topo_walk(store: ObjectStore, starts: Iterable[str]) -> Iterator[tuple[str, 
         _, _, sha = heapq.heappop(heap)
         c = _commit(store, sha, cache)
         yield sha, c
-        for p in c.parents:
+        for p in edges(sha, c):
             indeg[p] -= 1
             if indeg[p] == 0:
                 heapq.heappush(heap, (-_commit(store, p, cache).committer.timestamp, seq, p))
@@ -149,7 +155,8 @@ def topo_walk(store: ObjectStore, starts: Iterable[str]) -> Iterator[tuple[str, 
 
 
 def topo_order(store: ObjectStore, starts: Iterable[str],
-               excluded: frozenset[str] | set[str] = frozenset()) -> list[tuple[str, Commit]]:
+               excluded: frozenset[str] | set[str] = frozenset(),
+               parents_of: ParentsOf | None = None) -> list[tuple[str, Commit]]:
     """git's ``--topo-order`` over the commits reachable from ``starts`` but not in ``excluded``.
 
     Newest first, no parent before all of its children, like ``topo_walk``; but instead of
@@ -160,6 +167,7 @@ def topo_order(store: ObjectStore, starts: Iterable[str],
     order ``rebase`` replays commits in (``git rev-list --reverse --topo-order``).
     """
     cache: dict[str, Commit] = {}
+    edges = parents_of or (lambda _sha, c: c.parents)
     roots: list[str] = []
     for s in starts:
         if s not in roots and s not in excluded:
@@ -173,7 +181,7 @@ def topo_order(store: ObjectStore, starts: Iterable[str],
         queue.append(s)
     while queue:
         sha = queue.popleft()
-        for p in _commit(store, sha, cache).parents:
+        for p in edges(sha, _commit(store, sha, cache)):
             if p in excluded:
                 continue
             if p in indeg:
@@ -189,7 +197,7 @@ def topo_order(store: ObjectStore, starts: Iterable[str],
         sha = stack.pop()
         c = _commit(store, sha, cache)
         out.append((sha, c))
-        for p in c.parents:
+        for p in edges(sha, c):
             if p in indeg:
                 indeg[p] -= 1
                 if indeg[p] == 0:

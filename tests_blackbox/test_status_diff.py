@@ -205,15 +205,24 @@ class StatusBasicsTest(MinigitCase):
 
     def test_unborn_repo_long_format_exact(self):
         self.init()
+        # git's layout and hints, with "minigit" in the commands
         self.assertEqual(self.long_status(),
-                         "On branch main\n\nNo commits yet\n\nnothing to commit, working tree clean\n")
+                         "On branch main\n\nNo commits yet\n\n"
+                         'nothing to commit (create/copy files and use "minigit add" to track)\n')
         self.assertEqual(self.mg("status", "--porcelain").out, b"")
         self.write("f", "x\n")
         self.assertEqual(self.long_status(),
-                         "On branch main\n\nNo commits yet\n\nUntracked files:\n\tf\n")
+                         "On branch main\n\nNo commits yet\n\nUntracked files:\n"
+                         '  (use "minigit add <file>..." to include in what will be committed)\n\tf\n\n'
+                         'nothing added to commit but untracked files present (use "minigit add" to track)\n')
         self.mg("add", "f")
         self.assertEqual(self.long_status(),
-                         "On branch main\n\nNo commits yet\n\nChanges to be committed:\n\tnew file:   f\n")
+                         "On branch main\n\nNo commits yet\n\nChanges to be committed:\n"
+                         '  (use "minigit rm --cached <file>..." to unstage)\n\tnew file:   f\n\n')
+        # advice.statusHints=false drops the hint lines, as in git
+        self.mg("config", "advice.statusHints", "false")
+        self.assertEqual(self.long_status(),
+                         "On branch main\n\nNo commits yet\n\nChanges to be committed:\n\tnew file:   f\n\n")
 
     def test_clean_after_commit_and_flag_aliases(self):
         self.init()
@@ -261,20 +270,24 @@ class StatusBasicsTest(MinigitCase):
         self.write("n.txt", "n\n"); self.mg("add", "n.txt"); self.write("n.txt", "n2\n")
         self.write("b.txt", "b2\n")
         self.write("u.txt", "u\n")
-        self.assertEqual(self.long_status(), (
+        self.assertEqual(self.long_status(), (   # byte for byte what git prints (with "minigit")
             "On branch main\n"
-            "\n"
             "Changes to be committed:\n"
+            '  (use "minigit restore --staged <file>..." to unstage)\n'
             "\tmodified:   a.txt\n"
             "\tdeleted:    c.txt\n"
             "\tnew file:   n.txt\n"
             "\n"
             "Changes not staged for commit:\n"
+            '  (use "minigit add <file>..." to update what will be committed)\n'
+            '  (use "minigit restore <file>..." to discard changes in working directory)\n'
             "\tmodified:   b.txt\n"
             "\tmodified:   n.txt\n"
             "\n"
             "Untracked files:\n"
-            "\tu.txt\n"))
+            '  (use "minigit add <file>..." to include in what will be committed)\n'
+            "\tu.txt\n"
+            "\n"))
 
     def test_untracked_files_listed_individually_and_empty_dirs_hidden(self):
         self.init()
@@ -408,7 +421,7 @@ class StatusErrorsTest(MinigitCase):
         outside = os.path.join(self.tmp, "not-a-repo")
         os.makedirs(outside)
         r = self.mg("status", cwd=outside, check=False)
-        self.assertEqual(r.rc, 1, str(r))
+        self.assertEqual(r.rc, 128, str(r))   # git: fatal
         self.assertIn("not a minigit repository", r.errtext)
         bare = os.path.join(self.tmp, "bare.git")
         self.mg("init", "--bare", bare, cwd=self.tmp)
@@ -470,18 +483,22 @@ class StatusConflictTest(MinigitCase):
     def test_unmerged_codes_long_format_and_diff(self):
         self.assertPorcelain(["AA added.txt", "UU both.txt", "M  clean.txt", "DU ours_del.txt",
                               "UD theirs_del.txt"])
-        self.assertEqual(self.long_status(), (
+        self.assertEqual(self.long_status(), (   # git's text; no "unstage" hint during a merge
             "On branch main\n"
             "You have unmerged paths.\n"
+            '  (fix conflicts and run "minigit commit")\n'
+            '  (use "minigit merge --abort" to abort the merge)\n'
             "\n"
             "Changes to be committed:\n"
             "\tmodified:   clean.txt\n"
             "\n"
             "Unmerged paths:\n"
+            '  (use "minigit add/rm <file>..." as appropriate to mark resolution)\n'
             "\tboth added:      added.txt\n"
             "\tboth modified:   both.txt\n"
             "\tdeleted by us:   ours_del.txt\n"
-            "\tdeleted by them: theirs_del.txt\n"))
+            "\tdeleted by them: theirs_del.txt\n"
+            "\n"))
         # SUPERSEDED: git also prints a diff for conflicted files; minigit prints that of `git diff --ours`.
         def vs_ours(p: str, ours: bytes, theirs: bytes) -> bytes:
             marked = b"<<<<<<< HEAD\n" + ours + b"=======\n" + theirs + b">>>>>>> feature\n"
@@ -507,11 +524,13 @@ class StatusConflictTest(MinigitCase):
         self.assertEqual(self.long_status(), (
             "On branch main\n"
             "All conflicts fixed but you are still merging.\n"
+            '  (use "minigit commit" to conclude merge)\n'
             "\n"
             "Changes to be committed:\n"
             "\tmodified:   added.txt\n"
             "\tmodified:   both.txt\n"
-            "\tmodified:   clean.txt\n"))
+            "\tmodified:   clean.txt\n"
+            "\n"))
         self.commit("merged")
         self.assertEqual(self.long_status(), "On branch main\nnothing to commit, working tree clean\n")
 
@@ -538,7 +557,10 @@ class StatusCraftedStagesTest(MinigitCase):
             self.write(n, "x\n")
         self.assertEqual(self.porcelain(), ["AU au.txt", "A  ok.txt", "UA ua.txt", "UU uu.txt"])
         text = self.long_status()
-        self.assertIn("Unmerged paths:\n\tadded by us:     au.txt\n\tadded by them:   ua.txt\n"
+        self.assertIn("Unmerged paths:\n"
+                      '  (use "minigit restore --staged <file>..." to unstage)\n'   # no MERGE_HEAD here
+                      '  (use "minigit add <file>..." to mark resolution)\n'
+                      "\tadded by us:     au.txt\n\tadded by them:   ua.txt\n"
                       "\tboth modified:   uu.txt\n", text)
         # REAL BUG (fixed): ua.txt has no stage 2, so like `git diff --ours` it gets no diff against stage 3.
         self.assertEqual(self.diff(), b"* Unmerged path au.txt\n* Unmerged path ua.txt\n* Unmerged path uu.txt\n")
@@ -581,18 +603,22 @@ class StatusBranchHeaderTest(MinigitCase):
         self._set_tracking(c2)
         self.assertIn("Your branch is ahead of 'origin/main' by 1 commit.\n", self.long_status())
         self._set_tracking(c1)
-        self.assertIn("Your branch is ahead of 'origin/main' by 2 commits.\n", self.long_status())
+        self.assertIn("Your branch is ahead of 'origin/main' by 2 commits.\n"
+                      '  (use "minigit push" to publish your local commits)\n\n', self.long_status())
         self.mg("reset", "--hard", c1)
         self._set_tracking(c3)
         self.assertEqual(self.long_status(), "On branch main\nYour branch is behind 'origin/main' by 2 "
-                                             "commits, and can be fast-forwarded.\n" + clean)
+                                             "commits, and can be fast-forwarded.\n"
+                                             '  (use "minigit pull" to update your local branch)\n' + clean)
         self._set_tracking(c2)
         self.assertIn("Your branch is behind 'origin/main' by 1 commit, and can be fast-forwarded.\n",
                       self.long_status())
         self.write("f", "side\n")
         self.mg("commit", "-a", "-m", "side")
         self.assertIn("Your branch and 'origin/main' have diverged,\n"
-                      "and have 1 and 1 different commits each, respectively.\n", self.long_status())
+                      "and have 1 and 1 different commits each, respectively.\n"
+                      '  (use "minigit pull" if you want to integrate the remote branch with yours)\n',
+                      self.long_status())
         self.mg("switch", "--detach", "HEAD")
         self.assertNotIn("origin/main", self.long_status())
 
@@ -701,7 +727,7 @@ class DiffFormatTest(MinigitCase):
             "change far from the missing EOL": (ten, ten.replace(b"l2\n", b"X\n"),
                                                 b"@@ -1,5 +1,5 @@\n l1\n-l2\n+X\n l3\n l4\n l5\n"),
             "context reaches the missing EOL": (ten, ten.replace(b"l9\n", b"X\n"),
-                                                b"@@ -6,5 +6,5 @@\n l6\n l7\n l8\n-l9\n+X\n l10\n" + nl),
+                                                b"@@ -6,5 +6,5 @@ l5\n l6\n l7\n l8\n-l9\n+X\n l10\n" + nl),
         }
         for i, (label, (old, new, hunks)) in enumerate(cases.items()):
             with self.subTest(label):
@@ -711,17 +737,19 @@ class DiffFormatTest(MinigitCase):
         def lines(n):
             return b"".join(b"l%d\n" % i for i in range(1, n + 1))
         L20, L10, L8 = lines(20), lines(10), lines(8)
+        # after the second "@@": the nearest line above the hunk that starts with a letter (git's
+        # default function-name rule; every "lN" line qualifies)
         cases = {
             "gap of 6 merges": (L20, L20.replace(b"l5\n", b"X\n").replace(b"l12\n", b"Y\n"),
-                                [b"@@ -2,14 +2,14 @@"]),
+                                [b"@@ -2,14 +2,14 @@ l1"]),
             "gap of 7 splits": (L20, L20.replace(b"l5\n", b"X\n").replace(b"l13\n", b"Y\n"),
-                                [b"@@ -2,7 +2,7 @@", b"@@ -10,7 +10,7 @@"]),
+                                [b"@@ -2,7 +2,7 @@ l1", b"@@ -10,7 +10,7 @@ l9"]),
             "far apart": (L20, L20.replace(b"l2\n", b"X\n").replace(b"l18\n", b"Y\n"),
-                          [b"@@ -1,5 +1,5 @@", b"@@ -15,6 +15,6 @@"]),
-            "pure insert": (L10, L10.replace(b"l5\n", b"l5\nins\n"), [b"@@ -3,6 +3,7 @@"]),
-            "pure delete": (L10, L10.replace(b"l5\n", b""), [b"@@ -2,7 +2,6 @@"]),
+                          [b"@@ -1,5 +1,5 @@", b"@@ -15,6 +15,6 @@ l14"]),
+            "pure insert": (L10, L10.replace(b"l5\n", b"l5\nins\n"), [b"@@ -3,6 +3,7 @@ l2"]),
+            "pure delete": (L10, L10.replace(b"l5\n", b""), [b"@@ -2,7 +2,6 @@ l1"]),
             "insert at top": (lines(5), b"new\n" + lines(5), [b"@@ -1,3 +1,4 @@"]),
-            "delete at end": (L8, lines(6), [b"@@ -4,5 +4,3 @@"]),
+            "delete at end": (L8, lines(6), [b"@@ -4,5 +4,3 @@ l3"]),
             "file emptied": (b"a\nb\n", b"", [b"@@ -1,2 +0,0 @@"]),
             "empty file filled": (b"", b"a\n", [b"@@ -0,0 +1 @@"]),
             "single line": (b"x\n", b"y\n", [b"@@ -1 +1 @@"]),
@@ -944,12 +972,12 @@ class DiffFormsTest(MinigitCase):
         self.mg("add", "f")
         self.commit("c1")
         r = self.mg("diff", "nosuchrev", check=False)
-        self.assertEqual(r.rc, 1, str(r))
+        self.assertEqual(r.rc, 128, str(r))   # git: fatal
         self.assertIn("unknown revision 'nosuchrev'", r.errtext)
         r = self.mg("diff", "HEAD", "HEAD", "HEAD", check=False)
-        self.assertEqual(r.rc, 2, str(r))
+        self.assertEqual(r.rc, 129, str(r))
         r = self.mg("diff", "HEAD~5", check=False)
-        self.assertEqual(r.rc, 1, str(r))
+        self.assertEqual(r.rc, 128, str(r))   # git: fatal
         self.assertEqual(self.diff("HEAD", "HEAD"), b"")
 
 

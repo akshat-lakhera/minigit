@@ -20,10 +20,21 @@ Tests are run from `E:\ideas\minigit` with `python -m unittest discover -s tests
 - **All file content I/O is binary.** There is no newline conversion anywhere. Repo-relative paths are POSIX strings (`a/b.txt`), encoded with `utf-8`/`surrogateescape`.
 - An `Entry` is `tuple[str, str]` = `(mode, sha)`. Modes are the strings `"100644"`, `"100755"` and `"40000"`. A `FlatTree` is `dict[str, Entry]` and holds files only.
 - `ANY = object()` is a sentinel defined in `refs.py`. It means "do not check".
-- Exit codes:
+- Exit codes (git's numbers):
   - 0: success. This includes "Already up to date." and "Everything up-to-date".
-  - 1: any `MinigitError`. This covers refusals, conflicts, rejected pushes and "nothing to commit".
-  - 2: usage error.
+  - 1: a `MinigitError`, printed as `error: <message>`. This covers refusals, conflicts, rejected pushes,
+    "nothing to commit" and an unknown command (`minigit: 'x' is not a minigit command. See 'minigit --help'.`
+    plus `The most similar command is` and the closest names, as git prints them).
+  - 128: a `FatalError` (`NotARepositoryError`, `RevisionError`, `ObjectError`, `LockError`, a pathspec that
+    matches nothing in `add`/`rm`, no identity, a bad config line, `-C` to a missing directory), printed as
+    `fatal: <message>`; also an `OSError` no library code turned into a `MinigitError` (`fatal: permission denied:
+    '<file>'`, `fatal: no space left on device: '<file>'`, each with a `hint:`) and, as a last resort, `fatal:
+    internal error: ...` (with `MINIGIT_DEBUG=1` the traceback too). Never a bare Python traceback.
+  - 129: usage error (argparse usage line plus `error: ...`; a mistyped long option gets `hint: did you mean
+    '--oneline'?`).
+  - 130: interrupted (ctrl-C): `interrupted` on stderr, no traceback. 141: the reader of stdout went away
+    (`minigit log | head`): nothing is printed (Windows reports this as `EINVAL`, handled the same).
+  - Every `hint` line is printed as `hint: ...` (a multi-line hint gets the prefix on each line).
 - Environment variables:
   - `MINIGIT_GLOBAL_CONFIG`: global config path. Default `~/.minigitconfig`.
   - `MINIGIT_CREDENTIALS`: credentials file. Default `~/.minigit-credentials.json`.
@@ -71,7 +82,10 @@ The format is git-style INI with a hand-written parser (do not use `configparser
 - Section lines are `[core]` or `[remote "origin"]`.
 - Entry lines are `\tkey = value`.
 - Lines starting with `#` or `;` are comments.
-- Keys are case-insensitive, and are stored lowercased.
+- Keys are case-insensitive, and are stored lowercased (letters, digits, `-`, `_`).
+- Any other line (a broken `[section` header, a key before the first section, a key with spaces) is refused, as
+  git does: `FatalError("bad config line N in file PATH")` with a hint quoting the line. Skipping it would let the
+  next `config` write drop or mangle it.
 
 The key `remote.origin.url` maps to section `remote`, subsection `origin`, key `url`. It is split at the first dot and the last dot. `user.name` has no subsection.
 
@@ -156,6 +170,9 @@ trailer: 20B sha1 over all preceding bytes
   - `commit()` runs `fsync`, `close`, then `replace_with_retry(lock, path)`.
   - `__exit__` without a commit deletes the lock file.
 - **`replace_with_retry`:** 40 attempts, 25 ms apart, retrying on `PermissionError` (on Windows, readers briefly block the replace).
+- **A damaged current branch is never "unborn":** when `resolve("HEAD")` follows HEAD to a branch file that is empty
+  or holds something other than a commit id, it raises `MinigitError("refs/heads/x is corrupt: ...")` (with a hint)
+  instead of returning None, so the next commit cannot silently start a new root over the lost history.
 - **Ref names** (`check_ref_name`) must start with `refs/` or equal `HEAD`. Rejected:
   - an empty component
   - a component starting with `.` or ending with `.lock`
@@ -182,7 +199,10 @@ trailer: 20B sha1 over all preceding bytes
   - a name, looked up in this order (git's): `refs/<n>` if it starts with `refs/`, then `refs/tags/<n>`, then
     `refs/heads/<n>`, then `refs/remotes/<n>`. So a tag shadows a branch of the same name; `refs/heads/x` names the branch.
   - a hex prefix of at least 4 characters, resolved by listing `objects/xx/`
-- **Suffixes**, applied left to right: `~N`, `^` (= `^1`), `^N`.
+- **Suffixes**, applied left to right: `~N`, `^` (= `^1`), `^N`, and git's peel suffixes `^{}` (follow tags to
+  the first non-tag object), `^{commit}`, `^{tree}` (a commit gives its tree), `^{blob}`, `^{tag}` (the object must
+  be a tag) and `^{object}`, e.g. `HEAD^{tree}`, `v1^{commit}~1`, `HEAD^{tree}:dir`. A type mismatch is
+  `X^{blob}: expected blob type, but the object dereferences to tree type`.
 - `rev:path` resolves to a blob or tree (used by show and cat-file). `A..B` is handled by `diff` (two trees) and by
   `cherry-pick` / `revert` (a commit range, section 6); `resolve_rev` itself never sees it.
 - **Annotated tags are peeled.** `resolve_object("v1")` is the tag object itself (as `git rev-parse v1`), so
@@ -190,8 +210,10 @@ trailer: 20B sha1 over all preceding bytes
   commit: log, show, diff, switch --detach, checkout, merge, rebase, cherry-pick, reset, blame, grep, ...) follows the
   tag (or a chain of tags) to the commit; so do the suffixes (`v1~0`, `v1^0` and `v1~2` name commits) and `v1:path`.
   A tag that names a tree or blob gives `'<x>' is not a commit`.
-- **Errors** (all `RevisionError`):
-  - `unknown revision 'x'`
+- **Errors** (all `RevisionError`, printed as `fatal:`, exit 128):
+  - `unknown revision 'x'`, with a hint saying why where minigit knows: `HEAD~2 (abc1234) is a root commit: the history
+    has no commit before it` for `~N` past the root, `HEAD (abc1234) has 1 parent` for `^N`, `the current branch
+    'main' has no commits yet` on an unborn HEAD, and that the `^{...}` peel syntax is not supported
   - `ambiguous short id 'abcd' (matches N objects)`
   - `'<x>' is not a commit`
   - `path 'p' does not exist in '<rev>'`
@@ -222,19 +244,29 @@ Notation:
 - **Directory, or `.`:** stage every non-ignored file under it, and remove index entries under it whose files are gone.
 - **File:** stage it. A stage-0 entry also clears conflict stages.
 - **Missing but tracked:** remove it from the index.
-- **Explicitly named ignored file** without `-f`: `MinigitError("path 'p' is ignored by .minigitignore (use -f)")`.
-- **No match:** `pathspec 'x' did not match any files`.
+- **Explicitly named ignored files** without `-f`: git's report, printed without a prefix (exit 1) and listing every
+  such path, sorted: `The following paths are ignored by one of your .minigitignore files:\n<p>...` with the hint
+  `Use -f if you really want to add them.` Nothing is staged.
+- **No match:** `FatalError("pathspec 'x' did not match any files")` (exit 128).
 - **`-A` / `--all`:** with no pathspec, stage every change of the whole work tree (new, modified and deleted files) from
   the repository root, whatever `cwd` is; it is `add .` run from the root. With pathspecs it is a plain `add` of them.
 - **`-u` / `--update`:** tracked files only: a modified file is re-staged, a missing one is removed from the index, a
   new file is never staged. No pathspec: the whole tree. With pathspecs: the tracked files under them; a pathspec with
   no tracked file under it is `pathspec 'x' did not match any files`.
-- `-A` together with `-u`, and no pathspec without `-A`/`-u`, are `UsageError`s.
+- `-A` together with `-u` is a `UsageError`. No pathspec without `-A`/`-u` prints git's
+  `Nothing specified, nothing added.` (and a hint) to stderr and exits 0.
 - The whole command is all-or-nothing: the index is written once.
 
 ### rm `[--cached] [-r] [-f] <paths>`
 - Every path must be tracked, and a directory needs `-r`.
-- Without `-f`: refuse if `W != I` or `I != H` with `'p' has staged or local changes (use -f)`. With `--cached`, refuse only when `I` matches neither `H` nor `W`.
+- Without `-f`: refuse if `W != I` or `I != H`; with `--cached`, refuse only when `I` matches neither `H` nor `W`.
+  The refusal is git's (exit 1): one `error:` block per kind, `the following file has staged content different
+  from both the\nfile and the HEAD:` (then `(use -f to force removal)`), `... has changes staged in the index:` and
+  `... has local modifications:` (both then `(use --cached to keep the file, or -f to force removal)`), each path on
+  its own line indented four spaces (`the following files have ...` for several).
+- A path that is not tracked is `FatalError("pathspec 'x' did not match any files")`, a directory without `-r` is
+  `FatalError("not removing 'd' recursively without -r")`, and no path at all is git's
+  `fatal: No pathspec was given. Which files should I remove?`.
 - Remove the index entry. Without `--cached`, also delete the file and prune empty directories.
 
 ### status
@@ -245,29 +277,47 @@ Notation:
   - Untracked: `??`, listed as individual files (no directory collapsing).
   - A staged deletion whose file is still on disk shows both `D ` and `??`.
 - **Porcelain:** one `XY path` line per path, sorted by path.
-- **Long format:**
+- **Long format** (git's text and layout, byte for byte, with `minigit` in the hints):
   ```
   On branch main            | HEAD detached at abc1234
-  No commits yet            (only when unborn, after a blank line)
   Your branch is ahead of 'origin/main' by N commit(s).   | behind ... by M commit(s), and can be fast-forwarded. | have diverged, N and M ... | up to date with 'origin/main'.
+    (use "minigit push" to publish your local commits)    | (use "minigit pull" to update your local branch) | (use "minigit pull" if you want to integrate the remote branch with yours)
   Your branch is based on 'origin/x', but the upstream is gone.     (branch.<b>.remote/merge set, tracking ref missing;
     (use "minigit branch --unset-upstream" to fixup)                 the porcelain output is not affected)
+
   You have unmerged paths.  | All conflicts fixed but you are still merging.   (when MERGE_HEAD)
+    (fix conflicts and run "minigit commit") + (use "minigit merge --abort" to abort the merge) | (use "minigit commit" to conclude merge)
+
+  No commits yet            (only when unborn, after a blank line; a gone upstream is reported right after it)
 
   Changes to be committed:
+    (use "minigit restore --staged <file>..." to unstage)     ("rm --cached" when unborn; no hint during a merge or cherry-pick)
   \tnew file:   p | \tmodified:   p | \tdeleted:    p
 
   Unmerged paths:
+    (use "minigit restore --staged <file>..." to unstage)     (not during a merge or cherry-pick)
+    (use "minigit add <file>..." to mark resolution)          ("add/rm <file>..." as appropriate, with a deleted-by side)
   \tboth modified:   p | both added: | deleted by us: | deleted by them: | added by us: | added by them:
 
   Changes not staged for commit:
+    (use "minigit add <file>..." to update what will be committed)   ("add/rm" when a file is deleted)
+    (use "minigit restore <file>..." to discard changes in working directory)
   \tmodified:   p | \tdeleted:    p
 
   Untracked files:
+    (use "minigit add <file>..." to include in what will be committed)
   \tp
 
-  nothing to commit, working tree clean     (only if all sections are empty)
+  <summary>
   ```
+  The tracking paragraph, the operation-in-progress paragraph (merge, cherry-pick, revert, rebase) and
+  every non-empty section end with one blank line. The closing summary is omitted when something is
+  staged or a merge has no unmerged paths left (git's "committable"); otherwise it is the first of
+  `no changes added to commit (use "minigit add" and/or "minigit commit -a")` (unstaged or unmerged
+  changes), `nothing added to commit but untracked files present (use "minigit add" to track)`,
+  `nothing to commit (create/copy files and use "minigit add" to track)` (unborn) and
+  `nothing to commit, working tree clean`. `advice.statusHints=false` (git's switch) drops every
+  `(use ...)` line and the parenthesised part of the summary.
 
 ### diff
 - **Forms:**
@@ -287,11 +337,13 @@ Notation:
   columns. A binary file shows ` Bin <old> -> <new> bytes` instead of the count and bar (and makes the
   count column at least 3 wide); a mode-only change shows ` | 0`; an exact rename (a deleted and an added
   path with the same blob) is one line `old => new | 0` (`dir/{a => b}.txt` when the names share a
-  directory prefix or suffix) at the new path; an unmerged path shows ` | Unmerged`. The block ends with
-  ` N files changed, X insertions(+), Y deletions(-)`: `1 file changed`, singular `insertion(+)` /
-  `deletion(-)` for 1, and the insertions or deletions part is omitted when it is zero while the other is
-  not (both stay when both are zero). Empty output when nothing changed. `commit`'s summary line uses
-  the same counting (`diff.file_stats`).
+  directory prefix or suffix) at the new path; an unmerged path shows ` | Unmerged` and, in the
+  work-tree form, a second line for the diff against stage 2 that the patch prints (as git). The block
+  ends with ` N files changed, X insertions(+), Y deletions(-)`: `1 file changed`, singular
+  `insertion(+)` / `deletion(-)` for 1, and the insertions or deletions part is omitted when it is zero
+  while the other is not (both stay when both are zero). `Unmerged` lines are not counted; with nothing
+  else the summary is ` 0 files changed`. Empty output when nothing changed. `commit`'s summary line
+  uses the same counting (`diff.file_stats`).
 - **Per changed file:**
   ```
   diff --git a/p b/p
@@ -299,10 +351,14 @@ Notation:
   index <old7>..<new7>[ <mode>]   (0000000 for absent; " <mode>" only when both modes are equal)
   --- a/p | --- /dev/null
   +++ b/p | +++ /dev/null
-  @@ -s[,l] +s[,l] @@
+  @@ -s[,l] +s[,l] @@[ <function line>]
   ```
   - Hunks come from `difflib.SequenceMatcher(None, a, b, autojunk=False).get_grouped_opcodes(3)` over `split_lines` (`keepends`, split on `\n`).
   - Range rules: `,l` is omitted when `l == 1`. When `l == 0`, `start = i1` (else `i1 + 1`).
+  - Function line (git's default funcname rule): the nearest old-side line above the hunk's first line
+    that starts with an ASCII letter, `_` or `$`, cut to 80 bytes and stripped of trailing whitespace,
+    after one space. Only the lines between this hunk and the previous one are searched; when none
+    qualifies, the previous hunk's function line is repeated (none for the first hunk).
   - A line without a final `\n` is followed by `\n\\ No newline at end of file\n`.
   - A NUL byte in the first 8000 bytes of either side prints `Binary files a/p and b/p differ`, after the header lines and with no `---`/`+++` lines.
   - A mode-only change prints the header only.
@@ -314,16 +370,30 @@ Notation:
 1. Hold the index lock. With `-a`, re-stage tracked files that were modified or deleted.
 2. If `U` is non-empty: `cannot commit: unresolved conflicts in: a, b`.
 3. `tree = build_tree(I)`. The parents are `[head]` (or none), plus `MERGE_HEAD` if it exists.
-4. Without a merge and without `--allow-empty`, if tree == parent tree (or the empty tree when unborn): `NothingToCommit("nothing to commit, working tree clean")`.
+4. Without a merge and without `--allow-empty`, if tree == parent tree (or the empty tree when unborn): `NothingToCommit("nothing to commit, working tree clean")`
+   (git's other wordings when the work tree has unstaged or untracked files, or on an empty unborn branch). The CLI
+   prints, as git, the long status (`No commits yet` reads `Initial commit`) ending with that line, to stdout, exit 1.
 5. The message is the `-m` values joined with `"\n\n"`. Otherwise use `MERGE_MSG` with lines starting with `#` dropped. Otherwise: `UsageError("commit message required: use -m")`.
-6. Normalize the message: `rstrip()` + `"\n"`. An empty message gives `aborting commit due to empty commit message`.
+6. Normalize the message as git's default cleanup does (`ops.cleanup_message`, git's `stripspace`): trailing
+   whitespace is removed from every line, runs of blank lines become one, leading and trailing blank lines go, and
+   the message ends with one `"\n"`; `#` lines are kept (they are only dropped from `MERGE_MSG`). Commit ids
+   therefore match git's for the same `-m` text. An empty message gives git's bare line
+   `Aborting commit due to empty commit message.` (exit 1).
 7. Write the object, then `update_head(new, expected=head)`. Remove `MERGE_HEAD` and `MERGE_MSG`.
 8. Return `[main (root-commit) abc1234] subject` or `[main abc1234] subject` (`[detached HEAD abc1234]` when detached).
-- **Identity:** `MINIGIT_AUTHOR_NAME`/`_EMAIL`, else `user.name`/`user.email`. If missing: `please set your identity: minigit config --global user.name "You"; minigit config --global user.email you@example.com`. The time is `MINIGIT_AUTHOR_DATE` or now, with the local tz offset. The committer equals the author.
-- **`--amend`** replaces the HEAD commit `old`. Before the lock: an unborn HEAD is `you have nothing to amend`; an
+   The subject is git's `%s`: the first paragraph of the message with its lines joined by spaces.
+   With `stat=True` (the CLI), git's `print_commit_summary` lines follow: ` Author: Name <email>` when the author is
+   not the committer, ` Date: <date>` for an amend, the shortstat line, then the `--summary` lines
+   ` create mode 100644 p`, ` delete mode 100644 p`, ` mode change 100644 => 100755 p` and
+   ` rename a => b (100%)` (exact renames), in path order. A merge commit and an empty commit get none of the last two.
+- **Identity:** `MINIGIT_AUTHOR_NAME`/`_EMAIL`, else `user.name`/`user.email`. If missing: `FatalError("author identity unknown (user.name and user.email not set)")` (or only the missing
+  one), with a hint that shows the two `minigit config --global ...` commands. The time is `MINIGIT_AUTHOR_DATE` or now, with the local tz offset. The committer equals the author.
+- **`--amend`** replaces the HEAD commit `old`. Before the lock: an unborn HEAD is `fatal: You have nothing to amend.`; an
   operation in progress is `you cannot amend during a merge` (`cherry-pick`, `revert`, `rebase` likewise). Then steps 1
   and 2 as above, and: the parents are `old.parents` (never `MERGE_HEAD`); step 4 is skipped, so an amend that changes
-  nothing is allowed without `--allow-empty`; the message is the `-m` values or else `old.message`; the author is
+  nothing is allowed without `--allow-empty`, but, as in git, an amend whose tree equals its (first) parent's tree
+  (the empty tree for a root commit) needs `--allow-empty`: `You asked to amend the most recent commit, but doing so
+  would make it empty. ...` (bare, exit 1); the message is the `-m` values or else `old.message`; the author is
   `old.author` (name, email, date) and the committer the identity. Write `ORIG_HEAD = old`, then
   `update_head(new, expected=old)`. The summary is `[main abc1234] subject` (never `(root-commit)`), and the stat line
   compares with the kept parent.
@@ -344,23 +414,33 @@ Notation:
       message lines indented 4 spaces
 
   ```
-  There is a blank line between commits.
-- **`--oneline`:** `<sha7>[ (decor)] <subject>`.
+  There is a blank line between commits. As in git, every message line is indented, blank ones
+  included (`"    "`), trailing whitespace is dropped and blank lines before the subject are skipped.
+- **`--oneline`:** `<sha7>[ (decor)] <subject>`, the subject being the first paragraph of the message
+  with its lines joined by spaces (git's rule).
 - An unborn HEAD gives `your current branch 'main' does not have any commits yet`.
-- **Paths** (`-- path...`, relative to the current directory like `diff`'s): only commits whose tree
-  differs from their first parent's tree (the empty tree for a root commit) at one of the paths. A path
-  matches itself and everything under it (`p == s` or `p.startswith(s + "/")`; `.` is the whole tree).
+- **Paths** (`-- path...`, relative to the current directory like `diff`'s): git's default history
+  simplification. A commit is TREESAME to a parent when both trees hold the same entries at every path
+  (a root commit is compared with the empty tree). A TREESAME commit is not shown, and a merge that is
+  TREESAME to one of its parents (the first such parent) is walked through that parent only, so a side
+  branch that brought nothing for the paths is not followed and a merge whose side branch brought the
+  whole change is hidden; a merge that differs from every parent is shown and all its parents are
+  walked. A path matches itself and everything under it (`p == s` or `p.startswith(s + "/")`; `.` is
+  the whole tree).
   Without `--`, git's rule: an argument that is not a revision but exists in the work tree or in the HEAD
   tree is a path, and so is every argument after it; an argument that is both a revision and such a path
   is a `UsageError` (`log: ambiguous argument 'x': both revision and filename`) and must be put after
   `--`. Works with `--oneline`, `-n`, `--all`, `--graph` and `--stat`.
-- **`--graph`:** git's ASCII graph to the left of every line, in the same order as without it (which is
-  git's `--date-order`): `*` for the commit, `|` for the lanes passing by, `\` and `/` where lanes split
+- **`--graph`:** git's ASCII graph to the left of every line. As in git, `--graph` implies
+  `--topo-order` (`graph.topo_order`): Kahn's algorithm off a stack, so after a merge its second-parent
+  lineage is listed before the first parent's instead of interleaving by date. `*` for the commit, `|`
+  for the lanes passing by, `\` and `/` where lanes split
   and join; a merge is `*   <text>` followed by a `|\  ` row, and a lane rejoining its parent prints a
   `|/  ` row. The drawing (`graph.AsciiGraph`) is a port of git's graph.c and is identical to git's for
   one and two lanes, trailing spaces included; the blank line between two commits carries the lanes of
   the second commit. With `-n` the open lanes leave the picture at the bottom, as in git. With paths,
-  every commit is joined to its nearest shown first-parent ancestors. Octopus merges (3+ parents) are
+  every shown commit is joined to its nearest shown ancestors along the simplified history (git's
+  parent rewriting). Octopus merges (3+ parents) are
   drawn (`*-.`) but are not guaranteed to match git.
 - **`--stat`:** after the message of every non-merge commit, a blank line and the `diff --stat` block
   against the first parent (the empty tree for a root commit). A merge commit gets no block, as in git.
@@ -397,11 +477,14 @@ minigit tag -a NAME [REV] -m MSG [-m MSG2]   annotated: a tag object (tagger = t
 minigit tag -f ...                           replace an existing tag: prints "Updated tag 'v1' (was abc1234)"
 minigit tag -d NAME...                       delete: prints "Deleted tag 'v1' (was abc1234)" per tag
 ```
+- The message gets git tag's default cleanup (`ops.cleanup_message(strip_comments=True)`): as for commit, and
+  `#` lines are dropped even with `-m`.
 - REV must name a commit (possibly through a tag): `'<x>' is not a commit` otherwise. A tag of an annotated tag
   stores the tag object (type `tag`), as git does.
-- Errors (exit 1): `tag 'v1' already exists`, `tag 'v1' not found`, `no tag message` (`-a` without `-m`, or an empty
-  message), `'<name>' is not a valid tag name` (`check_ref_name("refs/tags/<name>")`, plus git's refusals of a
-  leading `-`, `HEAD`, `@`, a `refs/` prefix and a trailing `.` or `/`). Usage errors (exit 2): more than two
+- Errors: `fatal: tag 'v1' already exists` (exit 128), `error: tag 'v1' not found.` (exit 1), `no tag message`
+  (`-a` without `-m`, or an empty message; exit 1), `fatal: '<name>' is not a valid tag name` (exit 128, with a hint
+  listing the naming rules; `check_ref_name("refs/tags/<name>")`, plus git's refusals of a
+  leading `-`, `HEAD`, `@`, a `refs/` prefix and a trailing `.` or `/`). Usage errors (exit 129): more than two
   positionals, `-d` without a name, `-n` with a name, `-a`/`-m`/`-f` while listing.
 - `branch` never lists tags. `switch v1` says `a branch is expected, got tag 'v1'`; `checkout v1` and
   `switch --detach v1` detach at the tagged commit. `merge v1` defaults to the message `Merge tag 'v1'`.
@@ -418,10 +501,13 @@ minigit tag -d NAME...                       delete: prints "Deleted tag 'v1' (w
   tracking ref `refs/remotes/REMOTE/BRANCH` must exist: `the requested upstream branch 'origin/x' does not
   exist`. A local branch name makes B track it (remote `.`). Prints `branch 'B' set up to track 'origin/x'.`
 - **`--unset-upstream [B]`:** remove the two keys; `branch 'B' has no upstream information` when neither is set.
-- **`branch N [START]`:** `update(ref, sha, expected=None)`. If it exists: `a branch named 'N' already exists`.
+- **`branch N [START]`:** `update(ref, sha, expected=None)`. If it exists: `fatal: a branch named 'N' already exists`
+  (exit 128); an invalid name is `fatal: 'N' is not a valid branch name` with a hint listing the naming rules; on an
+  unborn branch: `fatal: not a valid object name: 'main'`.
 - **`-d N`:**
   - Refuse the current branch: `cannot delete the branch 'N' you are on`.
-  - Refuse a branch not merged into HEAD (or its upstream tracking ref): `the branch 'N' is not fully merged (use -D)`.
+  - Refuse a branch not merged into HEAD (or its upstream tracking ref): `the branch 'N' is not fully merged`, with
+    the hint `If you are sure you want to delete it, run 'minigit branch -D N'`.
 - `-D` forces the delete.
 
 ### switch / checkout
@@ -432,6 +518,17 @@ minigit tag -d NAME...                       delete: prints "Deleted tag 'v1' (w
   - `checkout REV`: a non-branch REV detaches HEAD and returns a "HEAD is now at ..." note.
   - `checkout [REV] -- paths`: same as `restore` (worktree from the index, or with REV, both from REV).
 - **DWIM:** if no local `B` exists and exactly one `refs/remotes/*/B` does, create `B` there, set the upstream, and switch.
+- **Output (git's):** the notes (`Switched to branch 'B'`, `Switched to a new branch 'B'`, `Already on 'B'`,
+  `HEAD is now at abc1234 subject`) go to stderr. On stdout, the changes the work tree carries over, as
+  `diff HEAD --name-status` lines (`M\tp`, `A\tp` staged new file, `D\tp`); none for `switch -c B` without a start
+  point. Leaving a detached HEAD prints `Previous HEAD position was abc1234 subject`, or, when no ref (and not the
+  new HEAD) reaches the old commit any more, git's `Warning: you are leaving N commit(s) behind, not connected to ...`
+  block with the newest four commits (`... and N more.`) and the `minigit branch <new-branch-name> abc1234` advice.
+  `checkout REV` from a branch first prints a short detached-HEAD note (`Note: switching to 'REV'.`, how to keep
+  commits with `switch -c`, how to go back), unless `advice.detachedHead` is `false`.
+- **Errors:** `switch X` where X names nothing is `fatal: invalid reference: X`; `checkout X` where X is no branch,
+  revision or path is git's `error: pathspec 'X' did not match any file(s) known to minigit` with a hint; `switch`
+  without an argument is `fatal: missing branch or commit argument`; an existing `-c`/`-b` branch is fatal (128).
 - **Preconditions:** while `MERGE_HEAD` exists: `merge in progress; commit or run 'minigit merge --abort'`. `switch -c B` with no start point only changes HEAD's target, which works on an unborn HEAD.
 - **`checkout_tree(repo, index, old, new, force=False)`:**
   1. **Plan.** For each `p` with `old.get(p) != new.get(p)`:
@@ -439,22 +536,26 @@ minigit tag -d NAME...                       delete: prints "Deleted tag 'v1' (w
      - `i = I.get(p)`. The index is OK if `i == old.get(p)` or `i == new.get(p)`.
      - The worktree is OK if `W(p) == i` when `i` exists. When `i` does not exist, it is OK if `W(p) is None` or `W(p) == new.get(p)` (an untracked file in the way is refused).
      - **Dir/file clash:** the target needs file `p` but disk has dir `p/` containing anything not tracked in `old` and removed by this switch, or the target needs `p/x` and disk has an untracked file `p`. Either is a conflict.
-  2. If any conflict was found, raise `CheckoutConflictError(paths=[...])` with the message `Your local changes to the following files would be overwritten by checkout:\n\t<p>...\nPlease commit your changes or restore them before you switch branches.` Nothing has been touched.
+  2. If any conflict was found, raise `CheckoutConflictError(paths=[...])` with the message `Your local changes to the following files would be overwritten by checkout:\n\t<p>...\nPlease commit your changes or stash them before you switch branches.\nAborting` (git's, ending with `Aborting`). Nothing has been touched.
   3. **Apply.** Delete first, deepest paths first (file, index entry, empty directories). Then write: makedirs, write bytes, `chmod 0o755`/`0o644` on POSIX, and `index.put(entry_with_stat)`.
   4. The caller writes the index, then updates HEAD.
 
 ### reset `[--soft|--mixed|--hard] [REV]` / `reset [REV] -- paths`
 - `target = resolve_rev(REV or HEAD)`. Write `ORIG_HEAD = old head`.
-- **soft:** `update_head(target)`. Refused while `MERGE_HEAD` exists.
+- **soft:** `update_head(target)`. Refused while `MERGE_HEAD` exists (`fatal: Cannot do a soft reset in the middle of a merge.`).
 - **mixed (default):** move HEAD, then index := `flatten(target)`. Keep the old stat where `(mode, sha)` is unchanged; otherwise use `mtime_ns=0`. Remove the `MERGE_*` files.
 - **hard:** do what mixed does, then for `p` in T, write the file if `W(p) != T[p]`. For `p` in (old index paths, any stage, ∪ old H) − T, delete the file. Untracked files are never touched.
 - **Path form:** set those index entries to REV's version, or remove them if REV lacks the path. HEAD does not move.
+  `--soft`/`--hard` with paths is `fatal: Cannot do soft reset with paths.` (`hard`), with a hint naming `restore`.
+- **Output:** after a mixed reset (both forms) git's `Unstaged changes after reset:` followed by `M\tp` / `D\tp` for
+  every tracked file that differs from the new index (nothing when none does); `--hard` prints `HEAD is now at ...`.
 
 ### restore `[--staged] [--worktree] [--source REV] <paths>`
 - The default is the worktree from the index.
 - `--staged`: the index from the source (default HEAD), or remove the entry when the source lacks the path.
 - With both flags, both come from the source (default HEAD).
-- A path that is in neither the source nor the index gives `pathspec 'p' did not match`.
+- A path that is in neither the source nor the index gives `pathspec 'p' did not match any file(s) known to minigit`;
+  no path at all is `fatal: you must specify path(s) to restore`.
 
 ### merge-base (`graph.merge_bases`)
 1. `A* = ancestors(a)`, inclusive.
@@ -473,7 +574,8 @@ minigit tag -d NAME...                       delete: prints "Deleted tag 'v1' (w
    - Write `ORIG_HEAD`.
    - Run `checkout_tree(H, T)`.
    - `update_head(theirs, expected=head)`.
-   - Messages: `Updating <h7>..<t7>`, `Fast-forward`.
+   - Messages: `Updating <h7>..<t7>`, `Fast-forward`, then git's diffstat of the change and its
+     `create mode` / `delete mode` / `rename` / `mode change` summary lines (`merge.change_summary`).
 5. **Three-way merge:**
    - `base = best_merge_base`. If it is `None`: `refusing to merge unrelated histories`.
    - `B, O, T` are the flat trees, merged with `merge.merge_trees` (rules below).
@@ -482,8 +584,9 @@ minigit tag -d NAME...                       delete: prints "Deleted tag 'v1' (w
    - `ORIG_HEAD = head`.
    - Index: clean results at stage 0, conflicted paths as stages.
    - Worktree: clean results, plus conflict contents.
-   - **No conflicts:** create a commit with parents `[head, theirs]`, then `update_head(expected=head)`. kind is `"merged"`, message `Merge made by the 'three-way' strategy.`
+   - **No conflicts:** create a commit with parents `[head, theirs]`, then `update_head(expected=head)`. kind is `"merged"`, message `Merge made by the 'ort' strategy.` (git's wording; the content merges are git's), followed by the diffstat and summary lines as for a fast-forward.
    - **Conflicts:** write `MERGE_HEAD` and `MERGE_MSG` (the message plus `\n# Conflicts:\n#\t<p>` lines). kind is `"conflict"`. The messages are the CONFLICT lines plus `Automatic merge failed; fix conflicts and then commit the result.` The CLI exits 1.
+   - As in git, every content merge (both sides changed a file) is preceded by `Auto-merging <p>` in the messages, in path order with the CONFLICT lines (`merge_trees(..., auto_merging=True)`; merge, cherry-pick, revert, rebase and stash apply/pop pass it).
 8. **Default message:**
    - A `refs/heads/x` rev: `Merge branch 'x'`.
    - A `refs/remotes/o/x` rev: `Merge remote-tracking branch 'o/x'`.
@@ -500,18 +603,20 @@ minigit tag -d NAME...                       delete: prints "Deleted tag 'v1' (w
   - **Mode:** if `o.mode == (b.mode if b else o.mode)`, take `t.mode`, else `o.mode`. If both changed differently, keep ours and add a warning message.
   - **Clean:** write the blob and stage 0.
   - **Conflict:** stages 1 (if b), 2 and 3. The worktree gets the marker content. Message `CONFLICT (content): Merge conflict in p`, or `CONFLICT (add/add): Merge conflict in p` when b is None.
-- **Modify/delete** (one side None, the other changed from b): stages 1 plus 2 or 3. The worktree keeps the surviving side's content. Message: `CONFLICT (modify/delete): p deleted in <theirs_label> and modified in HEAD.`, or the mirror form (`deleted in HEAD and modified in <theirs_label>`).
+- **Modify/delete** (one side None, the other changed from b): stages 1 plus 2 or 3. The worktree keeps the surviving side's content. Message: `CONFLICT (modify/delete): p deleted in <theirs_label> and modified in HEAD.  Version HEAD of p left in tree.`, or the mirror form (`deleted in HEAD and modified in <theirs_label>.  Version <theirs_label> of p left in tree.`).
 - **Binary on either side:** stages 1 (if b), 2 and 3. The worktree keeps ours. Message `CONFLICT (binary): Merge conflict in p`.
 - **File/dir clash** (a result path is also a directory prefix of another result path): raise `MinigitError("merge conflict: 'p' is a file on one side and a directory on the other (not supported)")` before touching anything.
 
-**merge3 (bzr-style diff3 on `split_lines`):**
-1. Compute `am = SequenceMatcher(None, base, ours, autojunk=False).get_matching_blocks()`, and `bm` the same way for theirs.
-2. Intersect the matching base ranges to get the sync regions `(bs, be, os, oe, ts, te)`. Add a sentinel at the ends.
-3. Between sync regions, take the chunk `(base[ib:bs], ours[io:os], theirs[it:ts])`:
-   - ours == base → take theirs.
-   - theirs == base → take ours.
-   - ours == theirs → take ours.
-   - Otherwise it is a conflict:
+**merge3 (git's `xdl_merge` at level `XDL_MERGE_ZEALOUS`, on `split_lines`), so results and conflict hunks are git's:**
+1. Diff base→ours and base→theirs with git's histogram diff (what `git merge` uses), then git's hunk compaction
+   (`xdl_change_compact` without the indent heuristic, including its classic re-diff of a moved group that lines up
+   with a change on the other side). `merge3.diff_changes(a, b)` returns the script as `(a_start, a_count, b_start, b_count)`.
+2. Walk both scripts together: a change only one side made is taken; changes of both sides that overlap or touch
+   (adjacent lines) are one conflict, unless both made exactly the same change.
+3. Refine each conflict by diffing ours against theirs inside it: lines both sides share at its start, end or
+   middle leave the markers (a conflict whose sides are equal disappears); conflicts at most three lines apart
+   are joined again.
+4. Write ours with the changes applied; a conflict is:
      ```
      <<<<<<< HEAD
      ours
@@ -519,14 +624,19 @@ minigit tag -d NAME...                       delete: prints "Deleted tag 'v1' (w
      theirs
      >>>>>>> <theirs_label>
      ```
-- The marker newline is `\r\n` if ours' first line ends with `\r\n`, else `\n`.
+- The marker newline is git's per-conflict choice: `\r\n` when the line before the conflict in ours (or its first
+  line) and the same in theirs and base's first line end in `\r\n` (unknown counts as yes, all unknown is `\n`).
 - If a chunk's last line lacks a newline, add one before the next marker.
+- In a virtual merge base (criss-cross merges) the markers are `7 + 2 * depth` characters long, labelled
+  `Temporary merge branch 1` / `2`, as in git.
 
 ### cherry-pick / revert (`cherry.py`, `sequencer.py`)
 `cherry-pick [-n] [-x] [-m N] [--allow-empty] (REV | A..B)...` and `revert [-n] [-m N] (REV | A..B)...`, both with
 `--continue` and `--abort`. Each is a three-way tree merge on top of HEAD (cherry-pick: base = the commit's parent,
 theirs = the commit; revert: base = the commit, theirs = its parent). A conflict leaves stages 1/2/3, markers,
-`MERGE_MSG` and `CHERRY_PICK_HEAD`/`REVERT_HEAD`; revisions still to do are kept in `.minigit/SEQUENCER`.
+`MERGE_MSG` and `CHERRY_PICK_HEAD`/`REVERT_HEAD`; revisions still to do are kept in `.minigit/SEQUENCER`. Each commit made is
+reported as git does: `[branch sha7] subject`, then ` Author: ...` (only when it differs from the committer),
+` Date: <author date>`, the shortstat and the create/delete/mode lines.
 - **Ranges** (`sequencer.expand_revs`): `A..B` is every commit reachable from `B` but not from `A` (`graph.ancestors`
   of `A` subtracted from `graph.topo_walk([B])`), applied oldest first; `A^..B` therefore includes `A`; an empty side
   means `HEAD`. Single revisions and ranges mix freely and are applied in the order given. A merge commit inside a
@@ -538,7 +648,8 @@ theirs = the commit; revert: base = the commit, theirs = its parent). A conflict
 Design and messages: `features/cherry-pick-revert.md`.
 
 ### stash (`stash.py`)
-`stash [push] [-m MSG] [-u]`, `stash (pop | apply | drop | show) [stash@{N} | N]`, `stash list`, `stash clear`.
+`stash [push] [-m MSG] [-u]`, `stash (pop | apply | drop) [stash@{N} | N]`, `stash show [-p] [stash@{N} | N]`
+(the diffstat, as in git; `-p` the patch), `stash list`, `stash clear`. `apply`/`pop` print the status afterwards, as git does.
 `push` shelves the index, the work tree and (with `-u`) untracked files as git-style stash commits and resets
 the work tree to HEAD. The stack is the file `.minigit/stash` (one commit id per line, newest first), not a ref, so
 `branch`, `log --all`, `push` and `clone` never see it. `apply`/`pop` is a three-way tree merge (base = the
@@ -553,7 +664,9 @@ replayed oldest first on top of UPSTREAM (or NEWBASE), so the result is linear. 
 replayed before the second-parent lineage whatever the dates, so the replayed commits get the ids git would give them. Each replay is cherry-pick's
 three-way merge and keeps the author and message; a commit whose patch id is already in the new base is dropped.
 HEAD is detached while replaying and the branch ref moves only after the last commit. A conflict stops the rebase
-(`REBASE_HEAD` and `.minigit/rebase/` hold the state). No interactive mode. Design and messages: `features/rebase.md`.
+(`REBASE_HEAD` and `.minigit/rebase/` hold the state). As in git, a commit that replays cleanly prints no
+`Auto-merging` lines (only the one that stops does), and the commit `--continue` makes is reported with its
+shortstat and create/delete/mode lines. No interactive mode. Design and messages: `features/rebase.md`.
 
 ### blame / grep (`blame.py`, `grep.py`)
 `blame [-L START,END] [-s] [-e] [--porcelain] [REV] PATH` and
@@ -567,7 +680,9 @@ roots: all refs, `HEAD`, `ORIG_HEAD`, `MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_
 (`.minigit/stash`), the rebase state (`.minigit/rebase/{orig-head,onto,todo,done}`), the sequencer state
 (`SEQUENCER`: `orig_head` and `todo`) and every blob in the index. The walk is `pack.closure`; when a root names a
 missing or corrupt object, or a state file is not made of ids, the command fails with `error: cannot prune: ...`
-(exit 1) and nothing at all is deleted. Unreachable objects written within the last hour are kept unless `--force`
+(exit 1) and nothing at all is deleted. A ref file that holds neither a commit id nor `ref: ...` also stops the
+prune (`cannot prune: ref refs/heads/x: '...' is not a commit id`): that branch's history would otherwise look
+unreachable. Unreachable objects written within the last hour are kept unless `--force`
 is given, so a commit or push in flight in another process cannot lose objects. Output: `Removed N temporary files`
 and/or `Pruned N unreachable objects` (only the non-zero lines, in that order), else `Nothing to clean`. `fsck`
 reports every temporary file as `warning: temporary file objects/xx/tmp-... (run 'minigit gc')`; warnings alone
@@ -601,6 +716,9 @@ leave its exit code at 0.
   2. The URL userinfo (`http://alice:TOK@host:port/proj`).
   3. The credentials file: JSON `{"http://host:port": {"user": "...", "token": "..."}, "http://host:port|alice": {...}}`. A URL with a user but no token (`http://alice@host:port/proj`) uses the `scheme://host:port|alice` entry; a URL without a user uses the host default `scheme://host:port`.
 - **Storing credentials:** `clone` and `remote add` strip the userinfo from the stored URL (keeping `user@`) and save the token under `scheme://host:port|user` only. *(Integration, QA bug 1)* Only `minigit login URL --user U --token T` writes the host default (and the `|U` entry), so a `user:token@` URL used once never changes the identity of other clones of that server (chmod 600 on POSIX).
+- **Tokens are never printed:** a URL that still carries a token (a hand-edited `remote.<n>.url`) is shown as
+  `http://alice:***@host:port/proj` in `remote -v`, the `To`/`From` lines of push and fetch, and every error message
+  about a URL (`transport.redact_url`). `remote get-url` prints the configured value as it is.
 
 ### 7.2 HTTP protocol v1
 - **Server:** `ThreadingHTTPServer`, `daemon_threads=True`, `protocol_version = "HTTP/1.0"`. Every response sets `Content-Length`.
@@ -726,7 +844,7 @@ Readers take no lock: ref files are replaced atomically, and objects never chang
 
 ### 7.5 Client flows
 - **`clone URL [DIR]`:**
-  1. DIR defaults to the last URL path component (with `.git` stripped). A non-empty DIR gives `destination 'x' already exists and is not empty`.
+  1. DIR defaults to the last URL path component (with `.git` stripped). A non-empty DIR gives git's `destination path 'x' already exists and is not an empty directory`.
   2. `init`, then remote `origin`, then fetch.
   3. Branch = `info.head` if that ref exists, else `main` if present, else the first in sorted order.
   4. Create `refs/heads/<b>` = `origin/<b>`, set `branch.<b>.remote=origin` and `branch.<b>.merge=refs/heads/<b>`, point HEAD at it, and run `checkout_tree({}, T)` + write the index.
@@ -747,7 +865,10 @@ Readers take no lock: ref files are replaced atomically, and objects never chang
      - ` ! [rejected]        v1 -> v1 (would clobber existing tag)`
 - **`pull [--rebase | --no-rebase] [REMOTE [BRANCH]]`:**
   1. `fetch`.
-  2. The upstream is `branch.<cur>.merge`, else the same branch name. The tracking ref must exist: `no upstream 'origin/x' (push with -u first)`.
+  2. The upstream is `branch.<cur>.merge`, else the same branch name. The tracking ref must exist: `no upstream 'origin/x' (push with -u first)`
+     (hint: `publish it with 'minigit push -u origin x', or say what to merge: 'minigit pull origin <branch>'`).
+     When the merge (or rebase) refuses after the fetch, for example over local changes, the fetch lines are still
+     printed first, as git does: the tracking refs did move (`MinigitError.fetch_changes`).
   3. `merge.merge(repo, "refs/remotes/<r>/<b>", label="<r>/<b>", message="Merge branch '<b>' of <url>")`.
   - **`--rebase`** (`--no-rebase` is the default): step 3 becomes `rebase.start(repo, "<r>/<b>")`, so the current
     branch's own commits are replayed on top of the fetched branch (features/rebase.md). Before the fetch the
@@ -759,12 +880,15 @@ Readers take no lock: ref files are replaced atomically, and objects never chang
     `CONFLICT`/`Could not apply` lines and hints; `status` reports the rebase); `rebase --continue`, `--skip`
     and `--abort` finish it. The outcome's `kind` is `"up-to-date"`, `"fast-forward"`, `"rebased"` or `"conflict"`.
 - **`push [-u] [--force] [--delete] [REMOTE [SRC[:DST]]]`:**
-  1. Default: the current branch to the same name. A detached HEAD needs `SRC:DST`.
+  1. Default: the current branch to the same name. A detached HEAD needs `SRC:DST`. `push REMOTE HEAD` (or `@`)
+     means the same as no refspec (git's meaning), never a branch named `HEAD`; a `HEAD` destination branch
+     (`main:HEAD`) is a usage error, and the server answers 400 to an update that would create `refs/heads/HEAD`.
      **Tags:** `SRC` naming a local tag (`refs/tags/<SRC>` exists and no branch of that name does; `refs/tags/v1`
      is explicit) pushes the tag to `refs/tags/<DST>`; a name that is both a branch and a tag is refused
      (`src refspec 'x' matches more than one`). `local` is the ref's value: the tag object for an annotated tag.
   2. Get a fresh `info_refs` and take `remote_old`.
-  3. If `remote_old == local`: `Everything up-to-date`.
+  3. If `remote_old == local`: `Everything up-to-date` (with `-u`, after the `branch 'x' set up to track` line, as git
+     prints them).
   4. **Local pre-check** (not authoritative): if `remote_old` is set and is missing locally or is not an ancestor of local, and there is no `--force`, raise `PushRejectedError` without uploading. For a tag, any differing `remote_old` without `--force` is rejected locally with reason `tag-exists`.
   5. Send the pack with `old = remote_old`.
   6. **On 200:** for a branch set `refs/remotes/<r>/<dst> = local` and, with `-u`, the upstream (tags get neither). Lines: `To <url>` then `   a1b2c3d..e4f5a6b  main -> main` (or ` * [new branch]      main -> main`, ` * [new tag]         v1 -> v1`, ` + a1b2c3d...e4f5a6b v1 -> v1 (forced update)`).
@@ -788,7 +912,15 @@ Readers take no lock: ref files are replaced atomically, and objects never chang
 - **HTTP errors:**
   - 401 → `AuthError("authentication failed for '<url>': check user/token (minigit login)")`.
   - 403 → `PermissionDeniedError("permission denied: ...")`.
-  - A `URLError` → `RemoteError("could not connect to server at <url>: <reason>")`.
+  - A `URLError` → `RemoteError("could not connect to server at <url>: <reason>")`, where the reason is readable
+    instead of the raw socket text: `connection refused` (hint: is `minigit serve` running on host:port?),
+    `could not resolve host 'h'`, `connection timed out`, `TLS error (...)` (for `https://`, hint: the server speaks
+    plain http).
+  - An `info/refs` answer that is not JSON (the URL points at some other web server) keeps
+    `malformed info/refs response from <url> (not JSON)` and adds a hint that the URL must name a `minigit serve`
+    repository. A URL that is not http(s), such as a local path or `user@host:path`, is
+    `unsupported remote url '...': expected http://host:port/<repo>` with a hint that only `minigit serve` remotes
+    are supported.
   - Any other status → `RemoteError(body.error)`.
 
 ### 7.6 Server CLI
@@ -865,20 +997,22 @@ Unit tests use `tempfile.TemporaryDirectory(ignore_cleanup_errors=True)` and do 
 ### M1 core
 ```python
 # __init__.py
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 # errors.py
 class MinigitError(Exception):
     exit_code: int = 1
+    prefix: str = "error"      # first word of the printed message ("" prints it bare)
     def __init__(self, message: str, *, hint: str | None = None) -> None   # .message, .hint
-class UsageError(MinigitError): exit_code = 2
-class NotARepositoryError(MinigitError): ...
-class ObjectError(MinigitError):
+class FatalError(MinigitError): exit_code = 128; prefix = "fatal"   # printed as 'fatal: ...'
+class UsageError(MinigitError): exit_code = 129
+class NotARepositoryError(FatalError): ...
+class ObjectError(FatalError):
     def __init__(self, message: str, *, sha: str | None = None, hint: str | None = None) -> None
-class LockError(MinigitError): ...
+class LockError(FatalError): ...
 class RefUpdateError(MinigitError):
     def __init__(self, message: str, *, ref: str, expected: object, actual: str | None, hint: str | None = None) -> None
-class RevisionError(MinigitError): ...
+class RevisionError(FatalError): ...
 class NothingToCommit(MinigitError): ...
 class CheckoutConflictError(MinigitError):
     def __init__(self, message: str, *, paths: list[str], hint: str | None = None) -> None
@@ -957,10 +1091,12 @@ def peel(store: ObjectStore, sha: str) -> tuple[str, str]    # (type, sha) of th
 
 # trees.py
 Entry = tuple[str, str]; FlatTree = dict[str, Entry]
-def flatten_tree(store: ObjectStore, tree_sha: str | None) -> FlatTree   # None/EMPTY_TREE -> {}
-def build_tree(store: ObjectStore, flat: FlatTree) -> str                # writes subtrees; {} -> EMPTY_TREE
+def flatten_tree(store: ObjectStore, tree_sha: str | None, known: FlatTree | None = None) -> FlatTree
+    # None/EMPTY_TREE -> {}; known (e.g. the index) is hashed in memory and a subtree with the same id
+    # is copied from it instead of read: same result, no tree reads for a clean status
+def build_tree(store: ObjectStore, flat: FlatTree) -> str                # writes missing subtrees; {} -> EMPTY_TREE
 def commit_tree_sha(store: ObjectStore, commit_sha: str) -> str
-def commit_flat(store: ObjectStore, commit_sha: str | None) -> FlatTree
+def commit_flat(store: ObjectStore, commit_sha: str | None, known: FlatTree | None = None) -> FlatTree
 
 # config.py
 def global_config_path() -> str                              # MINIGIT_GLOBAL_CONFIG or ~/.minigitconfig
@@ -1008,7 +1144,7 @@ class Repository:
     def relpath(self, user_path: str, cwd: str) -> str       # POSIX repo-relative; "" = root; MinigitError("'p' is outside repository")
     def abspath(self, rel: str) -> str
     def head_commit(self) -> str | None
-    def head_flat(self) -> FlatTree
+    def head_flat(self, known: FlatTree | None = None) -> FlatTree
     def read_commit(self, sha: str) -> Commit
     def identity(self) -> Signature                          # section 6 commit identity rules
     def merge_head(self) -> str | None
@@ -1024,8 +1160,9 @@ def ancestors(store: ObjectStore, tips: Iterable[str]) -> set[str]       # inclu
 def is_ancestor(store: ObjectStore, anc: str, desc: str) -> bool        # anc == desc -> True
 def merge_bases(store: ObjectStore, a: str, b: str) -> list[str]
 def best_merge_base(store: ObjectStore, a: str, b: str) -> str | None
-def topo_walk(store: ObjectStore, starts: Iterable[str]) -> Iterator[tuple[str, Commit]]   # section 6 log order
-def topo_order(store: ObjectStore, starts: Iterable[str], excluded=frozenset()) -> list[tuple[str, Commit]]  # git --topo-order (rebase)
+def topo_walk(store: ObjectStore, starts: Iterable[str], parents_of=None) -> Iterator[tuple[str, Commit]]   # section 6 log order
+def topo_order(store: ObjectStore, starts: Iterable[str], excluded=frozenset(), parents_of=None) -> list[tuple[str, Commit]]  # --topo-order (rebase, log --graph)
+# parents_of(sha, commit) -> parents replaces the walk's edges (log -- path's simplified history)
 def ahead_behind(store: ObjectStore, local: str, upstream: str) -> tuple[int, int]
 class AsciiGraph:                                                  # log --graph (a port of git's graph.c)
     def update(self, sha: str, parents: Sequence[str]) -> None    # once per commit, in log order
@@ -1119,18 +1256,21 @@ class StatusResult:
     def is_clean(self) -> bool                               # no entries other than none
 def upstream_of(repo: Repository, branch: str) -> tuple[str, str | None] | None   # (tracking ref, its sha or None)
 def compute_status(repo: Repository) -> StatusResult
-def format_status_long(st: StatusResult) -> str
+def format_status_long(st: StatusResult, hints: bool = True) -> str   # hints: the (use ...) lines (advice.statusHints)
 def format_status_porcelain(st: StatusResult) -> str
 
 # history.py
 def decorations(repo: Repository) -> dict[str, list[str]]  # sha -> ["HEAD -> main", "tag: v1", "origin/main"]
 def commit_tips(repo: Repository) -> list[str]             # the commits every ref names (tags peeled), for log --all
-class PathFilter:                                           # log -- path: tree differs from the first parent's
+class PathFilter:                                           # log -- path: history simplification (TREESAME)
     def __init__(self, store: ObjectStore, paths: Sequence[str]) -> None
+    def simplify(self, sha: str, commit: Commit | None = None) -> tuple[bool, tuple[str, ...]]  # (shown, followed parents)
     def matches(self, sha: str, commit: Commit | None = None) -> bool
-    def rewrite_parents(self, commit: Commit) -> list[str]  # nearest matching first-parent ancestors (--graph)
+    def parents_of(self, sha: str, commit: Commit) -> tuple[str, ...]          # followed parents: the walk edges
+    def rewrite_parents(self, sha: str, commit: Commit | None = None) -> list[str]  # nearest shown ancestors (--graph)
 def log_entries(repo: Repository, revs: Sequence[str] | None, max_count: int | None, all_refs: bool = False,
-                paths: Sequence[str] = ()) -> list[tuple[str, Commit]]
+                paths: Sequence[str] = (), topo: bool = False) -> list[tuple[str, Commit]]   # topo: --graph
+def oneline_subject(message: str) -> str                    # first paragraph joined with spaces (--oneline)
 def format_log(repo: Repository, entries: list[tuple[str, Commit]], oneline: bool, *, graph: bool = False,
                stat: bool = False, paths: Sequence[str] = ()) -> str
 def format_tag_header(tag: Tag) -> list[str]               # show of an annotated tag: tag NAME, Tagger, Date, message
@@ -1160,7 +1300,15 @@ def set_upstream_to(repo: Repository, upstream: str, branch: str | None = None) 
 def unset_upstream(repo: Repository, branch: str | None = None) -> None             # MinigitError when no upstream is set
 def switch(repo: Repository, target: str | None, *, create: str | None = None, start: str | None = None,
            detach: bool = False) -> str                     # "Switched to branch 'x'" | "Switched to a new branch 'x'" | "HEAD is now at abc1234 subject"
-def reset(repo: Repository, rev: str = "HEAD", mode: str = "mixed") -> str         # hard: "HEAD is now at abc1234 subject"; else ""
+def reset(repo: Repository, rev: str = "HEAD", mode: str = "mixed") -> str         # hard: "HEAD is now at abc1234 subject"; mixed: unstaged_after_reset(); soft: ""
+def unstaged_after_reset(repo: Repository) -> str     # "Unstaged changes after reset:\nM\ta" or ""
+def cleanup_message(text: str, *, strip_comments: bool = False) -> str   # git's stripspace; "" when empty
+def message_subject(message: str) -> str              # git's %s: the first paragraph joined by spaces
+def local_changes(repo: Repository) -> str            # "M\ta\nA\tb": what a switch carries over
+def detached_head(repo: Repository) -> str | None     # the detached HEAD commit, else None
+def leaving_detached_head(repo: Repository, old: str | None) -> str   # "Previous HEAD position was ..." | the lost-commits warning | ""
+def detach_advice(repo: Repository, target: str, previous_branch: str | None) -> str
+def nothing_to_commit_report(repo: Repository, message: str, cwd: str) -> str   # the status + message commit prints
 def reset_paths(repo: Repository, rev: str, pathspecs: Sequence[str], cwd: str) -> list[str]
 def restore(repo: Repository, pathspecs: Sequence[str], cwd: str, *, staged: bool = False,
             worktree: bool | None = None, source: str | None = None) -> list[str]
@@ -1178,9 +1326,10 @@ def hash_object_cmd(repo: Repository | None, path: str, write: bool) -> str
 @dataclass
 class Merge3Result: lines: list[bytes]; conflicts: int
 def merge_lines(base: list[bytes], ours: list[bytes], theirs: list[bytes], ours_label: str = "HEAD",
-                theirs_label: str = "theirs") -> Merge3Result
+                theirs_label: str = "theirs", marker_size: int = 7) -> Merge3Result
 def merge_blobs(base: bytes | None, ours: bytes, theirs: bytes, ours_label: str = "HEAD",
-                theirs_label: str = "theirs") -> tuple[bytes, bool]           # (content, clean)
+                theirs_label: str = "theirs", marker_size: int = 7) -> tuple[bytes, bool]   # (content, clean)
+def diff_changes(a: list[bytes], b: list[bytes]) -> list[tuple[int, int, int, int]]   # git's histogram script
 
 # merge.py
 @dataclass
@@ -1190,7 +1339,8 @@ class TreeMergeResult:
     worktree: dict[str, tuple[str, bytes]]              # conflicted path -> (mode, content to write)
     messages: list[str]                                 # CONFLICT/warning lines
 def merge_trees(store: ObjectStore, base: FlatTree, ours: FlatTree, theirs: FlatTree,
-                ours_label: str, theirs_label: str) -> TreeMergeResult
+                ours_label: str, theirs_label: str, *, virtual: bool = False, call_depth: int = 1,
+                auto_merging: bool = False) -> TreeMergeResult
 @dataclass
 class MergeOutcome:
     kind: str                                           # "up-to-date" | "fast-forward" | "merged" | "conflict"
@@ -1216,7 +1366,8 @@ def unpack(store: ObjectStore, data: bytes, max_object_size: int = 64 << 20) -> 
 def complete_commits(store: ObjectStore, ref_values: Iterable[str]) -> set[str]   # tags peeled
 def check_connectivity(store: ObjectStore, tip: str, complete: set[str]) -> None           # ObjectError
 def fsck(repo: Repository) -> list[str]                  # problems; [] = healthy (hash check every object once, then ref
-                                                         # connectivity from the caches; "warning: ..." lines are informational)
+                                                         # connectivity from the caches; "warning: ..." lines are informational;
+                                                         # a ref file holding neither an id nor "ref: ..." is "ref X: '...' is not a commit id")
 
 # auth.py
 def hash_token(token: str) -> str
@@ -1289,17 +1440,21 @@ def login(url: str, user: str, token: str) -> None
 ### M7 cli + e2e
 ```python
 # cli.py
-def build_parser() -> argparse.ArgumentParser   # prog="minigit"; errors raise UsageError (exit 2)
+def build_parser(only: str | None = None) -> argparse.ArgumentParser   # prog="minigit"; errors raise UsageError (exit 129)
+    # only=<command>: just that subparser (main() uses this: ~40 other parsers and their modules are skipped)
 def main(argv: Sequence[str] | None = None) -> int
-# __main__.py: `import sys; from minigit.cli import main; sys.exit(main())`
+# __main__.py: `sys.exit(main())`; a ctrl-C during the imports exits 130 without a traceback
 ```
 - **Global flags:** `-C <dir>` (sets cwd), `--version`, `--help`, `<cmd> --help`.
 - **Commands** (the flags in section 6/7 are authoritative): init, config, add, rm, status (`--porcelain`, `-s` = porcelain), diff, commit, log, show, branch, switch, checkout, merge, cherry-pick, revert, stash, rebase, reset, restore, remote (`add|remove|-v`), clone, fetch, pull, push, pr (`open|list|show|diff|merge|close`), login, serve, server (`init|add-user|remove-user|add-token|list-tokens|revoke-token|create-repo|perm|set-repo|list`), fsck, blame, grep, cat-file, ls-files, hash-object, rev-parse, help.
 - **Output:**
   - Data goes to `sys.stdout.buffer` as UTF-8 bytes with `\n` newlines.
-  - Errors go to stderr as `error: <message>`, plus `hint: <hint>` when set. `PushRejectedError` prints `format_push_rejection`.
+  - Errors go to stderr as `error: <message>` (`fatal: <message>` for exit 128, section 0), plus `hint: <hint>` when
+    set. `PushRejectedError` prints `format_push_rejection`. An `unknown revision 'x'` close to a branch, tag or
+    remote branch name gets `hint: did you mean 'main'?`.
   - Merge or pull conflicts print their messages to stdout and exit 1.
-  - An unexpected exception prints `fatal: internal error: <e>` and exits 1 (the traceback only with `MINIGIT_DEBUG=1`).
+  - An unexpected exception prints `fatal: internal error: <e>` plus a hint and exits 128 (the traceback only with
+    `MINIGIT_DEBUG=1`); an `OSError` prints `fatal: permission denied: '<file>'` and the like (section 0).
 - `bin/minigit` inserts its parent's parent into `sys.path` and calls `cli.main`. *(Integration)* It is an sh/Python polyglot (`#!/bin/sh`) that re-runs itself with `python3` on POSIX (many Linux systems have no `python`) and `python` on Windows. `bin/minigit.cmd` is `@python "%~dp0minigit" %*`. `pyproject.toml` optionally installs a `minigit` console script.
 - **`tests/helpers.py`:**
   - `run(args, cwd, env=None, check=True)` runs `[sys.executable, "-m", "minigit", *args]` with `PYTHONPATH=<root>`, a 30 s timeout and captured bytes.

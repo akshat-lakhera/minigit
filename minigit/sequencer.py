@@ -52,6 +52,7 @@ class PickOutcome:
     conflicts: list[str] = field(default_factory=list)
     messages: list[str] = field(default_factory=list)   # stdout lines: CONFLICT / warning lines
     summary: str | None = None      # "[main abc1234] subject" when committed
+    details: list[str] = field(default_factory=list)   # the lines git prints below it (Date, stat...)
     error: str | None = None        # "could not apply abc1234... subject" on conflict
     hint: str | None = None         # the resolve/continue hint on conflict
 
@@ -104,6 +105,30 @@ def _summary(repo: Repository, sha: str, message: str) -> str:
     branch = repo.refs.current_branch()
     prefix = f"[detached HEAD {sha[:7]}]" if branch is None else f"[{branch} {sha[:7]}]"
     return f"{prefix} {message.split(chr(10), 1)[0]}"
+
+
+def commit_details(repo: Repository, sha: str) -> list[str]:
+    """What git prints below ``[branch sha7] subject`` for a commit made by cherry-pick / revert:
+    `` Author:`` when it differs from the committer, `` Date:`` (the author date), the shortstat and
+    the create/delete/mode lines."""
+    from .merge import mode_summary
+    from .ops import _shortstat
+    from .util import format_date
+
+    commit = repo.read_commit(sha)
+    lines: list[str] = []
+    a, c = commit.author, commit.committer
+    if (a.name, a.email) != (c.name, c.email):
+        lines.append(f" Author: {a.name} <{a.email}>")
+    lines.append(f" Date: {format_date(a.timestamp, a.tz_offset)}")
+    store = repo.objects
+    old = commit_flat(store, commit.parents[0]) if commit.parents else {}
+    new = flatten_tree(store, commit.tree)
+    stat = _shortstat(repo, old, new)
+    if stat:
+        lines.append(stat)
+    lines.extend(mode_summary(old, new))
+    return lines
 
 
 def _conflicts_message(message: str, conflicts: list[str]) -> str:
@@ -238,7 +263,7 @@ def _apply(repo: Repository, *, action: str, source: str, subject: str, base: Fl
         ours = index.flat()
         if not stacked and ours != repo.head_flat():
             raise MinigitError("you have staged changes; commit them first")
-        res = merge_trees(store, base, ours, theirs, "HEAD", label)
+        res = merge_trees(store, base, ours, theirs, "HEAD", label, auto_merging=True)
         plan = _plan(repo, index, ours, res, action)
         if not res.stages and not plan.changed and not (allow_empty and not no_commit):
             if action == "cherry-pick":
@@ -272,6 +297,8 @@ def _apply(repo: Repository, *, action: str, source: str, subject: str, base: Fl
     else:
         repo.refs.update_head(new_sha, expected=head)
         outcome.summary = _summary(repo, new_sha, message)
+        if action in ACTIONS:
+            outcome.details = commit_details(repo, new_sha)
     return outcome
 
 
@@ -441,8 +468,9 @@ def continue_(repo: Repository, action: str) -> list[str]:
     seq = seq if seq and seq["action"] == action else None
     lines: list[str] = []
     if repo.refs.read_special(state) is not None:
-        _sha, summary = ops.commit(repo, [])
-        lines.append(summary)
+        sha, summary = ops.commit(repo, [])
+        lines.append(summary.split("\n", 1)[0])
+        lines.extend(commit_details(repo, sha))
     elif seq is None:
         raise MinigitError(f"no {action} in progress ({state} missing)")
     if seq is not None:
@@ -458,6 +486,7 @@ def continue_(repo: Repository, action: str) -> list[str]:
             lines.extend(out.messages)
             if out.summary:
                 lines.append(out.summary)
+                lines.extend(out.details)
             if out.kind == "conflict":
                 raise Stopped(lines, out)
     return lines
