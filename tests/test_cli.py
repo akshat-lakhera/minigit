@@ -248,7 +248,7 @@ class ParserTests(CliTestCase):
     def test_version(self):
         rc, out, _ = self.cli("--version")
         self.assertEqual(rc, 0)
-        self.assertIn("minigit 0.3.0", out)
+        self.assertIn("minigit 0.4.0", out)
 
     def test_help(self):
         rc, out, _ = self.cli("--help")

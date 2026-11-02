@@ -509,7 +509,11 @@ class WebUiAcceptanceTests(unittest.TestCase):
     def test_summary_page(self):
         resp = self.page("/-/proj/")
         self.assertIn(f"minigit clone {self.server.url}/proj".encode(), resp.body)
-        self.assertEqual(commit_links(resp.body, "proj"), self.main_log, "recent commits, newest first")
+        recent = resp.body.split(b'<section id="recent">', 1)[1].split(b"</section>", 1)[0]
+        self.assertEqual(commit_links(recent, "proj"), self.main_log, "recent commits, newest first")
+        self.assertTrue(set(commit_links(resp.body, "proj")) <= set(self.main_log),
+                        "the file table links only commits of the default branch")
+        self.assertIn(b"README.md", resp.body, "the code page lists the files")
         hrefs = links(resp.body)
         self.assertTrue(has_link(hrefs, "/-/proj/tree", rev="main"))
         self.assertTrue(has_link(hrefs, "/-/proj/log", rev="main"))

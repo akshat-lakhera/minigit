@@ -743,11 +743,51 @@ client ignores unknown keys and a server that sends no `peeled` is treated as "n
 **Web UI (`/-/`).** `minigit serve` also serves a read-only, JavaScript-free HTML site under the URL prefix `/-/`
 (module `webui.py`; design in `features/web-ui.md`). Requests whose first path segment is `-` are handled before the
 protocol checks, so they are **exempt from the `X-Minigit-Protocol` rule** and answer with HTML, not JSON. Pages:
-`/-/` (repository list), `/-/<repo>/` (summary), `branches`, `tags`, `log`, `commit/<rev>`, `tree`, `blob` and `raw`. Only
+`/-/` (repository list), `/-/<repo>/` (the code page), `branches`, `tags`, `log`, `commit/<rev>`, `tree`, `blob`,
+`blame`, `raw`, `pulls` and `pulls/<n>`. Only
 GET and HEAD are accepted (other methods: 405). Access follows the protocol's ACLs and HTTP Basic auth (user name +
 token), and public repos are readable anonymously. As in the protocol, an anonymous request for any non-public
 repository name gets 401 with `WWW-Authenticate` whether or not the repository exists; a signed-in user gets 404 for a
-missing repository and 403 for one they may not read. Browsers cache Basic credentials, so there is no log-out.
+missing repository and 403 for one they may not read (the pull request pages included). Browsers cache Basic
+credentials, so there is no log-out.
+
+*Look and layout.* The site is branded **minigithub** (an inline SVG mark: a rounded tile with a small commit graph)
+and uses its own palette (deep teal header, warm neutrals, amber accent), the system font stack and a monospace
+stack. Every page is server-rendered HTML with one inline stylesheet, no scripts and nothing loaded from elsewhere
+(CSP `default-src 'none'; style-src 'unsafe-inline'; img-src data:`), so it works offline. Light and dark themes
+follow `prefers-color-scheme`; the header's theme link (`/-/?theme=auto|light|dark&back=<same-site /-/ URL>`) sets
+the `mg_theme` cookie (`Path=/-/`, `SameSite=Lax`; `auto` clears it), which pins `<html data-theme>`; any other `back`
+redirects to `/-/`. Layouts reflow down to phone width; code, diffs and wide tables scroll inside their own box.
+- Repo pages share a header: the repo name with a Public/Private badge and tabs **Code** (`/-/<repo>/`, or
+  `tree?rev=L` for another rev), **Commits** (`log?rev=L`), **Branches**, **Tags** and **Pull requests** (with counts).
+  Tree, blob, blame and log pages have a branch/tag switcher (a `<details>` menu).
+- The code page (`/-/<repo>/`) and `tree` show the latest commit bar, a file table (directories first) with the
+  last commit that changed each entry and its age, and the directory's README below it (`README.md`/`.markdown`
+  rendered by `mdrender.py`; `README`/`README.txt`/`README.rst` as plain text). "Last commit" walks at most 200
+  commits (`LAST_COMMIT_SCAN`, git's TREESAME rule for merges) and is skipped for directories over 400 entries;
+  entries not found in that window stay blank. The code page's sidebar holds the **Clone** box
+  `minigit clone <base_url>/<repo>` (`base_url` = `https` when `X-Forwarded-Proto: https`, else `http`, + the
+  request's `Host`, or the server URL when `Host` is missing or unusable), counts, and **Recent commits** (the first
+  10 log rows of the default branch, `<section id="recent">`). An empty repo shows `This repository is empty.`, the
+  clone box and push instructions.
+- `mdrender.py` supports headings, paragraphs, nested lists, fenced code, block quotes, rules, pipe tables, inline
+  code, bold, italic and links; only `http(s)://` targets become links (`rel="nofollow noopener noreferrer"`), images
+  become their alt text, and all other text, raw HTML included, is escaped.
+- The log groups rows by the author's calendar day; each row has an initials avatar (colour from a hash of the
+  e-mail), the subject and the sha (both link `commit/<sha40>`), ref decorations as pills, the author and a relative
+  time whose tooltip is `util.format_date`. Rows link no other commits.
+- A commit page shows the subject, the message body, author/committer with dates, the full sha, parent links (its
+  only commit links) and **Browse files**, then a changed-files list with `+/-` counts and per-file diff cards: the
+  git header lines, then a table with old/new line numbers (`?view=split` for side by side, `?view=unified` the
+  default; other values 400). A file over 1 MiB is `Diff suppressed: file too large`; at most 2500 diff lines per file
+  and 6000 per page are drawn, the rest is cut with a note; more than 300 files are listed as not shown.
+- `blob` shows numbered lines (`#L<n>` anchors), or a placeholder for binary (`Binary file (N bytes) not shown.`),
+  empty and over-1-MiB files, with Code/Blame/Raw buttons. `blame?rev=R&path=P` (files up to 256 KiB) groups lines by
+  the commit that last changed them.
+- `pulls?state=open|merged|closed|all` lists pull requests with Open/Merged/Closed badges; `pulls/<n>` shows the
+  title, state, branches, ahead/behind, the description (rendered by `mdrender.py`), the mergeability or merge/close
+  record, the commits and the three-dot diff (as on the commit page). A corrupt `pulls.json` lists nothing and gives
+  404 for a single pull request; the other pages still work.
 **Browser redirect:** a `GET`/`HEAD` of `/` or `/<repo>` that has no `X-Minigit-Protocol` header and an `Accept` header
 containing `text/html` gets `303` to `/-/` or `/-/<repo>/`; every other request without the header still gets 400.
 `serve --no-web` turns all of this off: `/-/` is then just an unknown repository name and nothing is redirected.
@@ -982,7 +1022,7 @@ Every file is owned by exactly one module. Dependency order: **M1 → M2 → {M3
 | **M5 server** | `pack.py auth.py server.py` | `tests/test_server.py` | M1 |
 | **M6 client** | `transport.py remote.py` | `tests/test_remote.py` | M1, M2, M4, M5 (pack; `server.make_server` in tests) |
 | **M7 cli + e2e** | `cli.py __main__.py`, `bin/minigit`, `bin/minigit.cmd`, `tests/__init__.py tests/helpers.py tests/test_e2e_local.py tests/test_e2e_multiuser.py`, `README.md` | the e2e files | all |
-| **M8 web UI** | `webui.py` (`/-/`, section 7.2; `server.py` imports it lazily) | `tests/test_webui.py`, `tests/test_web_ui.py` | M1, M3, M5 |
+| **M8 web UI** | `webui.py` (`/-/`, section 7.2; `server.py` imports it lazily), `mdrender.py` (README markdown) | `tests/test_webui.py`, `tests/test_web_ui.py` | M1, M3, M5 |
 | **M9 pull requests** | `pulls.py` (server), `pr.py` (client + CLI glue), section 7.7 | `tests/test_pulls.py`, `tests/test_pull_requests_lite.py` | M1, M4, M5, M6 |
 | **M10 stash, rebase, cherry-pick/revert** | `stash.py`, `rebase.py`, `cherry.py`, `sequencer.py` (section 6) | `tests/test_stash.py`, `tests/test_rebase.py`, `tests/test_cherry.py`, `tests/test_cherry_pick_revert.py` | M1, M2, M4 |
 | **M11 blame, grep** | `blame.py`, `grep.py` (section 6) | `tests/test_blame_grep.py` | M1, M2, M3 |
@@ -997,7 +1037,7 @@ Unit tests use `tempfile.TemporaryDirectory(ignore_cleanup_errors=True)` and do 
 ### M1 core
 ```python
 # __init__.py
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 # errors.py
 class MinigitError(Exception):

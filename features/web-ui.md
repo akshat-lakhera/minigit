@@ -4,6 +4,12 @@ Status: implemented in `minigit/webui.py` (with a few hook lines in `server.py` 
 `cli.py`). Acceptance tests: `tests/test_web_ui.py` (black box, live server) and `tests/test_webui.py`
 (in-process). This document is kept as the design record.
 
+Redesign (2026-11-02): the pages now use the "minigithub" look described in SPEC.md 7.2 (*Look and layout*):
+repo tabs, a code page with a last-commit file table and rendered README (`mdrender.py`), a log grouped by day,
+line-numbered unified/split diffs, blame, and pull request pages (`pulls`, `pulls/<n>`). Where this record and SPEC.md
+differ on page layout (for example the summary page's commit links, log decorations shown as pills instead of
+`(...)`, the theme cookie), SPEC.md is current. URLs, ACLs and the no-script rule are unchanged.
+
 Second design pass (2026-10-20): checked against the current `server.py`, `cli.py`, `revparse.py`, `refs.py` and
 `auth.py`. It adds the rev syntax gate (4.3, 8.6; it closes a path traversal confirmed against today's
 `revparse`), strict integer parameters, repo-list rows for missing repo directories, the notes on unsupported

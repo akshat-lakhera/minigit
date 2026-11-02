@@ -163,7 +163,7 @@ class InitAddCommitLogTests(LocalBase):
         self.assertIn("does not have any commits yet", res.err)
         res = self.fail_mg("frobnicate", code=1)
         self.assertIn("is not a minigit command", res.err)
-        self.assertIn("minigit 0.3.0", self.mg("--version").out)
+        self.assertIn("minigit 0.4.0", self.mg("--version").out)
         self.assertIn("usage: minigit commit", self.mg("commit", "--help").out)
         res = self.fail_mg("add", "nope", code=128)
         self.assertIn("fatal: pathspec 'nope' did not match any files", res.err)
@@ -174,7 +174,7 @@ class InitAddCommitLogTests(LocalBase):
         proc = subprocess.run([sys.executable, script, "--version"], capture_output=True, timeout=30,
                               env=env, cwd=self.wt)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn(b"minigit 0.3.0", proc.stdout)
+        self.assertIn(b"minigit 0.4.0", proc.stdout)
         proc = subprocess.run([sys.executable, script, "init"], capture_output=True, timeout=30,
                               env=env, cwd=self.wt)
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -184,7 +184,7 @@ class InitAddCommitLogTests(LocalBase):
             proc = subprocess.run([cmd, "--version"], capture_output=True, timeout=30, env=env,
                                   cwd=self.wt, shell=False)
             self.assertEqual(proc.returncode, 0, proc.stderr)
-            self.assertIn(b"minigit 0.3.0", proc.stdout)
+            self.assertIn(b"minigit 0.4.0", proc.stdout)
 
 
 class DiffTests(LocalBase):

@@ -17,7 +17,7 @@ import unittest
 from html.parser import HTMLParser
 from urllib.parse import parse_qs, urlsplit
 
-from minigit import auth, objects, server, webui
+from minigit import auth, mdrender, objects, server, webui
 from minigit.auth import ServerConfig
 from minigit.objects import Commit, ObjectStore, Signature, TreeEntry
 from minigit.repo import Repository
@@ -359,7 +359,8 @@ class RoutingTests(RepoFixture):
         order = [self.c3, self.c2, self.c1]
 
         def shas(body: bytes) -> list[str]:
-            return [urlsplit(h).path.rsplit("/", 1)[1] for h in links(body) if "/commit/" in h]
+            found = [urlsplit(h).path.rsplit("/", 1)[1] for h in links(body) if "/commit/" in h]
+            return list(dict.fromkeys(found))  # a row links its commit twice (subject and sha)
 
         first = self.assert_page(self.request("/-/proj/log?rev=main&n=2", "alice"))
         self.assertEqual(shas(first), order[:2])
@@ -429,7 +430,7 @@ class RoutingTests(RepoFixture):
         self.assertTrue(has_link(links(self.assert_page(self.request("/-/proj/branches", "alice"))), "/-/proj/tags"))
         # log rows carry the tag decorations, and a tag is a valid rev (peeled)
         log = self.assert_page(self.request("/-/proj/log?rev=v1.0", "alice"))
-        self.assertIn(b"(tag: v1.0)", log)
+        self.assertIn(b'<span class="ref tagref">tag: v1.0</span>', log)
         self.assertIn(b"Commits on v1.0", log)
         self.assertIn(self.c2.encode(), log)
         self.assertNotIn(self.c3.encode(), log)
@@ -446,6 +447,295 @@ class RoutingTests(RepoFixture):
         self.assertFalse(has_link(links(body), "/-/lost/"))
         self.assert_page(self.request("/-/lost/", "bob"), 404)
         self.assertNotIn(b"lost", self.assert_page(self.request("/-/", "alice")))
+
+
+# ---------------------------------------------------------------------------
+# README markdown
+# ---------------------------------------------------------------------------
+
+_ALLOWED_TAGS = {"p", "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol", "li", "pre", "code", "blockquote", "hr",
+                 "strong", "em", "a", "div", "table", "thead", "tbody", "tr", "th", "td"}
+
+
+class _Tags(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.tags: list[tuple[str, list]] = []
+
+    def handle_starttag(self, tag, attrs) -> None:
+        self.tags.append((tag, attrs))
+
+
+def tags_of(fragment: str) -> list[tuple[str, list]]:
+    p = _Tags()
+    p.feed(fragment)
+    return p.tags
+
+
+class MarkdownTests(unittest.TestCase):
+    def test_blocks(self):
+        out = mdrender.render("# Title #\n\nSome *text*\nwrapped.\n\n## Sub\n\n- a\n- b\n  - nested\n\n"
+                              "3. three\n4. four\n\n```py\nx = '<b>'\n```\n\n> quoted\n\n---\n\n"
+                              "| h1 | h2 |\n|----|:--:|\n| c1 | `c2` |\n")
+        self.assertIn("<h1>Title</h1>", out)
+        self.assertIn("<p>Some <em>text</em>\nwrapped.</p>", out)
+        self.assertIn("<h2>Sub</h2>", out)
+        self.assertIn("<ul><li>a</li><li>b<ul><li>nested</li></ul></li></ul>", out)
+        self.assertIn('<ol start="3"><li>three</li><li>four</li></ol>', out)
+        self.assertIn("<pre><code>x = &#x27;&lt;b&gt;&#x27;</code></pre>", out)
+        self.assertIn("<blockquote><p>quoted</p></blockquote>", out)
+        self.assertIn("<hr>", out)
+        self.assertIn("<th>h1</th><th>h2</th>", out)
+        self.assertIn("<td><code>c2</code></td>", out)
+
+    def test_inline_and_links(self):
+        out = mdrender.render_inline("**bold** __b2__ *it* _it2_ `a<b` [site](https://example.com/x?a=1&b=2) "
+                                     "<http://example.org> snake_case_name")
+        self.assertIn("<strong>bold</strong> <strong>b2</strong> <em>it</em> <em>it2</em>", out)
+        self.assertIn("<code>a&lt;b</code>", out)
+        self.assertIn('<a href="https://example.com/x?a=1&amp;b=2" rel="nofollow noopener noreferrer">site</a>', out)
+        self.assertIn('<a href="http://example.org" rel="nofollow noopener noreferrer">http://example.org</a>', out)
+        self.assertIn("snake_case_name", out, "intra-word underscores are not emphasis")
+        for evil in ("[x](javascript:alert(1))", "[x](data:text/html,hi)", "[x](//evil.example)", "[x](/-/proj/)",
+                     "[x](vbscript:msgbox)", "![alt](https://example.com/i.png)"):
+            with self.subTest(evil=evil):
+                self.assertNotIn("<a", mdrender.render_inline(evil))
+        self.assertEqual(mdrender.render_inline("![alt <x>](https://e.com/i.png)"), "alt &lt;x&gt;",
+                         "images are never loaded: the alt text stays")
+
+    def test_nothing_unsafe_survives(self):
+        nasty = ('<script>alert(1)</script>\n\n<img src=x onerror=alert(1)>\n\n# <b>head</b>\n\n'
+                 '- <i>item</i> [l](https://e.com/"onmouseover="alert(1))\n\n```\n</code></pre><script>x</script>\n```\n'
+                 '> <iframe src="https://e.com"></iframe>\n\n| <x> | y |\n|---|---|\n| <td> | z |\n'
+                 "[a](https://e.com/'x) `<` **<u>** \0 \r\n")
+        out = mdrender.render(nasty)
+        self.assertNotIn("<script", out)
+        self.assertNotIn("<img", out)
+        self.assertNotIn("<iframe", out)
+        for tag, attrs in tags_of(out):
+            self.assertIn(tag, _ALLOWED_TAGS, out)
+            for name, value in attrs:
+                self.assertIn((tag, name), {("a", "href"), ("a", "rel"), ("ol", "start"), ("div", "class")}, out)
+                if name == "href":
+                    self.assertRegex(value, r"^https?://[^\s\"'<>]+$")
+        # deep nesting is bounded, not a crash
+        mdrender.render("> " * 500 + "x")
+        mdrender.render("".join("  " * i + "- x\n" for i in range(300)))
+        mdrender.render_inline("*" * 2000 + "a" + "*" * 2000)
+
+
+# ---------------------------------------------------------------------------
+# the redesigned pages
+# ---------------------------------------------------------------------------
+
+README_MD = (b"# Project <Title>\n\nSee [docs](https://example.com/docs) and "
+             b"[bad](javascript:alert(1)).\n\n<script>alert(1)</script>\n\n- one\n- two\n")
+
+
+class RedesignTests(RepoFixture):
+    def setUp(self) -> None:
+        super().setUp()
+        store = self.repo.objects
+        self.c4 = make_commit(store, {"README.md": README_MD, "dir": {"a.txt": b"line1\nLINE2\n", "bin": b"\0\1"},
+                                      "page.html": b"<b>bold</b> & <i>it</i>\n"}, [self.c3], "Rich README", TS + 180)
+        self.repo.refs.update("refs/heads/main", self.c4)
+
+    def assert_page(self, resp: webui.WebResponse, status: int = 200) -> bytes:
+        self.assertEqual(resp.status, status, resp.body[-600:])
+        self.assertEqual(resp.content_type, webui.HTML_TYPE)
+        self.assertIn("default-src 'none'", dict(resp.headers)["Content-Security-Policy"])
+        self.assertNotIn(b"<script", resp.body.lower())
+        return resp.body
+
+    def test_code_page_has_file_table_readme_and_clone_box(self):
+        body = self.assert_page(self.request("/-/proj/", "alice"))
+        self.assertIn(b"<h1>Project &lt;Title&gt;</h1>", body, "the README is rendered under the files")
+        self.assertIn(b'<a href="https://example.com/docs" rel="nofollow noopener noreferrer">docs</a>', body)
+        self.assertIn(b"&lt;script&gt;alert(1)&lt;/script&gt;", body)
+        self.assertNotIn(b'href="javascript', body)
+        self.assertIn(b"<ul><li>one</li><li>two</li></ul>", body)
+        self.assertIn(b"<code>minigit clone http://h:1/proj</code>", body)
+        hrefs = links(body)
+        # last commit per entry: README.md changed in c4, page.html in c2, dir in c2
+        rows = body.split(b'<table class="list files">', 1)[1].split(b"</table>", 1)[0].decode()
+        for name, sha in (("README.md", self.c4), ("page.html", self.c2), ("dir", self.c2)):
+            row = next(r for r in rows.split("<tr>") if f">{name}</a>" in r)
+            self.assertIn(f"/-/proj/commit/{sha}", row, name)
+        self.assertTrue(has_link(hrefs, "/-/proj/pulls"), "every repo page has the Pull requests tab")
+        self.assertIn(b'aria-current="page" href="/-/proj/"', body, "the Code tab is the current one")
+        self.assertIn(b"minigithub", body)
+        self.assertIn(b'<span class="badge ">Private</span>', body)
+        pub = self.assert_page(self.request("/-/pub/", None))
+        self.assertIn(b'<span class="badge ">Public</span>', pub)
+
+    def test_last_commits_is_bounded(self):
+        store = self.repo.objects
+        found = webui.last_commits(store, self.c4, "", ["README.md", "page.html", "dir", "missing"])
+        self.assertEqual({k: v[0] for k, v in found.items()},
+                         {"README.md": self.c4, "page.html": self.c2, "dir": self.c2})
+        found = webui.last_commits(store, self.c4, "dir", ["a.txt", "bin"])
+        self.assertEqual({k: v[0] for k, v in found.items()}, {"a.txt": self.c2, "bin": self.c1})
+        self.assertEqual(set(webui.last_commits(store, self.c4, "", ["dir"], limit=1)), set(),
+                         "past the limit an entry is left blank")
+
+    def test_subdirectory_readme_and_breadcrumbs(self):
+        store = self.repo.objects
+        c5 = make_commit(store, {"README.md": README_MD, "docs": {"sub": {"README": b"plain <readme>\n"}}},
+                         [self.c4], "Docs", TS + 240)
+        self.repo.refs.update("refs/heads/main", c5)
+        body = self.assert_page(self.request("/-/proj/tree?rev=main&path=docs/sub", "alice"))
+        self.assertIn(b'<pre class="plain">plain &lt;readme&gt;\n</pre>', body, "a plain README stays plain text")
+        hrefs = links(body)
+        self.assertTrue(has_link(hrefs, "/-/proj/tree", rev="main", path="docs"))
+        self.assertTrue(has_link(hrefs, "/-/proj/tree", rev="main"))
+
+    def test_themes(self):
+        body = self.assert_page(self.request("/-/proj/", "alice"))
+        self.assertIn(b"@media (prefers-color-scheme:dark){:root:not([data-theme=light])", body)
+        self.assertIn(b":root[data-theme=dark]", body)
+        self.assertIn(b'<html lang="en">', body, "no cookie: the system theme decides")
+        token = webui._REQUEST.set(("dark", "/-/proj/"))
+        try:
+            body = self.assert_page(self.request("/-/proj/", "alice"))
+        finally:
+            webui._REQUEST.reset(token)
+        self.assertIn(b'<html lang="en" data-theme="dark">', body)
+        self.assertTrue(has_link(links(body), "/-/", theme="auto", back="/-/proj/"), "the switch cycles to auto")
+        resp = self.request("/-/?theme=dark&back=%2F-%2Fproj%2Flog%3Frev%3Dmain")
+        self.assertEqual(resp.status, 303)
+        self.assertIn(("Location", "/-/proj/log?rev=main"), resp.headers)
+        self.assertIn(("Set-Cookie", "mg_theme=dark; Path=/-/; Max-Age=31536000; SameSite=Lax"), resp.headers)
+        resp = self.request("/-/?theme=auto")
+        self.assertIn(("Location", "/-/"), resp.headers)
+        self.assertIn(("Set-Cookie", "mg_theme=; Path=/-/; Max-Age=0; SameSite=Lax"), resp.headers)
+        for back in ("https://evil.example/", "//evil.example/", "/elsewhere", "/-/a\r\nX-Evil: 1", "/-/\\x"):
+            with self.subTest(back=back):
+                from urllib.parse import quote
+                resp = self.request("/-/?theme=light&back=" + quote(back, safe=""))
+                self.assertIn(("Location", "/-/"), resp.headers, "only same-site /-/ targets")
+        self.assert_page(self.request("/-/?theme=purple"), 400)
+
+    def test_theme_cookie_parsing_and_clone_url(self):
+        class FakeHandler:
+            def __init__(self, headers):
+                self.headers = headers
+                self.server = type("S", (), {"url": "http://127.0.0.1:9"})()
+        self.assertEqual(webui.request_theme(FakeHandler({"Cookie": "a=1; mg_theme=dark; b=2"})), "dark")
+        self.assertEqual(webui.request_theme(FakeHandler({"Cookie": "mg_theme=light"})), "light")
+        self.assertIsNone(webui.request_theme(FakeHandler({"Cookie": "mg_theme=\"><x>"})))
+        self.assertIsNone(webui.request_theme(FakeHandler({})))
+        self.assertEqual(webui.base_url(FakeHandler({"Host": "repo.example.com",
+                                                     "X-Forwarded-Proto": "https"})), "https://repo.example.com")
+        self.assertEqual(webui.base_url(FakeHandler({"Host": "h:8", "X-Forwarded-Proto": "javascript"})), "http://h:8")
+        self.assertEqual(webui.base_url(FakeHandler({"Host": "h:8"})), "http://h:8")
+        self.assertEqual(webui.base_url(FakeHandler({"Host": "evil\"><x>"})), "http://127.0.0.1:9")
+
+    def test_log_is_grouped_by_day_with_avatars(self):
+        body = self.assert_page(self.request("/-/proj/log?rev=main", "alice"))
+        self.assertEqual(body.count(b'<div class="day">Nov 14, 2023</div>'), 1, "one group for one day")
+        self.assertIn(b'<span class="av av', body)
+        self.assertIn(b">TU</span>", body, "initials of Test User")
+        self.assertIn(b'<time title="Tue Nov 14 22:16:20 2023 +0000">', body)
+
+    def test_blob_and_blame_views(self):
+        body = self.assert_page(self.request("/-/proj/blame?rev=main&path=dir/a.txt", "alice"))
+        self.assertIn(b'id="L1"', body)
+        self.assertIn(b'id="L2"', body)
+        hrefs = links(body)
+        self.assertTrue(has_link(hrefs, f"/-/proj/commit/{self.c1}"), "line 1 comes from the first commit")
+        self.assertTrue(has_link(hrefs, f"/-/proj/commit/{self.c2}"), "line 2 was changed in the second")
+        self.assertTrue(has_link(hrefs, "/-/proj/blob", rev="main", path="dir/a.txt"))
+        binary = self.assert_page(self.request("/-/proj/blame?rev=main&path=dir/bin", "alice"))
+        self.assertIn(b"Binary file (2 bytes) not shown.", binary)
+        self.assertNotIn(b"\x00", binary)
+        self.assert_page(self.request("/-/proj/blame?rev=main&path=nope", "alice"), 404)
+        self.assert_page(self.request("/-/proj/blame?rev=main", "alice"), 400)
+        blob = self.assert_page(self.request("/-/proj/blob?rev=main&path=dir/bin", "alice"))
+        self.assertIn(b'class="placeholder"', blob)
+        self.assertTrue(has_link(links(blob), "/-/proj/raw", rev="main", path="dir/bin"))
+
+    def test_split_view_and_truncation(self):
+        body = self.assert_page(self.request(f"/-/proj/commit/{self.c2}?view=split", "alice"))
+        self.assertIn(b'<table class="diff split">', body)
+        self.assertIn(b'<td class="c del">-line2</td>', body)
+        self.assertIn(b'<td class="c add">+LINE2</td>', body)
+        self.assertEqual([h for h in links(body) if "/commit/" in h], [f"/-/proj/commit/{self.c1}"],
+                         "the view switch links are query-only")
+        unified = self.assert_page(self.request(f"/-/proj/commit/{self.c2}", "alice"))
+        self.assertIn(b'<tr class="del"><td class="n">2</td><td class="n"></td><td class="c">-line2</td></tr>', unified)
+        self.assertIn(b'<tr class="add"><td class="n"></td><td class="n">2</td><td class="c">+LINE2</td></tr>', unified)
+        self.assert_page(self.request(f"/-/proj/commit/{self.c2}?view=sideways", "alice"), 400)
+        from unittest import mock
+        with mock.patch.object(webui, "MAX_FILE_DIFF_LINES", 2):
+            cut = self.assert_page(self.request(f"/-/proj/commit/{self.c4}", "alice"))
+        self.assertIn(b"Diff truncated:", cut)
+        with mock.patch.object(webui, "MAX_DIFF_LINES", 1):
+            cut = self.assert_page(self.request(f"/-/proj/commit/{self.c2}", "alice"))
+        self.assertIn(b"Diff not shown: this page already shows", cut)
+
+    def open_pr(self, title: str = "Add <b>feature</b> & more", body: str = "**Why**: <script>x</script>") -> str:
+        from minigit import pulls
+        head = make_commit(self.repo.objects, {"README.md": README_MD, "new.txt": b"new <line>\n",
+                                               "dir": {"a.txt": b"line1\nLINE2\n", "bin": b"\0\1"},
+                                               "page.html": b"<b>bold</b> & <i>it</i>\n"},
+                           [self.c4], "Feature <commit>", TS + 300)
+        self.repo.refs.update("refs/heads/feature", head)
+        pulls.open_pull(self.repo, "alice", "feature", "main", title, body)
+        return head
+
+    def test_pull_request_list_and_page(self):
+        from minigit import pulls
+        empty = self.assert_page(self.request("/-/proj/pulls", "alice"))
+        self.assertIn(b"No open pull requests.", empty)
+        head = self.open_pr()
+        listing = self.assert_page(self.request("/-/proj/pulls", "alice"))
+        self.assertIn(b"Add &lt;b&gt;feature&lt;/b&gt; &amp; more", listing)
+        self.assertNotIn(b"<b>feature</b>", listing)
+        self.assertIn(b'<span class="state open">', listing)
+        self.assertTrue(has_link(links(listing), "/-/proj/pulls/1"))
+        self.assertIn(b'Pull requests <span class="count">1</span>', listing, "the tab counts open requests")
+        page = self.assert_page(self.request("/-/proj/pulls/1", "alice"))
+        self.assertIn(b'<span class="state open">', page)
+        self.assertIn(b"<strong>Why</strong>: &lt;script&gt;x&lt;/script&gt;", page, "the body is safe markdown")
+        self.assertIn(b"Feature &lt;commit&gt;", page)
+        self.assertTrue(has_link(links(page), f"/-/proj/commit/{head}"))
+        self.assertIn(b"This branch has no conflicts", page)
+        self.assertIn(b'<td class="c">+new &lt;line&gt;</td>', page, "the diff of the pull request")
+        self.assertIn(b"diff --git a/new.txt b/new.txt", page)
+        self.assertIn(b'<table class="diff split">',
+                      self.assert_page(self.request("/-/proj/pulls/1?view=split", "alice")))
+        pulls.merge_pull(self.repo, "alice", 1)
+        merged = self.assert_page(self.request("/-/proj/pulls/1", "alice"))
+        self.assertIn(b'<span class="state merged">', merged)
+        self.assertIn(b"No open pull requests.", self.assert_page(self.request("/-/proj/pulls", "alice")))
+        self.assertIn(b"Add &lt;b&gt;feature", self.assert_page(self.request("/-/proj/pulls?state=merged", "alice")))
+        self.assertIn(b"Add &lt;b&gt;feature", self.assert_page(self.request("/-/proj/pulls?state=all", "alice")))
+        self.assert_page(self.request("/-/proj/pulls?state=bogus", "alice"), 400)
+        for path in ("/-/proj/pulls/2", "/-/proj/pulls/abc", "/-/proj/pulls/0", "/-/proj/pulls/1/extra"):
+            with self.subTest(path=path):
+                self.assert_page(self.request(path, "alice"), 404)
+
+    def test_pull_request_pages_follow_the_acls(self):
+        self.open_pr()
+        for path in ("/-/proj/pulls", "/-/proj/pulls/1"):
+            with self.subTest(path=path):
+                anon = self.request(path, None)
+                self.assert_page(anon, 401)
+                self.assertIn(webui.CHALLENGE, anon.headers)
+                bob = self.request(path, "bob")
+                self.assert_page(bob, 403)
+                self.assertNotIn(b"feature", bob.body)
+
+    def test_closed_pull_request_and_corrupt_store(self):
+        from minigit import pulls
+        self.open_pr()
+        pulls.close_pull(self.repo, "alice", 1)
+        self.assertIn(b'<span class="state closed">', self.assert_page(self.request("/-/proj/pulls/1", "alice")))
+        with open(pulls.pulls_path(self.repo), "wb") as fh:
+            fh.write(b"{not json")
+        self.assertIn(b"No open pull requests.", self.assert_page(self.request("/-/proj/pulls", "alice")))
+        self.assert_page(self.request("/-/proj/pulls/1", "alice"), 404)
+        self.assert_page(self.request("/-/proj/", "alice"))
 
 
 # ---------------------------------------------------------------------------

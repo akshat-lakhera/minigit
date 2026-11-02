@@ -156,8 +156,10 @@ operations are available as JSON over HTTP under `/<repo>/pulls` (`features/pull
 
 ## Web UI
 
-`minigit serve` also serves a read-only, JavaScript-free site at `http://host:8080/-/`: repository list,
-summary, branches, tags, paged commit log, a commit with its diff, a file browser and raw file download. Access
+`minigit serve` also serves a read-only, JavaScript-free site, "minigithub", at `http://host:8080/-/`: repository
+list, a code page with the file table and rendered README, branches, tags, a commit log grouped by day, a commit with
+a unified or split diff, a file browser with blame and raw download, and the pull requests. It has light and dark
+themes and works on phones and offline. Access
 follows the same ACLs as the protocol (the browser asks for user name + token; `--public` repos are readable
 anonymously; any other repository name, existing or not, answers 401 to an anonymous browser). Browsers cache HTTP
 Basic credentials, so there is no log-out other than closing the browser. Pass `serve --no-web` to turn it off.
@@ -256,7 +258,7 @@ a pull request database `pulls.json` lives inside the bare repository). Details 
 python -m unittest discover -s tests -t .
 ```
 
-968 tests in `tests/` (counted as `def test_`): unit tests per module, CLI tests, and end-to-end tests that start a
+982 tests in `tests/` (counted as `def test_`): unit tests per module, CLI tests, and end-to-end tests that start a
 live `minigit serve` and drive clones, pushes, conflicts and concurrent pushes through real subprocesses.
 `tests_blackbox/` holds another 425 tests, independent QA suites written against `SPEC.md` only (they drive the CLI
 as a user would); run them with `python -m unittest discover -s tests_blackbox -t .`.

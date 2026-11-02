@@ -15,7 +15,11 @@ minigit {VERSION}: a small git clone with a multi-user HTTP server. Nothing else
 The executables are not code-signed. Windows SmartScreen and macOS Gatekeeper may ask once; choose "Run anyway"
 (Windows) or allow it under System Settings > Privacy & Security (macOS).
 
-## What is new in 0.3.0
+## What is new in 0.4.0
+
+- The web UI is now **minigithub**: a new look with its own logo and colours, light and dark themes, a code page with the file table, last commit per file and the README rendered, commits grouped by day, colored diffs with line numbers (unified or split), a blame view, and pull request pages. It works on phones and needs no JavaScript.
+
+## What was new in 0.3.0
 
 No new commands: this release makes the existing ones behave like git and fail better than git.
 

@@ -101,7 +101,7 @@ def make_commit(store: ObjectStore, tree: str, parents, ts: int, msg: str = "m",
 
 class ErrorsTest(unittest.TestCase):
     def test_version(self):
-        self.assertEqual(__version__, "0.3.0")
+        self.assertEqual(__version__, "0.4.0")
 
     def test_hierarchy_and_attrs(self):
         e = MinigitError("boom", hint="try again")

@@ -157,7 +157,7 @@ def _version_string() -> str:
     try:
         return "minigit " + str(importlib.import_module("minigit").__version__)
     except Exception:  # pragma: no cover - the package always has a version
-        return "minigit 0.3.0"
+        return "minigit 0.4.0"
 
 
 def _add_blame_parser(sub) -> None:
